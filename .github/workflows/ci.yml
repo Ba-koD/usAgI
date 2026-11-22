@@ -1,12 +1,16 @@
-# PR 확인: 공통 로직 테스트 + 플랫폼 앱 컴파일 확인 (세 OS 동시에)
+# main 푸시·PR 확인: 공통 로직 테스트 + 플랫폼 앱 컴파일 확인 (세 OS 동시에)
 #
-# - main 푸시와 태그는 release.yml(Build & Release)이 실제 묶기까지 하므로 여기서는 PR만 봐요.
+# - 실제 릴리스 빌드와 묶기는 태그를 올릴 때만 release.yml(Build & Release)이 해요.
+#   main 푸시마다 릴리스 빌드를 돌리면 같은 커밋을 태그에서 한 번 더 빌드하게 돼서, 여기서는 가볍게 확인만 해요.
 # - 릴리스 최적화(LTO) 없이 cargo check로 컴파일만 확인해서 빨라요.
-# - Linux 줄은 앱이 아직 없어서 공통 로직만 (Linux 앱을 만들 때 깨져 있지 않게).
-# - 같은 PR에 새로 올리면 이전 실행은 취소해요. 문서만 바뀌면 돌지 않아요.
+# - Linux 줄은 앱이 아직 없어서 공통 로직과 서명 도구만 (게시 단계가 Linux에서 서명 도구를 빌드하므로 미리 확인).
+# - 같은 브랜치·PR에 새로 올리면 이전 실행은 취소해요. 문서만 바뀌면 돌지 않아요.
 name: CI
 
 on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "scripts/install-mac.sh", "scripts/release.ps1"]
   pull_request:
     paths-ignore: ["**.md", "scripts/install-mac.sh", "scripts/release.ps1"]
   workflow_dispatch:
@@ -31,9 +35,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux (공통 로직)
+          - name: Linux (공통 로직 · 서명 도구)
             os: ubuntu-latest
-            app: ""
+            app: usagi-sign
           - name: Windows
             os: windows-latest
             app: usagi-win
