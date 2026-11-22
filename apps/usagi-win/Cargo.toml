@@ -1,0 +1,48 @@
+[package]
+name = "usagi-win"
+description = "usAgI for Windows: taskbar widget + tray rabbit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "usagi"
+path = "src/main.rs"
+
+[dependencies]
+usagi-core = { path = "../../crates/usagi-core" }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
+# Windows 알림(토스트): wry가 이미 쓰는 windows 크레이트에 기능만 더함
+windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Storage_EnhancedStorage", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Accessibility"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Networking_WinHttp",
+    "Win32_Security_Cryptography",
+]
+
+# 빌드 때 exe 아이콘(토끼)과 버전 정보를 넣음
+[build-dependencies]
+usagi-core = { path = "../../crates/usagi-core" }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "png-format"] }
+embed-resource = "3"
