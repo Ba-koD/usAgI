@@ -1,0 +1,921 @@
+import { FocusOut, Theme, CenterItem, ClickTarget, UiButton, Toggle, Segments } from "style.slint";
+
+// 원형 아이콘 단추 (칩 안의 종류 아이콘·삭제, 팝업 닫기)
+component RoundIcon inherits ClickTarget {
+    in property <image> icon;
+    in property <color> tint: Theme.sub;
+    in property <color> hover-bg: Theme.track;
+    in property <length> size: 26px;
+    in property <length> radius: root.size / 2;
+    width: root.size; height: root.size; border-radius: root.radius;
+    background: root.hovered ? root.hover-bg : transparent;
+    animate background { duration: 120ms; }
+    Image { width: round(root.size * 0.56 / 1px) * 1px; height: self.width; source: root.icon; colorize: root.tint; }
+}
+
+// 숫자 입력 칸의 −/+ 단추: 테두리와 면이 있는 작은 칸
+component StepKey inherits ClickTarget {
+    in property <image> icon;
+    width: 30px; border-radius: 7px; border-width: 1px;
+    border-color: root.hovered ? Theme.line-hot : Theme.key-line;
+    background: touch-down.pressed ? Theme.key-down : root.hovered ? Theme.key-hot : Theme.key;
+    animate background { duration: 100ms; }
+    Image { width: 14px; height: 14px; source: root.icon; colorize: Theme.ink; }
+    touch-down := TouchArea { enabled: false; }
+}
+
+// 숫자 입력: [−][ 값 ][+]. 칸을 누르면 바깥 틀이 강조색
+export component Stepper inherits Rectangle {
+    in-out property <int> value;
+    in property <int> minimum: 0;
+    in property <int> maximum: 100;
+    in property <length> field-width: 46px;
+    in property <string> label;
+    // 값을 정했을 때 (−/+, Enter, 칸을 벗어날 때)
+    callback committed(int);
+    height: 36px; border-radius: 10px; border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.field-line;
+    background: Theme.field;
+    accessible-role: spinbox; accessible-label: root.label; accessible-value: root.value;
+    function set(v: int) { root.value = clamp(v, root.minimum, root.maximum); input.text = root.value; root.committed(root.value); }
+    changed value => { if !input.has-focus { input.text = root.value; } }
+    HorizontalLayout {
+        padding: 2px; spacing: 2px;
+        StepKey { icon: @image-url("icons/minus.svg"); label: @tr("줄이기"); clicked => { root.set(root.value - 1); } }
+        Rectangle { width: root.field-width;
+            input := TextInput {
+                width: 100%; height: 100%;
+                text: root.value; single-line: true; input-type: number;
+                horizontal-alignment: center; vertical-alignment: center;
+                color: Theme.ink; font-size: 14.5px;
+                edited => { if self.text != "" { root.value = clamp(self.text.to-float(), root.minimum, root.maximum); } }
+                accepted => { root.set(root.value); }
+                changed has-focus => { if !self.has-focus { root.set(root.value); } }
+            }
+        }
+        StepKey { icon: @image-url("icons/plus.svg"); label: @tr("늘리기"); clicked => { root.set(root.value + 1); } }
+    }
+}
+
+
+// 길이 고르기 막대: 강조색 채움 + 흰 손잡이. 끄는 동안 moved, 놓으면 released
+export component RangeSlider inherits Rectangle {
+    in-out property <float> value;
+    in property <float> minimum;
+    in property <float> maximum: 100;
+    in property <string> label;
+    callback moved(float);
+    callback released(float);
+    height: 24px;
+    accessible-role: slider; accessible-label: root.label; accessible-value: root.value;
+    accessible-value-minimum: root.minimum; accessible-value-maximum: root.maximum; accessible-value-step: 1;
+    private property <float> ratio: root.maximum > root.minimum ? clamp((root.value - root.minimum) / (root.maximum - root.minimum), 0, 1) : 0;
+    private property <length> knob: 18px;
+    function set-from(x: length) {
+        root.value = round(root.minimum + clamp((x - root.knob / 2) / max(1px, root.width - root.knob), 0, 1) * (root.maximum - root.minimum));
+        root.moved(root.value);
+    }
+    Rectangle { y: (parent.height - 6px) / 2; height: 6px; border-radius: 3px; background: Theme.track;
+        Rectangle { x: 0; height: 100%; width: root.knob / 2 + (root.width - root.knob) * root.ratio; border-radius: 3px; background: Theme.accent; }
+    }
+    Rectangle {
+        x: (root.width - root.knob) * root.ratio; y: (parent.height - root.knob) / 2; width: root.knob; height: root.knob;
+        border-radius: root.knob / 2; background: #ffffff; border-width: 1px; border-color: Theme.line2;
+        drop-shadow-blur: 4px; drop-shadow-offset-y: 1px; drop-shadow-color: #00000040;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        moved => { if self.pressed { root.set-from(self.mouse-x); } }
+        changed pressed => { if self.pressed { root.set-from(self.mouse-x); } else { root.released(root.value); } }
+    }
+}
+
+// 한 줄 입력 칸 (단추와 같은 높이·모서리)
+export component TextField inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text <=> input.text;
+    callback accepted(string);
+    height: 34px; border-radius: 8px; border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.field-line; background: Theme.field;
+    animate border-color { duration: 120ms; }
+    forward-focus: input;
+    if root.text == "": Text { x: 12px; width: parent.width - 24px; height: 100%; vertical-alignment: center;
+        text: root.placeholder; color: Theme.faint; font-size: Theme.size-body; accessible-role: none; }
+    input := TextInput { x: 12px; width: parent.width - 24px; height: 100%; vertical-alignment: center; single-line: true;
+        color: Theme.ink; font-size: Theme.size-body; accessible-label: root.placeholder;
+        accepted => { root.accepted(self.text); } }
+}
+
+
+// 위젯 막대 길이: 슬라이더 + px 숫자 입력 (서로 맞춰 움직임) + 기본값
+export component BarLength inherits HorizontalLayout {
+    in property <int> value;
+    in property <int> minimum;
+    in property <int> maximum;
+    in property <bool> small;
+    callback commit(int);
+    spacing: 8px;
+    changed value => { slider.value = root.value; px.value = root.value; }
+    CenterItem { slider := RangeSlider {
+        width: root.small ? 110px : 170px; minimum: root.minimum; maximum: root.maximum; value: root.value;
+        label: @tr("위젯 막대 길이");
+        moved(v) => { px.value = round(v); }
+        released(v) => { px.value = round(v); if round(v) != root.value { root.commit(round(v)); } }
+    } }
+    CenterItem { px := Stepper {
+        minimum: root.minimum; maximum: root.maximum; value: root.value; field-width: 44px; label: @tr("위젯 막대 길이");
+        committed(v) => { slider.value = v; if v != root.value { root.commit(v); } }
+    } }
+    CenterItem { Text { text: "px"; color: Theme.sub; font-size: Theme.size-small; } }
+}
+
+// 리셋 전 시간 입력: [n] 시간 [n] 분 (+ 뒤 글자)
+export component LeadInput inherits HorizontalLayout {
+    in property <int> initial: 60;
+    in property <string> suffix;
+    out property <int> minutes: max(1, hours.value * 60 + mins.value);
+    spacing: 6px;
+    hours := Stepper { minimum: 0; maximum: 168; value: floor(root.initial / 60); field-width: 40px; label: @tr("시간"); }
+    CenterItem { Text { text: @tr("시간"); color: Theme.sub; font-size: Theme.size-small; } }
+    mins := Stepper { minimum: 0; maximum: 59; value: mod(root.initial, 60); field-width: 40px; label: @tr("분"); }
+    CenterItem { Text { text: root.suffix == "" ? @tr("분") : root.suffix; color: Theme.sub; font-size: Theme.size-small; } }
+}
+
+// 그래프 알림 하나: 종류(0 사용량 %, 1 리셋 몇 분 전), 저장된 값, 켜짐, 보일 글자
+export struct AlertItem { kind: int, value: int, on: bool, text: string }
+export struct Meter {
+    key: string, label: string, percent: int, level: int, exact: bool, detail: string, reset: string,
+    left: bool, own-basis: bool, widget: bool, alert-on: bool,
+    // 막대 위 눈금 (켜진 사용량 알림)
+    thresholds: [int],
+    alerts: [AlertItem],
+    // 이미 있는 값 (켜짐·꺼짐 모두): 빠른 선택에서 막음
+    taken-pct: [int], taken-reset: [int],
+}
+export struct Account {
+    id: string, provider: string, title: string, label: string, details: string,
+    status: string, plan: string, credits: string, refills: string, folder: string, footer: string,
+    refill-mode: string, refill-lead: int,
+    show-widget: bool, collapsed: bool, meters: [Meter],
+}
+// 개발용 화면 캡처: 조건부로 열리는 팝업을 열 때 쓰는 신호 (개발 빌드에서만 바뀜)
+export global Debug {
+    in-out property <string> open;
+}
+
+// 창 크기를 바꾸는 중인지 (그동안은 높이 애니메이션 없이 바로 맞춤)
+export global Motion {
+    in-out property <bool> resizing;
+    // 창 크기를 끄는 동안에도 애니메이션이 도는지 (Windows는 앱이 시계를 직접 돌림)
+    in-out property <bool> live-clock;
+}
+
+export global Actions {
+    callback command(string);
+    callback account(string, string, string);
+    callback meter(string, string, int, int);
+    // 그래프 알림 하나: add | replace | delete | toggle, 그래프 키, 종류(0 % / 1 리셋 전), 이전 값, 새 값(toggle은 1 켜기 0 끄기)
+    callback alert(string, string, int, int, int);
+    // 계정별 리필권 만료 알림 (계정 id, default|on|off, 만료 몇 분 전)
+    callback refill(string, string, int);
+    callback pref(string, string);
+    pure callback drag-payload(string) -> data-transfer;
+    pure callback dragged-account(data-transfer) -> string;
+    pure callback has-threshold([int], int) -> bool;
+    in-out property <string> confirm-cmd;
+    in-out property <string> confirm-id;
+    in-out property <string> confirm-text;
+    // 확인 창 제목 아래 설명 (무엇이 바뀌는지)
+    in-out property <string> confirm-detail;
+    public function confirm(cmd: string, id: string, message: string) {
+        self.confirm-cmd = cmd; self.confirm-id = id; self.confirm-text = message; self.confirm-detail = "";
+    }
+    public function ask(cmd: string, id: string, message: string, detail: string) {
+        self.confirm-cmd = cmd; self.confirm-id = id; self.confirm-text = message; self.confirm-detail = detail;
+    }
+    // 한 페이지 설정 초기화 (widget | alerts | general)
+    callback reset-page(string);
+}
+
+// 글자: 본문 / 설명 / 페이지 제목 / 구역 제목
+export component Caption inherits Text {
+    color: Theme.ink; font-size: Theme.size-body; vertical-alignment: center; wrap: word-wrap;
+}
+export component Hint inherits Caption { color: Theme.faint; font-size: Theme.size-small; }
+export component Heading inherits Caption { font-size: Theme.size-page; font-weight: 600; wrap: no-wrap; }
+export component Section inherits Caption { font-size: Theme.size-section; }
+export component Rule inherits Rectangle { height: 1px; background: Theme.line; }
+
+export component Panel inherits Rectangle {
+    in property <length> inset: Theme.pad;
+    // 위아래 여백 (설정 묶음은 좌우보다 조금 좁게)
+    in property <length> inset-y: root.inset;
+    in property <length> gap: 14px;
+    // 내용이 바뀔 때 높이를 부드럽게 바꿈 (계정 카드 접기·펼치기)
+    in property <bool> smooth;
+    // 지금은 적용되지 않는 설정 (예: 위젯을 끈 동안)
+    in property <bool> dim;
+    private property <float> appear: 0;
+    background: Theme.card; border-radius: 12px; border-width: 1px; border-color: Theme.line;
+    clip: true;
+    // 나타날 때 서서히 (창 열기, 페이지 전환)
+    private property <float> dim-level: root.dim ? 0.5 : 1;
+    animate dim-level { duration: 200ms; easing: ease-out; }
+    opacity: root.appear * root.dim-level;
+    animate appear { duration: 260ms; easing: ease-out; }
+    init => { root.appear = 1; }
+    height: body.preferred-height;
+    animate height { duration: root.smooth && !Motion.resizing ? 260ms : 0ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    // 카드의 빈 곳을 누르면 입력 칸 포커스 해제
+    TouchArea { pointer-event(e) => { if e.kind == PointerEventKind.down { FocusOut.release(); } } }
+    body := VerticalLayout { y: 0; width: parent.width; height: self.preferred-height;
+        padding-left: root.inset; padding-right: root.inset; padding-top: root.inset-y; padding-bottom: root.inset-y;
+        spacing: root.gap; @children }
+}
+
+// 접고 펼치는 부분: 높이·투명도가 k(0 접힘 ~ 1 펼침)를 따라감. 위 간격(gap)도 함께 줄어 접히면 자리를 차지하지 않음.
+// 바깥 카드는 따로 애니메이션하지 않고 이 높이를 그대로 따라가므로 안쪽과 바깥이 같은 속도로 움직임
+export component Fold inherits Rectangle {
+    in property <float> k: 1;
+    in property <length> gap;
+    clip: true;
+    height: (root.gap + body.preferred-height) * root.k;
+    opacity: min(1, root.k * 1.25);
+    body := VerticalLayout { x: 0; y: root.gap; width: parent.width; height: self.preferred-height; @children }
+}
+
+// 구역 제목 + 패널
+export component Group inherits VerticalLayout {
+    in property <string> title;
+    in property <bool> dim;
+    private property <float> appear: 0;
+    private property <float> dim-level: root.dim ? 0.5 : 1;
+    init => { root.appear = 1; }
+    animate appear { duration: 260ms; easing: ease-out; }
+    animate dim-level { duration: 200ms; easing: ease-out; }
+    spacing: 10px;
+    if root.title != "": Section { text: root.title; opacity: root.appear * root.dim-level; }
+    Panel { inset-y: 14px; gap: 12px; dim: root.dim; @children }
+}
+
+// 알림 띠 (오류 등): 나타날 때 서서히
+export component Banner inherits Rectangle {
+    in property <string> text;
+    private property <float> appear: 0;
+    init => { root.appear = 1; }
+    animate appear { duration: 220ms; easing: ease-out; }
+    opacity: root.appear;
+    border-radius: 10px; border-width: 1px; border-color: Theme.danger.with-alpha(0.35); background: Theme.danger.with-alpha(0.1);
+    HorizontalLayout { padding-left: 14px; padding-right: 14px; padding-top: 10px; padding-bottom: 10px;
+        Caption { text: root.text; color: Theme.danger; font-size: Theme.size-small; }
+    }
+}
+
+export component SettingRow inherits HorizontalLayout {
+    in property <string> title; in property <string> subtitle;
+    in property <bool> alert;
+    min-height: 40px; spacing: Theme.gap-l;
+    VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+        Caption { text: root.title; font-size: Theme.size-row; }
+        if root.subtitle != "": Hint { text: root.subtitle; color: root.alert ? Theme.danger : Theme.faint; }
+    }
+    CenterItem {
+        HorizontalLayout { alignment: end; spacing: Theme.gap-s; @children }
+    }
+}
+export component PrefToggle inherits SettingRow {
+    in property <string> key;
+    in property <bool> checked;
+    Toggle { label: root.title; checked: root.checked; clicked => { Actions.pref(root.key, !root.checked ? "true" : "false"); } }
+}
+
+// 알림 시점 입력: n시간 n분 전 (합계 분으로 알려 줌)
+export component LeadTime inherits HorizontalLayout {
+    in property <int> minutes;
+    callback edited(int);
+    spacing: 6px;
+    // 값이 정해지면(−/+, Enter, 칸을 벗어날 때) 합계 분으로, 바뀐 경우에만
+    function send() {
+        if max(1, hours.value * 60 + mins.value) != root.minutes { root.edited(max(1, hours.value * 60 + mins.value)); }
+    }
+    changed minutes => { hours.value = floor(root.minutes / 60); mins.value = mod(root.minutes, 60); }
+    hours := Stepper { minimum: 0; maximum: 168; value: floor(root.minutes / 60); field-width: 40px; label: @tr("시간");
+        committed => { root.send(); } }
+    CenterItem { Text { text: @tr("시간"); color: Theme.sub; font-size: Theme.size-small; } }
+    mins := Stepper { minimum: 0; maximum: 59; value: mod(root.minutes, 60); field-width: 40px; label: @tr("분");
+        committed => { root.send(); } }
+    CenterItem { Text { text: @tr("분 전"); color: Theme.sub; font-size: Theme.size-small; } }
+}
+
+// 작은 표시 (요금제는 강조색, 크레딧·리필권은 차분한 색)
+export component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> accent;
+    // 0 기본, 1 크레딧(보라), 2 리필권(초록)
+    in property <int> tone;
+    private property <color> ink: root.accent ? Theme.accent : root.tone == 1 ? Theme.violet : root.tone == 2 ? Theme.good : Theme.sub;
+    height: 24px; border-radius: 12px;
+    background: root.accent || root.tone > 0 ? root.ink.with-alpha(Theme.dark ? 0.18 : 0.12) : Theme.raised;
+    border-width: root.accent || root.tone > 0 ? 0px : 1px; border-color: Theme.line;
+    HorizontalLayout { padding-left: 9px; padding-right: 9px;
+        Text { text: root.text; color: root.ink; font-size: Theme.size-small; vertical-alignment: center; }
+    }
+}
+
+component AccountName inherits TextInput {
+    in property <string> account-id;
+    in property <string> saved;
+    private property <string> last-submitted;
+    single-line: true; color: Theme.ink; font-size: Theme.size-title; font-weight: 600;
+    horizontal-alignment: left; vertical-alignment: center;
+    accessible-label: @tr("계정 이름");
+    function sync() {
+        if !root.has-focus || root.text == root.last-submitted { root.text = root.saved; }
+        root.last-submitted = root.saved;
+    }
+    function submit() {
+        if root.text != root.last-submitted {
+            root.last-submitted = root.text;
+            Actions.account("label", root.account-id, root.text);
+        }
+    }
+    init => { root.sync(); }
+    changed saved => { root.sync(); }
+    changed account-id => { root.text = root.saved; root.last-submitted = root.saved; }
+    accepted => { root.submit(); }
+    changed has-focus => { if !root.has-focus { root.submit(); } }
+}
+
+component Mark inherits Rectangle {
+    in property <int> at; in property <Meter> meter; in property <length> track-width;
+    private property <int> shown: meter.left ? 100 - at : at;
+    private property <int> value: clamp(root.shown + round((drag.mouse-x - drag.pressed-x) / max(1px, root.track-width) * 100), 1, 99);
+    width: 14px; height: 22px;
+    x: root.track-width * root.shown / 100 - self.width / 2;
+    accessible-role: slider; accessible-label: @tr("{} 알림 기준", root.meter.label);
+    accessible-value: root.shown; accessible-value-minimum: 1; accessible-value-maximum: 99; accessible-value-step: 1;
+    accessible-action-increment => { root.commit(min(99, root.shown + 1)); }
+    accessible-action-decrement => { root.commit(max(1, root.shown - 1)); }
+    accessible-action-set-value(v) => { if v.is-float() { root.commit(clamp(round(v.to-float()), 1, 99)); } }
+    function commit(n: int) { if n != root.shown { Actions.meter("replace", root.meter.key, root.at, root.meter.left ? 100 - n : n); } }
+    forward-focus: keys;
+    Rectangle {
+        x: (parent.width - self.width) / 2 + (drag.pressed ? root.track-width * (root.value - root.shown) / 100 : 0px);
+        width: 3px; height: 18px; border-radius: 2px;
+        background: keys.has-focus || drag.has-hover ? Theme.accent : Theme.ink; opacity: root.meter.alert-on ? 1 : 0.5;
+    }
+    drag := TouchArea { mouse-cursor: ew-resize;
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.down { keys.focus(); }
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.up { root.commit(root.value); }
+        }
+    }
+    keys := FocusScope { width: 0;
+        key-pressed(e) => {
+            if e.text == Key.LeftArrow || e.text == Key.DownArrow { root.commit(max(1, root.shown - 1)); return accept; }
+            if e.text == Key.RightArrow || e.text == Key.UpArrow { root.commit(min(99, root.shown + 1)); return accept; }
+            return reject;
+        }
+    }
+}
+
+// 팝업 바탕 (둥근 모서리, 옅은 그림자)
+component PopupSurface inherits Rectangle {
+    background: Theme.popover; border-width: 1px; border-color: Theme.popover-line; border-radius: 14px;
+    drop-shadow-blur: 24px; drop-shadow-offset-y: 8px; drop-shadow-color: #00000055;
+}
+
+// 팝업 몸체: 열릴 때 서서히, 살짝 내려오며 (표면 + 내용)
+component PopupFrame inherits Rectangle {
+    private property <float> appear: 0;
+    init => { root.appear = 1; }
+    animate appear { duration: 160ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    x: 0; y: (root.appear - 1) * 6px; width: 100%; height: 100%;
+    opacity: root.appear;
+    PopupSurface { }
+    @children
+}
+
+// 그래프 알림 칩: [종류 아이콘(켜기·끄기)] [값(편집)] [×(마우스를 올렸을 때만)]
+component AlertChip inherits Rectangle {
+    in property <Meter> meter; in property <AlertItem> item;
+    private property <bool> live: root.item.on && root.meter.alert-on;
+    private property <bool> hot: bg.has-hover || ic.hovered || tx.hovered || xx.hovered || ic.focused || tx.focused || xx.focused;
+    private property <image> kind-icon: root.item.kind == 0 ? @image-url("icons/gauge.svg") : @image-url("icons/clock.svg");
+    // 사용량 알림을 남은 양 기준으로 볼 때 보이는 숫자
+    private property <int> shown: root.item.kind == 0 && root.meter.left ? 100 - root.item.value : root.item.value;
+    private property <string> dbg: Debug.open;
+    changed dbg => { if root.dbg == "edit:" + root.meter.key + ":" + root.item.kind + ":" + root.item.value { editor.show(); } }
+    private property <float> appear: 0;
+    init => { root.appear = 1; }
+    animate appear { duration: 200ms; easing: ease-out; }
+    opacity: root.appear;
+    height: 30px; border-radius: 15px; border-width: 1px;
+    border-color: root.hot ? Theme.line-hot : root.live ? Theme.line2 : Theme.line;
+    background: !root.live ? transparent : root.hot ? Theme.raised-hot : Theme.raised;
+    animate background, border-color { duration: 120ms; }
+    bg := TouchArea { mouse-cursor: default; }
+    HorizontalLayout {
+        padding-left: 2px; padding-right: 3px; spacing: 2px;
+        CenterItem { ic := RoundIcon {
+            icon: root.kind-icon; tint: root.live ? Theme.accent : Theme.faint;
+            label: root.item.on ? @tr("알림 끄기") : @tr("알림 켜기");
+            clicked => { Actions.alert("toggle", root.meter.key, root.item.kind, root.item.value, root.item.on ? 0 : 1); }
+        } }
+        tx := ClickTarget {
+            label: @tr("{} 알림 편집", root.item.text);
+            clicked => { editor.show(); }
+            HorizontalLayout { padding-left: 1px; padding-right: 1px;
+                Text { text: root.item.text; font-size: Theme.size-small; color: root.live ? Theme.ink : Theme.faint; vertical-alignment: center; }
+            }
+        }
+        CenterItem { xx := RoundIcon {
+            size: 22px; width: root.hot ? 22px : 0px; opacity: root.hot ? 1 : 0;
+            animate width, opacity { duration: 150ms; easing: ease-out; }
+            icon: @image-url("icons/x.svg"); tint: self.hovered ? Theme.danger : Theme.faint; hover-bg: Theme.danger.with-alpha(0.12);
+            label: @tr("{} 알림 삭제", root.item.text);
+            clicked => { Actions.alert("delete", root.meter.key, root.item.kind, root.item.value, 0); }
+        } }
+        // ×가 접혀 있을 때 오른쪽 여백을 양쪽과 맞춤
+        Rectangle { width: root.hot ? 0px : 5px; animate width { duration: 150ms; easing: ease-out; } }
+    }
+    editor := PopupWindow {
+        close-policy: close-on-click-outside;
+        x: 0; y: parent.height + 6px; width: 372px; height: 178px;
+        PopupFrame {
+            VerticalLayout {
+                HorizontalLayout { padding-left: 16px; padding-right: 16px; padding-top: 14px; spacing: 10px;
+                    Rectangle { width: 34px; height: 34px; border-radius: 10px;
+                        background: root.item.on ? Theme.accent.with-alpha(0.14) : Theme.track;
+                        Image { width: 18px; height: 18px; source: root.kind-icon; colorize: root.item.on ? Theme.accent : Theme.faint; }
+                    }
+                    VerticalLayout { horizontal-stretch: 1; alignment: center; spacing: 4px;
+                        Text { text: root.item.kind == 1 ? @tr("리셋 {}", root.item.text) : root.meter.left ? @tr("남은 양 {}%", root.shown) : @tr("사용량 {}%", root.shown);
+                            color: Theme.ink; font-size: 14.5px; font-weight: 600; }
+                        Hint { text: root.item.on ? @tr("켜짐 · 기준 도달 시 알림") : @tr("꺼짐 · 알림 없음"); }
+                    }
+                    CenterItem { Toggle { label: @tr("알림 켜기·끄기"); checked: root.item.on;
+                        clicked => { Actions.alert("toggle", root.meter.key, root.item.kind, root.item.value, root.item.on ? 0 : 1); } } }
+                }
+                HorizontalLayout { padding-left: 16px; padding-right: 16px; padding-top: 14px; padding-bottom: 16px; spacing: 8px; alignment: start;
+                    if root.item.kind == 0: pct := Stepper { minimum: 1; maximum: 99; value: root.shown; label: @tr("알림 기준 퍼센트"); }
+                    if root.item.kind == 0: CenterItem { Text { text: root.meter.left ? @tr("% 남았을 때") : @tr("% 사용했을 때"); color: Theme.sub; font-size: Theme.size-small; } }
+                    if root.item.kind == 1: lead := LeadInput { initial: root.item.value; suffix: @tr("분 전"); }
+                }
+                Rule {}
+                HorizontalLayout { padding-top: 12px; padding-bottom: 12px; padding-left: 10px; padding-right: 16px; spacing: 8px;
+                    UiButton { text: @tr("삭제"); icon: @image-url("icons/trash.svg"); danger: true; ghost: true; flush: true; border-width: 0px;
+                        clicked => { Actions.alert("delete", root.meter.key, root.item.kind, root.item.value, 0); editor.close(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    UiButton { text: @tr("취소"); clicked => { editor.close(); } }
+                    UiButton { text: @tr("적용"); primary: true; clicked => { root.apply(); editor.close(); } }
+                }
+            }
+        }
+    }
+    // 편집 값 저장 (사용량은 남은 양 기준이면 되돌려서)
+    function apply() {
+        if root.item.kind == 0 {
+            Actions.alert("replace", root.meter.key, 0, root.item.value, root.meter.left ? 100 - root.edit-pct : root.edit-pct);
+        } else {
+            Actions.alert("replace", root.meter.key, 1, root.item.value, root.edit-lead);
+        }
+    }
+    // 팝업 안 입력값 (팝업이 열려 있을 때만 유효)
+    private property <int> edit-pct: root.shown;
+    private property <int> edit-lead: root.item.value;
+}
+
+// 알림 추가 팝업의 [사용량 | 리셋 전] 선택
+component KindSwitch inherits Rectangle {
+    in-out property <int> kind;
+    height: 38px; border-radius: 10px; border-width: 1px; border-color: Theme.line; background: Theme.segment;
+    HorizontalLayout { padding: 3px; spacing: 3px;
+        for opt[i] in [{ text: @tr("사용량"), icon: @image-url("icons/gauge.svg") }, { text: @tr("리셋 전"), icon: @image-url("icons/clock.svg") }]: ClickTarget {
+            label: opt.text; border-radius: 7px;
+            horizontal-stretch: 1; min-width: 0px; preferred-width: 0px;
+            background: i == root.kind ? Theme.selected : transparent;
+            animate background { duration: 120ms; }
+            clicked => { root.kind = i; }
+            HorizontalLayout { alignment: center; spacing: 6px;
+                CenterItem { Image { width: 15px; height: 15px; source: opt.icon; colorize: i == root.kind ? Theme.ink : Theme.sub; } }
+                Text { text: opt.text; font-size: Theme.size-small; vertical-alignment: center; color: i == root.kind ? Theme.ink : Theme.sub; }
+            }
+        }
+    }
+}
+
+// 빠른 선택 단추 (이미 있는 값은 체크 표시와 함께 막힘)
+component PresetKey inherits ClickTarget {
+    in property <string> text;
+    in property <bool> taken;
+    label: root.text; enabled: !root.taken;
+    height: 34px; border-radius: 9px; border-width: 1px;
+    border-color: root.taken ? Theme.line : root.hovered ? Theme.accent.with-alpha(0.55) : Theme.preset-line;
+    background: root.taken ? transparent : root.hovered ? Theme.accent.with-alpha(0.08) : Theme.preset;
+    animate background, border-color { duration: 120ms; }
+    HorizontalLayout { alignment: center; spacing: 4px;
+        if root.taken: CenterItem { Image { width: 13px; height: 13px; source: @image-url("icons/check.svg"); colorize: Theme.faint; } }
+        Text { text: root.text; font-size: Theme.size-small; vertical-alignment: center; color: root.taken ? Theme.faint : Theme.ink; }
+    }
+}
+
+// [+ 알림 추가] 단추와 추가 팝업
+component AddAlert inherits ClickTarget {
+    in property <Meter> meter;
+    private property <int> kind;
+    private property <[int]> pct-presets: [50, 60, 70, 75, 80, 85, 90, 95];
+    private property <[int]> lead-presets: [10, 30, 60, 180];
+    private property <string> dbg: Debug.open;
+    changed dbg => {
+        if root.dbg == "add:" + root.meter.key { root.kind = 0; pop.show(); }
+        if root.dbg == "add-reset:" + root.meter.key { root.kind = 1; pop.show(); }
+    }
+    label: @tr("알림 추가");
+    height: 30px; border-radius: 15px; border-width: 1px;
+    border-color: root.hovered ? Theme.accent : Theme.line2;
+    background: root.hovered ? Theme.accent.with-alpha(0.08) : transparent;
+    animate background, border-color { duration: 120ms; }
+    clicked => { root.kind = 0; pop.show(); }
+    HorizontalLayout { padding-left: 10px; padding-right: 13px; spacing: 5px;
+        CenterItem { Image { width: 14px; height: 14px; source: @image-url("icons/plus.svg"); colorize: root.hovered ? Theme.accent : Theme.sub; } }
+        Text { text: @tr("알림 추가"); font-size: Theme.size-small; vertical-alignment: center; color: root.hovered ? Theme.accent : Theme.sub; }
+    }
+    pop := PopupWindow {
+        close-policy: close-on-click-outside;
+        x: 0; y: parent.height + 6px; width: 372px; height: root.kind == 0 ? 296px : 256px;
+        PopupFrame {
+            VerticalLayout {
+                HorizontalLayout { padding-left: 16px; padding-right: 9px; padding-top: 14px; spacing: 10px;
+                    VerticalLayout { horizontal-stretch: 1; spacing: 4px;
+                        Text { text: @tr("{} 알림 추가", root.meter.label); color: Theme.ink; font-size: 14.5px; font-weight: 600; }
+                        Hint { text: @tr("각 알림은 리셋 전까지 한 번만 표시"); }
+                    }
+                    RoundIcon { size: 28px; radius: 8px; icon: @image-url("icons/x.svg"); tint: Theme.faint; label: @tr("닫기"); clicked => { pop.close(); } }
+                }
+                VerticalLayout { padding-left: 16px; padding-right: 16px; padding-top: 14px; padding-bottom: 16px; spacing: 0px;
+                    KindSwitch { kind <=> root.kind; }
+                    Rectangle { height: 14px; }
+                    Hint { text: root.kind == 1 ? @tr("리셋 얼마 전에 알림을 받을지 선택") : root.meter.left ? @tr("알림을 받을 남은 양 선택") : @tr("알림을 받을 사용량 선택"); }
+                    Rectangle { height: 8px; }
+                    if root.kind == 0: VerticalLayout { spacing: 6px;
+                        for r in 2: HorizontalLayout { spacing: 6px;
+                            for c in 4: PresetKey {
+                                horizontal-stretch: 1; min-width: 0px; preferred-width: 0px;
+                                property <int> at: root.pct-presets[r * 4 + c];
+                                text: (root.meter.left ? 100 - self.at : self.at) + "%";
+                                taken: Actions.has-threshold(root.meter.taken-pct, self.at);
+                                clicked => { Actions.alert("add", root.meter.key, 0, 0, self.at); pop.close(); }
+                            }
+                        }
+                    }
+                    if root.kind == 1: HorizontalLayout { spacing: 6px;
+                        for v[i] in root.lead-presets: PresetKey {
+                            horizontal-stretch: 1; min-width: 0px; preferred-width: 0px;
+                            text: i == 0 ? @tr("10분") : i == 1 ? @tr("30분") : i == 2 ? @tr("1시간") : @tr("3시간");
+                            taken: Actions.has-threshold(root.meter.taken-reset, v);
+                            clicked => { Actions.alert("add", root.meter.key, 1, 0, v); pop.close(); }
+                        }
+                    }
+                    Rectangle { height: 12px; }
+                    Rule {}
+                    Rectangle { height: 12px; }
+                    if root.kind == 0: HorizontalLayout { spacing: 8px;
+                        custom-pct := Stepper { minimum: 1; maximum: 99; value: root.meter.left ? 30 : 70; label: @tr("새 알림 기준 퍼센트"); }
+                        CenterItem { Text { text: "%"; color: Theme.sub; font-size: Theme.size-small; } }
+                        Rectangle { horizontal-stretch: 1; }
+                        UiButton { text: @tr("추가"); primary: true;
+                            clicked => { Actions.alert("add", root.meter.key, 0, 0, root.meter.left ? 100 - custom-pct.value : custom-pct.value); pop.close(); } }
+                    }
+                    if root.kind == 1: HorizontalLayout { spacing: 8px;
+                        custom-lead := LeadInput { initial: 60; }
+                        Rectangle { horizontal-stretch: 1; }
+                        UiButton { text: @tr("추가"); primary: true;
+                            clicked => { Actions.alert("add", root.meter.key, 1, 0, custom-lead.minutes); pop.close(); } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 그래프 알림 전체 켜기·끄기 (종)
+component BellToggle inherits ClickTarget {
+    in property <bool> on;
+    width: 30px; height: 30px; border-radius: 15px; border-width: 1px;
+    border-color: root.on ? Theme.accent.with-alpha(0.4) : Theme.line2;
+    background: root.on ? Theme.accent.with-alpha(root.hovered ? 0.18 : 0.12) : root.hovered ? Theme.track : transparent;
+    animate background { duration: 120ms; }
+    Image { width: 16px; height: 16px; source: root.on ? @image-url("icons/alerts.svg") : @image-url("icons/bell-off.svg"); colorize: root.on ? Theme.accent : Theme.faint; }
+}
+
+component MeterCard inherits Rectangle {
+    in property <Meter> meter;
+    in property <bool> folded; in property <bool> alerts-page;
+    // 접기 진행 (0 접힘 ~ 1 펼침). 계정 카드가 애니메이션해서 넘겨 줌
+    in property <float> k: 1;
+    // 리셋 정보를 한 줄에 둘 만큼 넓은지 (계정 카드가 계산)
+    in property <bool> wide: true;
+    // 계정 카드가 막 나타났을 때만 0에서 차오름. 창 크기 때문에 배치가 바뀌어 새로 만들어질 때는 값 그대로
+    in property <bool> intro: true;
+    private property <[int]> presets: [50, 60, 70, 75, 80, 85, 90, 95];
+    // 값이 바뀌면 숫자와 막대가 이전 값에서 이어서 움직임 (줄어들 때도 자연스럽게)
+    private property <float> target: root.meter.exact ? root.meter.percent : 0;
+    private property <float> shown: root.intro ? 0 : root.target;
+    animate shown { duration: 900ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    init => { if root.intro { root.shown = root.target; } }
+    changed target => { root.shown = root.target; }
+    // 알림 줄: 넓으면 한 줄에 칩 3개, 좁으면 2개
+    private property <int> per-row: root.wide ? 3 : 2;
+    private property <int> slots: root.meter.alerts.length + 1;
+    private property <string> dbg: Debug.open;
+    changed dbg => { if root.dbg == "basis:" + root.meter.key { basis.show(); } }
+    border-radius: 10px; border-width: 1px; border-color: Theme.line; background: Theme.bg;
+    // 그래프 카드의 빈 곳을 누르면 입력 칸 포커스 해제
+    TouchArea { pointer-event(e) => { if e.kind == PointerEventKind.down { FocusOut.release(); } } }
+    // 옆 카드가 더 길어도 내용은 위에 붙임 (남는 높이를 줄 사이에 나누지 않게).
+    // 접기·펼치기: 여백·글자·막대 두께가 k를 따라가고, 사라지는 줄은 Fold로 줄어듦 (계정 카드와 같은 속도)
+    VerticalLayout {
+        alignment: start;
+        padding: Theme.gap-m + (Theme.gap-l - Theme.gap-m) * root.k; spacing: 0px;
+        HorizontalLayout { spacing: 6px; height: 18px + 10px * root.k;
+            Caption { text: root.meter.label; font-size: Theme.size-body + (Theme.size-section - Theme.size-body) * root.k; horizontal-stretch: 1; }
+            if root.k > 0.01 && !root.alerts-page && root.meter.exact: CenterItem { UiButton {
+                opacity: root.k;
+                text: @tr("위젯"); icon: @image-url("icons/eye.svg"); small: true; pill: true; active: root.meter.widget;
+                clicked => { Actions.meter("widget", root.meter.key, !root.meter.widget ? 1 : 0, 0); }
+            } }
+            if root.k > 0.01 && root.meter.exact: CenterItem { UiButton {
+                opacity: root.k;
+                text: root.meter.left ? @tr("남은 양") : @tr("사용량"); icon: @image-url("icons/fold.svg"); small: true; pill: true; ghost: true;
+                clicked => { basis.show(); }
+            } }
+        }
+        Rectangle { height: 6px + 4px * root.k; }
+        HorizontalLayout { alignment: start; spacing: 4px;
+            Text { text: root.meter.exact ? round(root.shown) : "–"; color: Theme.ink; vertical-alignment: bottom;
+                font-size: 22px + (Theme.size-number - 22px) * root.k; font-weight: 600; }
+            // 단위는 숫자의 글자 바닥선에 맞춤
+            if root.meter.exact: VerticalLayout { alignment: end; padding-bottom: 3px + 4px * root.k;
+                Text { text: root.meter.left ? @tr("% 남음") : @tr("% 사용"); color: Theme.faint;
+                    font-size: Theme.size-tiny + (Theme.size-body - Theme.size-tiny) * root.k; }
+            }
+        }
+        Rectangle { height: 6px + 4px * root.k; }
+        track := Rectangle {
+            height: 6px + 4px * root.k; border-radius: self.height / 2; background: Theme.track;
+            Rectangle { x: 0px; height: 100%; width: parent.width * clamp(root.shown, 0, 100) / 100;
+                border-radius: parent.border-radius;
+                background: root.meter.level >= 2 ? Theme.danger : root.meter.level == 1 ? Theme.warn : Theme.good;
+                animate background { duration: 300ms; } }
+            if root.k > 0.01 && root.meter.exact: Rectangle {
+                opacity: root.k;
+                for t in root.meter.thresholds: Mark { at: t; meter: root.meter; track-width: track.width; }
+            }
+        }
+        // 리셋 정보와 알림 줄: 접으면 함께 줄어듦
+        Fold { k: root.k; gap: 10px;
+            VerticalLayout { spacing: 10px;
+                // 리셋 정보: 넓으면 한 줄, 좁으면 남은 시간과 리셋 시각을 두 줄로 (줄바꿈으로 잘리지 않게)
+                if root.meter.reset == "" || root.wide: Hint {
+                    min-height: 20px; color: Theme.sub; wrap: no-wrap; overflow: elide;
+                    text: root.meter.reset == "" ? root.meter.detail : root.meter.detail + " · " + root.meter.reset;
+                }
+                if root.meter.reset != "" && !root.wide: VerticalLayout { spacing: 2px;
+                    Hint { color: Theme.sub; wrap: no-wrap; overflow: elide; text: root.meter.detail; }
+                    Hint { wrap: no-wrap; overflow: elide; text: root.meter.reset; }
+                }
+                if root.meter.exact: Rule {}
+                if root.meter.exact: VerticalLayout {
+                    spacing: 6px;
+                    // 종(그래프 전체) + 알림 칩들 + [알림 추가]. 칩은 한 줄에 per-row개씩
+                    for row in ceil(root.slots / root.per-row): HorizontalLayout {
+                        alignment: start; spacing: 6px;
+                        if row == 0 && root.meter.alerts.length > 0: BellToggle {
+                            on: root.meter.alert-on;
+                            label: root.meter.alert-on ? @tr("이 그래프 알림 모두 끄기") : @tr("이 그래프 알림 모두 켜기");
+                            clicked => { Actions.meter("enabled", root.meter.key, !root.meter.alert-on ? 1 : 0, 0); }
+                        }
+                        for col in root.per-row: HorizontalLayout {
+                            if row * root.per-row + col < root.meter.alerts.length: AlertChip {
+                                meter: root.meter; item: root.meter.alerts[row * root.per-row + col];
+                            }
+                            if row * root.per-row + col == root.meter.alerts.length: AddAlert { meter: root.meter; }
+                        }
+                    }
+                }
+            }
+        }
+        basis := PopupWindow {
+            close-policy: close-on-click-outside; x: parent.width - self.width - 12px; y: 44px; width: 168px; height: 128px;
+            PopupFrame {
+                VerticalLayout { padding: 6px; spacing: 2px;
+                    for t[i] in [@tr("전체 기준"), @tr("사용량"), @tr("남은 양")]: UiButton { text: t; ghost: true; border-width: 0px; start: true;
+                        active: i == (!root.meter.own-basis ? 0 : root.meter.left ? 2 : 1);
+                        clicked => { Actions.meter("basis", root.meter.key, i, 0); basis.close(); } }
+                }
+            }
+        }
+    }
+}
+
+export component AccountCard inherits Panel {
+    // 카드 높이는 내용(접기 진행을 따르는 그래프 카드·아래쪽 줄)을 그대로 따라감. 줄 사이 간격은 각 줄이 위쪽에 가짐
+    inset: Theme.pad; gap: 0px;
+    in property <Account> entry; in property <bool> alerts-page;
+    in property <bool> first; in property <bool> last; in property <int> position;
+    in property <length> room;
+    private property <bool> folder-open;
+    // 카드가 나타나고 잠시 뒤부터는 그래프를 새로 만들어도 0에서 차오르지 않음
+    private property <bool> settled;
+    settle := Timer { interval: 1200ms; running: !root.settled; triggered => { root.settled = true; } }
+    private property <length> meter-gap: Theme.gap-m;
+    private property <length> meter-min-width: 240px;
+    private property <bool> meters-in-row: root.room >= 2 * root.inset
+        + root.entry.meters.length * root.meter-min-width
+        + max(0, root.entry.meters.length - 1) * root.meter-gap;
+    private property <bool> folded: root.entry.collapsed && !root.alerts-page;
+    // 접기 진행 (0 접힘 ~ 1 펼침): 그래프 카드와 아래쪽 줄이 같은 값으로 함께 움직임
+    private property <float> k: root.folded ? 0 : 1;
+    animate k { duration: Motion.resizing ? 0ms : 280ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    private property <float> refill-k: root.entry.refill-mode == "on" ? 1 : 0;
+    animate refill-k { duration: 240ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    private property <float> folder-k: root.folder-open ? 1 : 0;
+    animate folder-k { duration: 200ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    private property <length> meter-width: root.meters-in-row
+        ? (root.room - 2 * root.inset - max(0, root.entry.meters.length - 1) * root.meter-gap) / max(1, root.entry.meters.length)
+        : root.room - 2 * root.inset;
+    private property <bool> has-extras: root.entry.credits != "" || root.entry.refills != "";
+    // 넓으면 요금제 옆, 좁으면 한 줄 아래에 크레딧·리필권
+    private property <bool> extras-inline: root.room >= 760px;
+    // 머리줄 높이는 이름·요금제 줄에 맞춤 (가운데 정렬한 단추가 높이를 묶지 않게)
+    HorizontalLayout {
+        spacing: Theme.gap-m; height: max(52px, titles.preferred-height);
+        if !root.alerts-page && !(root.first && root.last): DropArea {
+            width: 16px;
+            can-drop(e) => { return Actions.dragged-account(e.data) != "" ? DragAction.move : DragAction.none; }
+            dropped(e) => { Actions.account("move", Actions.dragged-account(e.data), root.position); return DragAction.move; }
+            DragArea {
+                allow-move: true; data: Actions.drag-payload(root.entry.id);
+                Text { width: 100%; height: 100%; text: "⠿"; font-size: Theme.size-section; color: Theme.faint;
+                    horizontal-alignment: center; vertical-alignment: center; accessible-label: @tr("끌어서 계정 순서 변경"); }
+            }
+        }
+        CenterItem { ClickTarget {
+            label: root.entry.provider == "claude" ? @tr("Claude 사용량 페이지") : @tr("ChatGPT 사용량 페이지");
+            width: 44px; height: 44px; clicked => { Actions.account("openUsage", root.entry.provider, ""); }
+            Image {
+                width: 40px; height: 40px;
+                source: root.entry.provider == "claude" ? @image-url("icons/claude.svg") : @image-url("icons/codex.svg");
+                colorize: root.entry.provider == "claude" ? #d97757 : Theme.ink;
+            }
+        } }
+        titles := VerticalLayout {
+            horizontal-stretch: 1; alignment: center; spacing: 6px;
+            Rectangle {
+                height: 26px; horizontal-stretch: 1;
+                if name.text == "" && !name.has-focus: Text {
+                    x: 0; width: 100%; height: 100%;
+                    text: root.entry.title; color: Theme.ink; font-size: Theme.size-title; font-weight: 600;
+                    horizontal-alignment: left; vertical-alignment: center; overflow: elide;
+                }
+                name := AccountName {
+                    width: 100%; height: 100%; account-id: root.entry.id; saved: root.entry.label;
+                }
+            }
+            HorizontalLayout { height: 24px; spacing: Theme.gap-s;
+                CenterItem {
+                    Rectangle { width: 8px; height: 8px; border-radius: 4px;
+                        background: root.entry.status == "in" ? Theme.good : root.entry.status == "out" ? Theme.danger : Theme.faint; }
+                }
+                if root.entry.plan != "": CenterItem { Chip { text: root.entry.plan; accent: true; } }
+                if root.extras-inline && root.entry.credits != "": CenterItem { Chip { text: root.entry.credits; tone: 1; } }
+                if root.extras-inline && root.entry.refills != "": CenterItem { Chip { text: root.entry.refills; tone: 2; } }
+                Text { text: root.entry.details; vertical-alignment: center; color: Theme.sub; font-size: Theme.size-small; overflow: elide; horizontal-stretch: 1; }
+            }
+            if !root.extras-inline && root.has-extras: HorizontalLayout { height: 24px; spacing: Theme.gap-s; alignment: start;
+                if root.entry.credits != "": Chip { text: root.entry.credits; tone: 1; }
+                if root.entry.refills != "": Chip { text: root.entry.refills; tone: 2; }
+            }
+        }
+        if !root.alerts-page: CenterItem { UiButton {
+            icon: @image-url("icons/external.svg"); text: root.room > 600px ? @tr("사용량 페이지") : "";
+            label: @tr("사용량 페이지"); small: true; pill: true; ghost: true;
+            clicked => { Actions.account("openUsage", root.entry.provider, ""); }
+        } }
+        if !root.alerts-page: CenterItem { HorizontalLayout { spacing: Theme.gap-s;
+            if root.room > 520px: CenterItem { Hint { text: @tr("위젯"); } }
+            CenterItem { Toggle { label: @tr("계정 위젯 표시"); checked: root.entry.show-widget;
+                clicked => { Actions.account("show", root.entry.id, !root.entry.show-widget ? "true" : "false"); } } }
+        } }
+        if !root.alerts-page: CenterItem { UiButton {
+            icon: root.folded ? @image-url("icons/fold-right.svg") : @image-url("icons/fold.svg"); label: root.folded ? @tr("펼치기") : @tr("접기"); small: true; ghost: true;
+            border-width: 0px; clicked => { Actions.account("collapse", root.entry.id, !root.folded ? "true" : "false"); }
+        } }
+    }
+    if root.entry.meters.length == 0: VerticalLayout { padding-top: Theme.gap-l; Hint { text: @tr("사용량 정보 없음"); } }
+    // 리필권이 지금 없어도 미리 설정 가능 (모든 공급자)
+    if root.alerts-page: VerticalLayout { padding-top: Theme.gap-l; SettingRow {
+        title: @tr("리필권 만료 알림");
+        subtitle: (root.entry.refill-mode == "default" ? @tr("전체 설정과 동일") : root.entry.refill-mode == "off" ? @tr("이 계정은 알림 끔") : @tr("이 계정만 따로 설정"))
+            + (root.entry.refills == "" ? @tr(" · 현재 리필권 없음") : "");
+        Segments { options: [@tr("기본값"), @tr("켜기"), @tr("끄기")];
+            index: root.entry.refill-mode == "on" ? 1 : root.entry.refill-mode == "off" ? 2 : 0;
+            selected(i) => { Actions.refill(root.entry.id, i == 1 ? "on" : i == 2 ? "off" : "default", root.entry.refill-lead); } }
+    } }
+    if root.alerts-page: Fold { k: root.refill-k; gap: Theme.gap-m; SettingRow {
+        title: @tr("알림 시점"); subtitle: @tr("이 계정의 리필권 만료 얼마 전에 알릴지 설정");
+        LeadTime { minutes: root.entry.refill-lead; edited(v) => { Actions.refill(root.entry.id, "on", v); } }
+    } }
+    if root.entry.meters.length > 0 && root.meters-in-row: HorizontalLayout {
+        padding-top: Theme.gap-l; spacing: root.meter-gap;
+        for meter in root.entry.meters: MeterCard {
+            horizontal-stretch: 1; min-width: 0px; preferred-width: 0px;
+            meter: meter; folded: root.folded; k: root.k; alerts-page: root.alerts-page; wide: root.meter-width >= 400px; intro: !root.settled;
+        }
+    }
+    if root.entry.meters.length > 0 && !root.meters-in-row: VerticalLayout {
+        padding-top: Theme.gap-l; spacing: root.meter-gap;
+        for meter in root.entry.meters: MeterCard {
+            horizontal-stretch: 1;
+            meter: meter; folded: root.folded; k: root.k; alerts-page: root.alerts-page; wide: root.meter-width >= 400px; intro: !root.settled;
+        }
+    }
+    // 아래쪽 줄: 접으면 그래프 카드와 같은 속도로 줄어듦
+    if !root.alerts-page: Fold { k: root.k; gap: Theme.gap-l;
+        Rule {}
+        Rectangle { height: Theme.gap-m; }
+        HorizontalLayout {
+            spacing: Theme.gap-s;
+            Hint { text: root.entry.footer; horizontal-stretch: 1; }
+            if root.entry.folder != "": CenterItem { UiButton { text: @tr("폴더"); icon: root.folder-open ? @image-url("icons/fold.svg") : @image-url("icons/fold-right.svg");
+                small: true; ghost: true; border-width: 0px; clicked => { root.folder-open = !root.folder-open; } } }
+            CenterItem { UiButton { text: @tr("지금 확인"); small: true; ghost: true; clicked => { Actions.account("probeNow", root.entry.id, ""); } } }
+            CenterItem { UiButton { text: root.entry.status == "in" ? @tr("다시 로그인") : @tr("로그인"); small: true; ghost: true;
+                clicked => { Actions.account("login", root.entry.id, ""); } } }
+            CenterItem { UiButton { text: @tr("삭제"); small: true; danger: true; ghost: true; clicked => { Actions.confirm("remove", root.entry.id, @tr("{} 계정 삭제 확인", root.entry.title)); } } }
+        }
+        Fold { k: root.folder-k; gap: Theme.gap-s; Hint { text: root.entry.folder; } }
+    }
+}
+
+// 고르기 칸: [현재 값  ⌄] 누르면 아래에 목록 (다른 입력 칸과 같은 모양)
+export component Dropdown inherits ClickTarget {
+    in property <[string]> model;
+    in property <int> current;
+    callback selected(int);
+    height: 36px; border-radius: 10px; border-width: 1px;
+    border-color: root.focused ? Theme.accent : root.hovered ? Theme.line-hot : Theme.field-line;
+    background: Theme.field;
+    accessible-role: combobox; accessible-value: root.model[root.current];
+    animate border-color { duration: 120ms; }
+    clicked => { menu.show(); }
+    HorizontalLayout { padding-left: 12px; padding-right: 10px; spacing: 8px;
+        Text { text: root.model[root.current]; color: Theme.ink; font-size: Theme.size-body; vertical-alignment: center;
+            horizontal-stretch: 1; overflow: elide; accessible-role: none; }
+        CenterItem { Image { width: 14px; height: 14px; source: @image-url("icons/fold.svg"); colorize: Theme.sub; } }
+    }
+    menu := PopupWindow {
+        close-policy: close-on-click-outside;
+        x: 0; y: root.height + 6px; width: root.width; height: root.model.length * 34px + max(0, root.model.length - 1) * 2px + 12px;
+        PopupFrame {
+            VerticalLayout { padding: 6px; spacing: 2px;
+                for t[i] in root.model: UiButton { text: t; ghost: true; border-width: 0px; start: true; active: i == root.current;
+                    clicked => { root.selected(i); menu.close(); } }
+            }
+        }
+    }
+}
+
+
+// 계정 추가 단추와 공급자 고르기 메뉴
+export component AddAccount inherits ClickTarget {
+    private property <string> dbg: Debug.open;
+    changed dbg => { if root.dbg == "providers" { providers.show(); } }
+    label: @tr("계정 추가");
+    height: 28px; border-radius: 14px; border-width: 1px;
+    border-color: root.focused ? Theme.accent : Theme.line; background: root.hovered ? Theme.track : Theme.selected;
+    opacity: root.enabled ? 1 : 0.45;
+    animate background { duration: 120ms; }
+    clicked => { providers.show(); }
+    HorizontalLayout { padding-left: 9px; padding-right: 12px; spacing: 5px;
+        CenterItem { Image { width: 14px; height: 14px; source: @image-url("icons/plus.svg"); colorize: Theme.ink; } }
+        Text { text: @tr("추가"); font-size: Theme.size-small; vertical-alignment: center; color: Theme.ink; accessible-role: none; }
+    }
+    providers := PopupWindow {
+        close-policy: close-on-click-outside; y: parent.height + 6px; width: 240px; height: 124px;
+        PopupFrame {
+            VerticalLayout { padding: 6px; spacing: 2px; alignment: start;
+                UiButton { text: "Claude"; icon: @image-url("icons/claude.svg"); icon-colored: true; icon-color: #d97757; ghost: true; border-width: 0px; start: true;
+                    clicked => { Actions.account("addNew", "claude", ""); providers.close(); } }
+                UiButton { text: "ChatGPT · Codex"; icon: @image-url("icons/codex.svg"); icon-colored: true; icon-color: Theme.ink; ghost: true; border-width: 0px; start: true;
+                    clicked => { Actions.account("addNew", "codex", ""); providers.close(); } }
+                Rectangle { height: 5px; }
+                Rule {}
+                HorizontalLayout { padding-left: 14px; padding-right: 10px; padding-top: 8px;
+                    Hint { text: @tr("CLI가 없으면 자동 설치"); wrap: no-wrap; overflow: elide; }
+                }
+            }
+        }
+    }
+}

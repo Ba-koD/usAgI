@@ -1,0 +1,421 @@
+import { FocusOut, Theme, CenterItem, NavItem, UiButton, Segments, Toggle } from "style.slint";
+import { AboutSlint, Palette, ScrollView } from "std-widgets.slint";
+import { Account, AccountCard, Actions, AddAccount, Banner, Debug, Fold, Dropdown, Motion, LeadTime, BarLength, TextField, Caption, Group, Hint, Heading, Panel, PrefToggle, Rule, Section, SettingRow } from "components.slint";
+import "fonts/Pretendard-Medium.otf";
+import "fonts/Pretendard-SemiBold.otf";
+export { Account, Meter, AlertItem, Actions, Debug, Motion } from "components.slint";
+
+export struct Preferences {
+    widget: bool, side: string, monitor-index: int, mode: string, theme: string, locale: string, logo: string, bar-px: int, bar-min: int, bar-max: int, bar-default: int, basis: string, refresh: int,
+    notify: bool, nap: bool, login: bool, refill: bool, refill-lead: int, urgent: bool, urgent-supported: bool, urgent-status: string,
+    autostart: bool, auto-update: bool,
+}
+export struct UpdateInfo {
+    status: string, notes: string, install: string, busy: bool, managed: bool, failed: bool,
+}
+export struct LoginInfo {
+    id: string, provider: string, message: string, can-open: bool, accepts-code: bool, done: bool, failed: bool,
+}
+// 확인 창 뒤 어두운 배경 (서서히)
+component Backdrop inherits Rectangle {
+    private property <float> appear: 0;
+    opacity: root.appear;
+    animate appear { duration: 180ms; easing: ease-out; }
+    init => { root.appear = 1; }
+    @children
+}
+
+export component SettingsView inherits Window {
+    title: @tr("usAgI 설정");
+    // 제목 표시줄 아이콘: 어두운 테마는 흰 토끼, 밝은 테마는 진한 토끼
+    icon: root.prefs.logo == "white" || (root.prefs.logo != "ink" && Theme.dark) ? @image-url("icons/rabbit.svg") : @image-url("icons/rabbit-ink.svg");
+    preferred-width: 1000px; preferred-height: 700px;
+    // 최소 크기: 계정 카드 머리줄(로고·이름·위젯 켜기)과 그래프 한 장, 설정 한 줄이 잘리지 않는 크기
+    min-width: 600px; min-height: 500px;
+    background: Theme.bg;
+    default-font-family: "Pretendard";
+    default-font-weight: 500;
+    in property <[Account]> accounts;
+    in property <Preferences> prefs;
+    in property <UpdateInfo> update;
+    in property <LoginInfo> login;
+    in property <[string]> monitors;
+    in property <[string]> monitor-ids;
+    in property <string> version;
+    in property <string> folder;
+    in property <string> font-license;
+    in property <string> error;
+    in property <bool> windows;
+    in property <bool> portable;
+    in-out property <int> page;
+    // 개발용 화면 캡처: 내용을 이만큼 내린 상태로
+    in-out property <length> debug-scroll;
+    changed debug-scroll => { scroll.viewport-y = -root.debug-scroll; }
+    private property <bool> show-font-license;
+    private property <[string]> pages: [@tr("사용량"), root.windows ? @tr("위젯") : @tr("메뉴 막대"), @tr("알림"), @tr("일반"), @tr("정보")];
+    private property <string> description: root.page == 1 ? (root.windows ? @tr("작업 표시줄에 사용량을 항상 표시") : @tr("메뉴 막대에 사용량을 항상 표시"))
+        : root.page == 2 ? @tr("사용량이 설정한 기준에 도달하면 {} 알림 표시", root.windows ? "Windows" : "macOS")
+        : root.page == 4 ? "usAgI v" + root.version : "";
+    // 820px 이하: 사이드바를 아이콘 줄로. 680px 이하: 여백과 버튼 글자를 줄임
+    private property <bool> narrow;
+    private property <bool> small;
+    private property <length> window-width: 1000px;
+    in-out property <bool> sidebar-flipped;
+    private property <bool> sidebar-expanded: root.narrow == root.sidebar-flipped;
+    private property <length> sidebar-rail: 64px;
+    private property <length> sidebar-full: 212px;
+    private property <length> sidebar-width: root.sidebar-width-target;
+    private property <length> sidebar-space: root.narrow ? root.sidebar-rail : root.sidebar-width-target;
+    private property <length> sidebar-width-target: root.sidebar-expanded ? root.sidebar-full : root.sidebar-rail;
+    private property <float> sidebar-backdrop: root.narrow && root.sidebar-flipped ? 0.38 : 0.0;
+    private property <float> sidebar-progress: (root.sidebar-width - root.sidebar-rail) / (root.sidebar-full - root.sidebar-rail);
+    private property <float> sidebar-label-opacity: clamp((root.sidebar-progress - 0.2) / 0.6, 0.0, 1.0);
+    private property <length> pane-width: root.window-width - root.sidebar-space;
+    private property <length> content-max: root.page == 0 ? 1040px : 780px;
+    private property <length> gutter: max(root.small ? Theme.gap-l : 32px, (root.pane-width - root.content-max) / 2);
+    private property <[image]> icons: [@image-url("icons/usage.svg"), @image-url("icons/widget.svg"), @image-url("icons/alerts.svg"), @image-url("icons/general.svg"), @image-url("icons/about.svg")];
+    changed width => {
+        root.window-width = root.width; root.narrow = root.width <= 820px; root.small = root.width <= 680px;
+        // 크기를 바꾸는 동안: 카드 높이 애니메이션 없이 바로 맞춤 (마지막 변화 300ms 뒤 다시 켬)
+        Motion.resizing = true;
+        resize-done.stop();
+        resize-done.start();
+        root.resizing();
+    }
+    // 크기를 바꾸는 중 (Windows: 끄는 동안 애니메이션 시계를 앱이 돌리기 시작)
+    callback resizing();
+    resize-done := Timer {
+        interval: 300ms; running: false;
+        triggered => { Motion.resizing = false; self.stop(); }
+    }
+    changed narrow => { root.sidebar-flipped = false; }
+    // 조건부 줄이 생기고 없어질 때 (높이·투명도)
+    private property <float> refill-k: root.prefs.refill ? 1 : 0;
+    animate refill-k { duration: 240ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    private property <float> warn-k: root.prefs.refresh <= 1 ? 1 : 0;
+    animate warn-k { duration: 240ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    private property <float> license-k: root.show-font-license ? 1 : 0;
+    animate license-k { duration: 280ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    // 입력 칸 포커스를 뺄 때 옮겨 갈 빈 칸 (단추·카드·빈 곳을 누르면)
+    private property <int> blur: FocusOut.tick;
+    changed blur => { sink.focus(); }
+    sink := FocusScope { x: 0; y: 0; width: 0px; height: 0px; }
+    // 창의 빈 곳을 누르면 포커스 해제 (맨 아래 층)
+    TouchArea { pointer-event(e) => { if e.kind == PointerEventKind.down { FocusOut.release(); } } }
+    // 화면 테마: 시스템(기본) / 라이트 / 다크
+    changed prefs => {
+        Palette.color-scheme = root.prefs.theme == "dark" ? ColorScheme.dark : root.prefs.theme == "light" ? ColorScheme.light : ColorScheme.unknown;
+    }
+    // 사이드바는 창 크기를 끄는 동안에도 부드럽게 (Windows는 앱이 시계를 직접 돌림). 시계가 멈추는 환경에서는 바로
+    animate sidebar-width, sidebar-space, sidebar-backdrop { duration: Motion.resizing && !Motion.live-clock ? 0ms : 240ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    HorizontalLayout {
+        spacing: 0px;
+        Rectangle { width: root.sidebar-space; }
+        VerticalLayout {
+            padding-top: 28px; spacing: Theme.gap-l;
+            // 페이지 제목 줄 (스크롤되지 않음)
+            VerticalLayout {
+                padding-left: root.gutter; padding-right: root.gutter; spacing: 6px;
+                HorizontalLayout { spacing: Theme.gap-m; height: 40px;
+                    Heading { text: root.pages[root.page]; horizontal-stretch: 0; }
+                    if root.page == 0: CenterItem { AddAccount { enabled: root.login.id == "" || root.login.done; } }
+                    Rectangle { horizontal-stretch: 1; }
+                    if root.page == 0: CenterItem { Segments { options: [@tr("사용량"), @tr("남은 양")]; index: root.prefs.basis == "left" ? 1 : 0;
+                        selected(i) => { Actions.pref("basis", i == 1 ? "left" : "used"); } } }
+                    if root.page == 0: CenterItem { UiButton { text: root.small ? "" : @tr("새로고침"); icon: @image-url("icons/refresh.svg"); label: @tr("새로고침"); clicked => { Actions.command("refresh"); } } }
+                    if root.page == 2: CenterItem { UiButton { text: root.small ? "" : @tr("알림 테스트"); icon: @image-url("icons/alerts.svg"); label: @tr("알림 테스트"); clicked => { Actions.command("testNotify"); } } }
+                    if root.page >= 1 && root.page <= 3: CenterItem { UiButton {
+                        text: root.small ? "" : @tr("초기화"); icon: @image-url("icons/reset.svg"); danger: true; label: @tr("{} 설정 초기화", root.pages[root.page]);
+                        clicked => {
+                            Actions.ask("resetPage", root.page == 1 ? "widget" : root.page == 2 ? "alerts" : "general", @tr("{} 설정 초기화", root.pages[root.page]),
+                                root.page == 1 ? (root.windows ? @tr("위젯 표시, 위치, 표시 값, 막대 길이를 기본값으로 되돌림") : @tr("표시 값을 기본값으로 되돌림")) : root.page == 2 ? @tr("알림 켜기·끄기, 리필권 알림, 그래프별 알림 기준을 기본값으로 되돌림. 계정·로그인은 유지") : (root.windows ? @tr("화면 테마, 언어, 로고 색, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지") : @tr("화면 테마, 언어, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지")));
+                        }
+                    } }
+                }
+                if root.description != "": Hint { text: root.description; }
+                if root.error != "": Banner { text: root.error; }
+            }
+            scroll := ScrollView {
+                vertical-stretch: 1;
+                viewport-width: self.visible-width;
+                // 여백을 스크롤 안쪽에 두어 스크롤 막대가 카드와 겹치지 않음
+                HorizontalLayout {
+                    padding-left: root.gutter; padding-right: root.gutter; padding-top: 2px; padding-bottom: 32px;
+                    VerticalLayout {
+                        spacing: root.page == 0 ? Theme.gap-l : Theme.gap-xl; alignment: start;
+                        if root.page == 0 && root.login.id != "": Panel {
+                            gap: Theme.gap-m;
+                            HorizontalLayout { spacing: Theme.gap-m;
+                                CenterItem { Image { width: 32px; height: 32px;
+                                    source: root.login.provider == "codex" ? @image-url("icons/codex.svg") : @image-url("icons/claude.svg");
+                                    colorize: root.login.provider == "codex" ? Theme.ink : #d97757; } }
+                                VerticalLayout { horizontal-stretch: 1; alignment: center; spacing: 3px;
+                                    Caption { text: root.login.provider == "codex" ? @tr("ChatGPT · Codex 계정 연결") : @tr("Claude 계정 연결"); font-size: Theme.size-row; }
+                                    Hint { text: root.login.message == "" ? @tr("공식 로그인 진행 중") : root.login.message;
+                                        color: root.login.failed ? Theme.danger : root.login.done ? Theme.good : Theme.faint; }
+                                }
+                                if root.login.can-open: CenterItem { UiButton { text: @tr("브라우저 열기"); clicked => { Actions.command("loginOpen"); } } }
+                                if root.login.failed: CenterItem { UiButton { text: @tr("다시 시도"); primary: true; clicked => { Actions.account("login", root.login.id, ""); } } }
+                                CenterItem { UiButton { text: root.login.done ? @tr("닫기") : @tr("취소"); ghost: true; clicked => { Actions.command("loginCancel"); } } }
+                            }
+                            if root.login.accepts-code: HorizontalLayout {
+                                padding-left: 44px; spacing: Theme.gap-s;
+                                code := TextField {
+                                    horizontal-stretch: 1; placeholder: @tr("인증 코드");
+                                    accepted(value) => { if value != "" { Actions.account("loginCode", "", value); self.text = ""; } }
+                                }
+                                UiButton { text: @tr("코드 보내기"); primary: true; enabled: code.text != "";
+                                    clicked => { Actions.account("loginCode", "", code.text); code.text = ""; } }
+                            }
+                        }
+                        // 계정이 하나도 없을 때
+                        if root.page == 0 && root.login.id == "" && root.accounts.length == 0: Panel {
+                            inset: 32px; gap: 10px;
+                            HorizontalLayout { alignment: center;
+                                Image { width: 44px; height: 44px; source: @image-url("icons/rabbit.svg"); colorize: Theme.faint; } }
+                            Rectangle { height: 2px; }
+                            Caption { text: @tr("연결된 계정 없음"); font-size: Theme.size-section; horizontal-alignment: center; }
+                            Hint { text: @tr("Claude Code·Codex CLI로 로그인한 계정의 사용량 표시. CLI가 없으면 공식 설치 프로그램으로 자동 설치"); horizontal-alignment: center; }
+                            Rectangle { height: 6px; }
+                            HorizontalLayout { alignment: center; spacing: Theme.gap-s;
+                                UiButton { text: "Claude"; icon: @image-url("icons/claude.svg"); icon-colored: true; icon-color: #d97757; clicked => { Actions.account("addNew", "claude", ""); } }
+                                UiButton { text: "ChatGPT · Codex"; icon: @image-url("icons/codex.svg"); icon-colored: true; icon-color: Theme.ink; clicked => { Actions.account("addNew", "codex", ""); } }
+                            }
+                        }
+                        if root.page == 2: Group {
+                            PrefToggle { title: @tr("알림 받기"); subtitle: @tr("끄면 그래프별 알림도 모두 꺼짐"); key: "notify"; checked: root.prefs.notify; }
+                            Rule {}
+                            PrefToggle { title: @tr("한도 도달·리셋 알림"); subtitle: @tr("Claude 한도에 도달했을 때와 한도가 리셋됐을 때 알림"); key: "napNotify"; checked: root.prefs.nap; }
+                            Rule {}
+                            PrefToggle { title: @tr("로그인 만료 알림"); subtitle: @tr("로그인이 만료되어 다시 로그인해야 할 때 알림"); key: "loginNotify"; checked: root.prefs.login; }
+                            Rule {}
+                            VerticalLayout {
+                                SettingRow { title: @tr("리필권 만료 알림"); subtitle: @tr("리필권이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경");
+                                    Toggle { label: @tr("리필권 만료 알림"); checked: root.prefs.refill;
+                                        clicked => { Actions.pref("refillNotify", !root.prefs.refill ? "true" : "false"); } }
+                                }
+                                Fold { k: root.refill-k; gap: 12px;
+                                    SettingRow { title: @tr("알림 시점"); subtitle: @tr("리필권 만료 얼마 전에 알릴지 설정");
+                                        LeadTime { minutes: root.prefs.refill-lead; edited(v) => { Actions.pref("refillLead", "" + v); } }
+                                    }
+                                }
+                            }
+                            if root.windows && root.prefs.urgent-supported: Rule {}
+                            if root.windows && root.prefs.urgent-supported: PrefToggle { title: @tr("방해 금지 중에도 알림"); key: "urgent"; checked: root.prefs.urgent; }
+                            if root.windows: Rule {}
+                            if root.windows: SettingRow { title: @tr("Windows 알림 설정"); subtitle: root.prefs.urgent-status;
+                                UiButton { text: @tr("Windows 설정 열기"); clicked => { Actions.command("openNotifySettings"); } } }
+                        }
+                        if root.page == 0 || root.page == 2: VerticalLayout {
+                            spacing: 10px;
+                            if root.page == 2 && root.accounts.length > 0: Section { text: @tr("그래프별 알림"); }
+                            VerticalLayout {
+                                spacing: Theme.gap-l;
+                                for acc[i] in root.accounts: AccountCard {
+                                    entry: acc; position: i; alerts-page: root.page == 2; first: i == 0; last: i + 1 == root.accounts.length;
+                                    room: root.pane-width - 2 * root.gutter;
+                                }
+                            }
+                        }
+                        if root.page == 1 && root.windows: Group {
+                            PrefToggle { title: @tr("작업 표시줄 위젯 표시"); key: "widget"; checked: root.prefs.widget; }
+                        }
+                        if root.page == 1 && root.windows: Group {
+                            title: @tr("위치"); dim: !root.prefs.widget;
+                            SettingRow { title: @tr("모니터"); subtitle: @tr("선택한 모니터가 연결되어 있지 않으면 주 모니터에 표시");
+                                Dropdown {
+                                    width: root.small ? 170px : 220px; label: @tr("위젯을 표시할 모니터");
+                                    model: root.monitors; current: root.prefs.monitor-index;
+                                    selected(i) => { Actions.pref("monitor", i); }
+                                }
+                            }
+                            Rule {}
+                            SettingRow { title: @tr("작업 표시줄 내 위치");
+                                Segments { options: [@tr("왼쪽"), @tr("오른쪽")]; index: root.prefs.side == "left" ? 0 : 1;
+                                    selected(i) => { Actions.pref("side", i == 0 ? "left" : "right"); } } }
+                        }
+                        if root.page == 1: Group {
+                            title: @tr("모양"); dim: root.windows && !root.prefs.widget;
+                            SettingRow { title: @tr("표시 값"); subtitle: root.windows ? @tr("위젯을 우클릭해도 전환 가능") : @tr("메뉴 막대 메뉴에서도 변경 가능");
+                                Segments { options: [@tr("퍼센트"), @tr("남은 시간")]; index: root.prefs.mode == "time" ? 1 : 0;
+                                    selected(i) => { Actions.pref("mode", i == 0 ? "percent" : "time"); } } }
+                            if root.windows: Rule {}
+                            if root.windows: SettingRow { title: @tr("막대 길이"); subtitle: @tr("남은 시간을 표시할 때의 막대 길이 · 기본 {}px", root.prefs.bar-default);
+                                BarLength {
+                                    value: root.prefs.bar-px; minimum: root.prefs.bar-min; maximum: root.prefs.bar-max; small: root.small;
+                                    commit(v) => { Actions.pref("barPx", "" + v); }
+                                }
+                            }
+                        }
+                        if root.page == 3: Group {
+                            title: @tr("화면");
+                            SettingRow { title: @tr("화면 테마"); subtitle: @tr("시스템을 선택하면 OS의 라이트·다크 설정을 따름");
+                                Segments { options: [@tr("시스템"), @tr("라이트"), @tr("다크")];
+                                    index: root.prefs.theme == "light" ? 1 : root.prefs.theme == "dark" ? 2 : 0;
+                                    selected(i) => { Actions.pref("theme", i == 1 ? "light" : i == 2 ? "dark" : "system"); } } }
+                            Rule {}
+                            SettingRow { title: @tr("언어"); subtitle: @tr("시스템을 선택하면 OS 언어를 따름");
+                                Segments { options: [@tr("시스템"), "English", "한국어"];
+                                    index: root.prefs.locale == "en" ? 1 : root.prefs.locale == "ko" ? 2 : 0;
+                                    selected(i) => { Actions.pref("locale", i == 1 ? "en" : i == 2 ? "ko" : "system"); } } }
+                            if root.windows: Rule {}
+                            if root.windows: SettingRow { title: @tr("로고 색"); subtitle: @tr("작업 표시줄, 제목 표시줄, 알림에 표시되는 토끼 로고의 색. 자동을 선택하면 라이트·다크 모드를 따름");
+                                Segments { options: [@tr("자동"), @tr("흰색"), @tr("검은색")];
+                                    index: root.prefs.logo == "white" ? 1 : root.prefs.logo == "ink" ? 2 : 0;
+                                    selected(i) => { Actions.pref("logo", i == 1 ? "white" : i == 2 ? "ink" : "auto"); } } }
+                        }
+                        if root.page == 3: Group {
+                            title: @tr("동작");
+                            VerticalLayout {
+                                SettingRow { title: @tr("갱신 주기"); subtitle: @tr("사용량을 다시 확인하는 간격");
+                                    if !root.small: Segments { options: [@tr("1분"), @tr("3분"), @tr("5분"), @tr("10분"), @tr("15분")]; index: root.prefs.refresh;
+                                        selected(i) => { Actions.pref("refresh", i); } }
+                                    if root.small: Dropdown {
+                                        width: 110px; label: @tr("갱신 주기");
+                                        model: [@tr("1분"), @tr("3분"), @tr("5분"), @tr("10분"), @tr("15분")]; current: root.prefs.refresh;
+                                        selected(i) => { Actions.pref("refresh", i); }
+                                    }
+                                }
+                                // 1분·3분: 공식 CLI를 자주 띄우고 사용량 서버에도 자주 물어봄
+                                Fold { k: root.warn-k; gap: 10px;
+                                    Hint { text: @tr("1분·3분은 요청이 잦아 요청 제한에 걸릴 수 있음"); color: Theme.warn; }
+                                }
+                            }
+                            Rule {}
+                            PrefToggle { title: root.windows ? @tr("Windows 시작 시 실행") : @tr("로그인 시 실행"); key: "autostart"; checked: root.prefs.autostart; }
+                        }
+                        if root.page == 3: Group {
+                            title: @tr("데이터");
+                            SettingRow { title: @tr("설정 폴더"); subtitle: root.portable ? @tr("포터블 · {}", root.folder) : root.folder;
+                                UiButton { text: @tr("열기"); label: @tr("설정 폴더 열기"); clicked => { Actions.command("openFolder"); } } }
+                            Rule {}
+                            SettingRow { title: @tr("고급 설정 파일"); subtitle: @tr("표시할 공급자, 추가 로그 폴더 등");
+                                UiButton { text: @tr("열기"); label: @tr("고급 설정 파일 열기"); clicked => { Actions.command("openConfig"); } } }
+                            Rule {}
+                            SettingRow { title: @tr("모든 설정 초기화"); subtitle: @tr("계정·로그인만 남기고 모든 설정과 알림 기준을 기본값으로 되돌림");
+                                UiButton { text: @tr("초기화"); danger: true;
+                                    clicked => { Actions.ask("resetSettings", "", @tr("모든 설정 초기화"), @tr("계정·로그인만 남기고 모든 설정과 알림 기준을 기본값으로 되돌림")); } } }
+                        }
+                        if root.page == 3: Group {
+                            title: @tr("종료");
+                            SettingRow { title: @tr("usAgI 종료"); subtitle: root.windows ? @tr("위젯과 알림 영역 아이콘 모두 닫기") : @tr("메뉴 막대에서 usAgI 종료");
+                                UiButton { text: @tr("종료"); danger: true; clicked => { Actions.confirm("quit", "", @tr("usAgI 종료 확인")); } } }
+                        }
+                        if root.page == 4: Group {
+                            SettingRow { title: @tr("업데이트"); subtitle: root.update.status; alert: root.update.failed;
+                                if root.update.install != "": UiButton { text: root.update.install; primary: true; clicked => { Actions.command("installUpdate"); } }
+                                UiButton { text: @tr("업데이트 확인"); enabled: !root.update.busy; clicked => { Actions.command("checkUpdate"); } } }
+                            if !root.update.managed: Rule {}
+                            if !root.update.managed: PrefToggle { title: @tr("자동 업데이트"); subtitle: @tr("새 버전을 미리 받아 두고 설정 창을 닫으면 설치"); key: "autoUpdate"; checked: root.prefs.auto-update; }
+                            Rule {}
+                            SettingRow { title: @tr("릴리스 노트"); subtitle: @tr("GitHub 릴리스 페이지");
+                                UiButton { text: @tr("열기"); label: @tr("GitHub 릴리스 보기"); clicked => { Actions.command("openRelease"); } } }
+                        }
+                        if root.page == 4 && root.update.notes != "": Group { title: @tr("변경 내용"); Caption { text: root.update.notes; } }
+                        if root.page == 4: Group {
+                            title: @tr("글꼴");
+                            VerticalLayout {
+                                SettingRow {
+                                    title: "Pretendard"; subtitle: "SIL Open Font License 1.1";
+                                    UiButton {
+                                        text: root.show-font-license ? @tr("닫기") : @tr("라이선스");
+                                        clicked => { root.show-font-license = !root.show-font-license; }
+                                    }
+                                }
+                                Fold { k: root.license-k; gap: 12px; Hint { text: root.font-license; } }
+                            }
+                        }
+                        // Slint 표시는 따로 한 패널에 가운데 (위아래 여백 같게)
+                        if root.page == 4: Group {
+                            title: @tr("UI 라이브러리");
+                            HorizontalLayout { alignment: center;
+                                AboutSlint { width: 260px; height: self.min-height; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Rectangle {
+        visible: Actions.confirm-cmd == "" && root.sidebar-backdrop > 0.01;
+        // 사이드바 바깥만 덮음: 마우스가 사이드바를 벗어나 여기로 오면 닫힘
+        x: root.sidebar-width; width: parent.width - root.sidebar-width;
+        background: #000;
+        opacity: root.sidebar-backdrop;
+        TouchArea {
+            clicked => { root.sidebar-flipped = false; }
+            changed has-hover => { if self.has-hover && root.narrow && root.sidebar-flipped { root.sidebar-flipped = false; } }
+        }
+    }
+    Rectangle {
+        x: 0; y: 0; width: root.sidebar-width; height: 100%;
+        clip: true; background: Theme.side;
+        Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
+        VerticalLayout {
+            padding: 10px; padding-top: 22px; spacing: 2px;
+            // 앱 이름 + 접기 단추. 접으면 이름은 사라지고 단추가 아이콘 줄 가운데로 옮겨 감
+            Rectangle {
+                height: 52px;
+                Image {
+                    x: 8px; y: (parent.height - self.height) / 2; width: 28px; height: 28px;
+                    opacity: root.sidebar-label-opacity;
+                    source: @image-url("icons/rabbit.svg"); colorize: Theme.ink;
+                }
+                VerticalLayout {
+                    x: 46px; y: 0; width: 110px; height: 100%; alignment: center; spacing: 1px;
+                    opacity: root.sidebar-label-opacity;
+                    Text { text: "usAgI"; color: Theme.ink; font-size: Theme.size-title; font-weight: 600; }
+                    Text { text: "v" + root.version; color: Theme.faint; font-size: Theme.size-tiny; }
+                }
+                UiButton {
+                    width: 34px; height: 34px; y: (parent.height - self.height) / 2;
+                    x: (parent.width - self.width) / 2 * (1 - root.sidebar-progress) + (parent.width - self.width) * root.sidebar-progress;
+                    ghost: true; border-width: self.focused ? 1px : 0px;
+                    label: root.sidebar-expanded ? @tr("메뉴 접기") : @tr("메뉴 펼치기");
+                    icon: @image-url("icons/sidebar.svg");
+                    clicked => { root.sidebar-flipped = !root.sidebar-flipped; }
+                }
+            }
+            Rectangle { height: Theme.gap-s; }
+            for name[i] in root.pages: VerticalLayout {
+                if i == 1 || i == 4: Rectangle {
+                    height: 12px + root.sidebar-progress * 22px;
+                    Text { x: 13px; y: 14px; opacity: root.sidebar-label-opacity; text: i == 1 ? @tr("설정") : @tr("기타");
+                        color: Theme.faint; font-size: Theme.size-tiny; }
+                }
+                NavItem {
+                    text: name; icon: root.icons[i]; active: root.page == i;
+                    label-opacity: root.sidebar-label-opacity;
+                    clicked => {
+                        root.page = i;
+                    }
+                }
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+    if Actions.confirm-cmd != "": Backdrop {
+        background: #0007;
+        TouchArea {}
+        Panel {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: min(380px, parent.width - 32px);
+            inset: Theme.gap-xl; gap: Theme.gap-xl;
+            VerticalLayout { spacing: 6px;
+                Section { text: Actions.confirm-text; }
+                if Actions.confirm-detail != "": Hint { text: Actions.confirm-detail; }
+            }
+            HorizontalLayout {
+                alignment: end; spacing: Theme.gap-s;
+                UiButton { text: @tr("취소"); ghost: true; clicked => { Actions.confirm-cmd = ""; } }
+                UiButton { text: Actions.confirm-cmd == "quit" ? @tr("종료") : Actions.confirm-cmd == "resetSettings" || Actions.confirm-cmd == "resetPage" ? @tr("초기화") : @tr("삭제"); danger: true; clicked => {
+                    if Actions.confirm-cmd == "quit" || Actions.confirm-cmd == "resetSettings" { Actions.command(Actions.confirm-cmd); }
+                    else if Actions.confirm-cmd == "resetPage" { Actions.reset-page(Actions.confirm-id); }
+                    else { Actions.account(Actions.confirm-cmd, Actions.confirm-id, ""); }
+                    Actions.confirm-cmd = "";
+                } }
+            }
+        }
+    }
+}

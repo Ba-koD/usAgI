@@ -1,0 +1,198 @@
+import { Palette } from "std-widgets.slint";
+
+// 색, 글자 크기, 간격을 한곳에서 정함.
+// 글자는 굵기·색으로 강조하지 않고 크기로 중요도를 나눔 (굵게는 페이지 제목·계정 이름·사용량 숫자만).
+export global Theme {
+    // 실제로 쓰이는 색 구성 (시스템을 따를 때도 맞게: Fluent 팔레트의 배경색으로 판단)
+    out property <bool> dark: Palette.background == #1c1c1c;
+    out property <color> bg: dark ? #1b1b1b : #f3f3f3;
+    out property <color> side: dark ? #202020 : #ebebeb;
+    out property <color> card: dark ? #262626 : #fff;
+    out property <color> raised: dark ? #2e2e2e : #f7f7f7;
+    out property <color> line: dark ? #353535 : #e3e3e3;
+    out property <color> ink: dark ? #f3f3f3 : #1b1b1b;
+    out property <color> sub: dark ? #b4b4b4 : #5e5e5e;
+    out property <color> faint: dark ? #a0a0a0 : #6e6e6e;
+    out property <color> accent: dark ? #5a9cff : #2f7cf6;
+    out property <color> soft: dark ? #5a9cff26 : #2f7cf61a;
+    out property <color> segment: dark ? #1d1d1d : #e9e9e9;
+    out property <color> selected: dark ? #3a3a3a : #fff;
+    out property <color> track: dark ? #ffffff19 : #00000014;
+    out property <color> good: dark ? #4cd07a : #1f9d47;
+    out property <color> warn: dark ? #ffb84d : #e08a00;
+    out property <color> danger: dark ? #ff6b66 : #d64541;
+    out property <color> violet: dark ? #b9a2ff : #6d4fd6;
+    // 팝업·칩·숫자 입력
+    out property <color> popover: dark ? #2a2a2a : #ffffff;
+    out property <color> popover-line: dark ? #3e3e3e : #d9d9d9;
+    out property <color> line2: dark ? #444444 : #d4d4d4;
+    out property <color> line-hot: dark ? #5c5c5c : #b8b8b8;
+    out property <color> raised-hot: dark ? #343434 : #efefef;
+    out property <color> field: dark ? #181818 : #f2f2f2;
+    out property <color> field-line: dark ? #474747 : #cfcfcf;
+    out property <color> key: dark ? #343434 : #ffffff;
+    out property <color> key-hot: dark ? #3d3d3d : #f4f4f4;
+    out property <color> key-down: dark ? #2c2c2c : #e8e8e8;
+    out property <color> key-line: dark ? #4a4a4a : #cfcfcf;
+    out property <color> preset: dark ? #323232 : #f6f6f6;
+    out property <color> preset-line: dark ? #3c3c3c : #e0e0e0;
+    out property <color> on-accent: dark ? #0b1a33 : #ffffff;
+    out property <color> accent-hot: dark ? #73abff : #1f6fea;
+
+    // 글자 크기 (중요도 순)
+    out property <length> size-page: 24px;     // 페이지 제목
+    out property <length> size-number: 40px;   // 사용량 숫자
+    out property <length> size-title: 17px;    // 계정 이름, 앱 이름
+    out property <length> size-section: 16px;  // 구역 제목, 그래프 이름
+    out property <length> size-row: 15px;      // 설정 항목 이름
+    out property <length> size-body: 14px;     // 설정 항목, 버튼, 본문
+    out property <length> size-small: 13px;    // 설명, 리셋 시각, 상태
+    out property <length> size-tiny: 12px;     // 칩, 버전
+
+    // 간격 (4의 배수)
+    out property <length> gap-xs: 4px;
+    out property <length> gap-s: 8px;
+    out property <length> gap-m: 12px;
+    out property <length> gap-l: 16px;
+    out property <length> gap-xl: 24px;
+    out property <length> pad: 20px;           // 패널 안쪽 여백
+}
+
+// 입력 칸에서 포커스 빼기: 단추·카드·빈 곳을 누르면 이름·숫자 입력이 끝남 (설정 창이 빈 포커스 칸으로 옮김)
+export global FocusOut {
+    in-out property <int> tick;
+    public function release() { self.tick += 1; }
+}
+
+export component ClickTarget inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    out property <bool> hovered: touch.has-hover;
+    out property <bool> focused: keys.has-focus;
+    callback clicked;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    forward-focus: keys;
+    @children
+    // 마우스로 누를 때는 포커스를 가져가지 않음 (테두리는 키보드로 옮겨 왔을 때만)
+    touch := TouchArea {
+        enabled: root.enabled; mouse-cursor: pointer;
+        clicked => { FocusOut.release(); root.clicked(); }
+    }
+    keys := FocusScope {
+        x: 0; width: 0; enabled: root.enabled;
+        key-pressed(e) => {
+            if e.text == " " || e.text == Key.Return { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+}
+
+export component CenterItem inherits VerticalLayout {
+    alignment: center; horizontal-stretch: 0; @children
+}
+
+export component UiButton inherits ClickTarget {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> small;
+    in property <bool> pill;
+    in property <bool> ghost;
+    in property <bool> active;
+    in property <bool> danger;
+    // 메뉴 항목처럼 왼쪽 정렬
+    in property <bool> start;
+    // 주요 동작 (파란 채움): 추가·적용
+    in property <bool> primary;
+    // 글자 단추처럼 안쪽 여백을 줄임 (아이콘이 내용 왼쪽 선에 맞게)
+    in property <bool> flush;
+    // 아이콘 고유 색 (공급자 로고 등). icon-colored가 참일 때만
+    in property <bool> icon-colored;
+    in property <color> icon-color;
+    label: root.text;
+    height: root.small ? 28px : 34px;
+    min-width: self.height;
+    horizontal-stretch: 0;
+    background: root.primary ? (root.hovered ? Theme.accent-hot : Theme.accent)
+        : root.active ? Theme.soft : root.hovered ? (root.danger && root.ghost ? Theme.danger.with-alpha(0.1) : Theme.track) : root.ghost ? transparent : Theme.selected;
+    animate background, border-color { duration: 120ms; }
+    border-color: root.focused ? Theme.accent : root.primary ? transparent : root.active ? Theme.accent.with-alpha(0.5) : Theme.line;
+    border-width: 1px; border-radius: root.pill ? self.height / 2 : 8px;
+    opacity: root.enabled ? 1 : 0.45;
+    HorizontalLayout {
+        alignment: root.start ? LayoutAlignment.start : LayoutAlignment.center; spacing: root.start ? 10px : 5px;
+        padding-left: root.text == "" ? 0px : root.flush ? 6px : root.small ? 10px : 14px;
+        padding-right: root.text == "" ? 0px : root.flush ? 8px : root.small ? 10px : 14px;
+        if root.icon.width > 0: CenterItem {
+            Image {
+                width: root.small ? 14px : 16px; height: self.width;
+                source: root.icon;
+                colorize: root.icon-colored ? root.icon-color : root.primary ? Theme.on-accent : root.active ? Theme.accent : root.danger ? Theme.danger : Theme.sub;
+            }
+        }
+        if root.text != "": Text {
+            text: root.text; vertical-alignment: center;
+            font-size: root.small ? Theme.size-small : Theme.size-body;
+            color: root.primary ? Theme.on-accent : root.danger ? Theme.danger : root.active ? Theme.accent : Theme.ink; accessible-role: none;
+            font-weight: root.primary ? 600 : 500;
+        }
+    }
+}
+
+export component Segments inherits Rectangle {
+    in property <[string]> options;
+    in property <int> index;
+    callback selected(int);
+    height: 36px; border-radius: 9px; border-width: 1px; border-color: Theme.line; background: Theme.segment;
+    HorizontalLayout { padding: 3px; spacing: 2px;
+        for title[i] in root.options: ClickTarget {
+            label: title; border-radius: 6px; border-width: self.focused ? 1px : 0px; border-color: Theme.accent;
+            background: i == root.index ? Theme.selected : self.hovered ? Theme.track : transparent;
+            animate background { duration: 150ms; }
+            clicked => { root.selected(i); }
+            HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                Text { text: title; color: i == root.index ? Theme.ink : Theme.sub;
+                    font-size: Theme.size-body; vertical-alignment: center; horizontal-alignment: center; accessible-role: none; }
+            }
+        }
+    }
+}
+
+export component Toggle inherits ClickTarget {
+    in property <bool> checked;
+    accessible-role: checkbox; accessible-checkable: true; accessible-checked: checked;
+    width: 40px; height: 22px;
+    border-radius: 11px; border-width: 1px;
+    border-color: root.checked || root.focused ? Theme.accent : Theme.faint;
+    background: root.checked ? Theme.accent : transparent;
+    animate background { duration: 150ms; }
+    Rectangle {
+        width: 14px; height: 14px; y: 4px; x: root.checked ? root.width - self.width - 4px : 4px;
+        border-radius: 7px; background: root.checked ? #fff : Theme.faint;
+        animate x { duration: 150ms; easing: ease-out; }
+    }
+}
+
+export component NavItem inherits ClickTarget {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> active;
+    in property <float> label-opacity;
+    label: text; height: 40px;
+    background: active ? Theme.soft : self.hovered ? Theme.track : transparent;
+    animate background { duration: 150ms; }
+    border-color: Theme.accent; border-width: self.focused ? 1px : 0px; border-radius: 8px;
+    if active: Rectangle { x: 0; width: 3px; height: 18px; background: Theme.accent; border-radius: 2px; }
+    Image {
+        x: 13px; width: 18px; height: 18px;
+        source: root.icon; colorize: root.active ? Theme.accent : Theme.sub;
+    }
+    Text {
+        x: 44px; width: max(0px, parent.width - self.x - 8px); height: parent.height;
+        opacity: root.label-opacity; overflow: clip;
+        text: root.text; font-size: Theme.size-body;
+        color: root.active ? Theme.ink : Theme.sub; vertical-alignment: center; accessible-role: none;
+    }
+}
