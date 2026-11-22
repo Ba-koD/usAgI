@@ -9,7 +9,8 @@ license = "MIT"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# 나눠서 최적화(thin LTO): 전체를 한 덩어리로 최적화할 때보다 다시 빌드하는 시간이 절반쯤 (실행 파일은 약 13% 커짐)
+lto = "thin"
+codegen-units = 16
 panic = "abort"
 strip = true
