@@ -84,9 +84,8 @@ Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UP
 공개 키가 저장소에 있는데 `UPDATE_SIGNING_KEY` 비밀값이 없으면 게시 단계가 실패 (서명 없는 릴리스는 설치된 앱이 받지 않음).
 이미 게시된 릴리스에 서명을 다시 올릴 때는 `scripts\sign-release.ps1 -Version x.y.z`.
 
-- main 푸시: 준비 → 빌드만 실행 (게시 없음). 산출물은 Actions 실행 페이지에서 7일간 내려받기 가능
-- PR: `ci.yml`이 세 OS에서 테스트와 컴파일 확인
-- 수동: Actions → Build & Release → **Run workflow** (기본은 빌드만)
+- main 푸시와 PR: `ci.yml`이 세 OS에서 테스트와 컴파일 확인만 실행 (2~3분). 릴리스 빌드는 태그에서 한 번만 실행
+- 수동: Actions → Build & Release → **Run workflow** (기본은 빌드만. 릴리스 전에 묶기까지 미리 확인할 때 사용, 산출물은 실행 페이지에서 7일간 내려받기 가능)
 
 | 릴리스 파일 | 쓰는 곳 |
 |---|---|
