@@ -18,8 +18,8 @@ pub const REPO: &str = match option_env!("USAGI_UPDATE_REPO") {
 
 pub use usagi_core::update::Release;
 
-/// Homebrew로 설치했을 때 안내 (스스로 바꾸지 않음)
-pub const BREW_HINT: &str = "brew upgrade --cask usagi 로 업데이트.";
+/// Homebrew로 설치했을 때의 업데이트 명령 (스스로 바꾸지 않음, 안내 문장은 코어가 언어에 맞춰 만듦)
+pub const BREW_HINT: &str = "brew upgrade --cask usagi";
 
 fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("/usr/bin/curl")
@@ -28,15 +28,15 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
         .args(["-A", &format!("usAgI/{} (macOS)", usagi_core::VERSION)])
         .args(args)
         .output()
-        .map_err(|e| format!("curl 실행 실패: {e}"))?;
+        .map_err(|e| usagi_core::tr!(format!("curl 실행 실패: {e}"), format!("Couldn't run curl: {e}")))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(if err.contains("404") {
-            "올라온 릴리스 없음".into()
+            usagi_core::tr!("올라온 릴리스 없음", "No release published").into()
         } else if err.contains("403") || err.contains("429") {
-            "GitHub 요청 한도 초과. 잠시 뒤 다시 확인".into()
+            usagi_core::tr!("GitHub 요청 한도 초과. 잠시 뒤 다시 확인", "GitHub request limit reached. Check again later").into()
         } else {
-            "업데이트 서버 연결 실패 (인터넷 연결 확인 필요)".into()
+            usagi_core::tr!("업데이트 서버 연결 실패 (인터넷 연결 확인 필요)", "Couldn't reach the update server (check the internet connection)").into()
         });
     }
     Ok(out.stdout)
@@ -68,35 +68,42 @@ pub fn download(rel: &Release) -> Result<PathBuf, String> {
     let zip = dir.join("usAgI-mac.zip");
     curl(&["-o", &zip.to_string_lossy(), &rel.asset_url])?;
     // 체크섬은 꼭 있어야 하고 일치해야 함
-    let want = usagi_core::update::parse_sha256(&String::from_utf8_lossy(&curl(&[&rel.sha_url])?)).ok_or("체크섬 수신 실패")?;
-    let got = usagi_core::sha256::hex(&std::fs::read(&zip).map_err(|e| e.to_string())?);
-    if got != want {
-        return Err("받은 파일 손상 (체크섬 불일치). 다시 시도 필요".into());
+    let want = usagi_core::update::parse_sha256(&String::from_utf8_lossy(&curl(&[&rel.sha_url])?)).ok_or(usagi_core::tr!("체크섬 수신 실패", "Couldn't download the checksum"))?;
+    let bytes = std::fs::read(&zip).map_err(|e| e.to_string())?;
+    if usagi_core::sha256::hex(&bytes) != want {
+        return Err(usagi_core::tr!("받은 파일 손상 (체크섬 불일치). 다시 시도 필요", "Downloaded file is damaged (checksum mismatch). Try again").into());
     }
+    // 서명: 이 빌드에 공개 키가 있으면 꼭 있어야 하고 맞아야 함 (체크섬은 같은 릴리스에서 오므로 바꿔치기를 막지 못함)
+    if let Some(key) = usagi_core::update::signing_key() {
+        let missing = || usagi_core::tr!("서명 수신 실패. 설치 중단", "Couldn't download the signature. Not installing").to_string();
+        let sig = curl(&[rel.sig_url.as_deref().ok_or_else(missing)?]).map_err(|_| missing())?;
+        usagi_core::update::verify_signature(key, &bytes, &String::from_utf8_lossy(&sig), &rel.version, "usAgI-mac.zip")?;
+    }
+    drop(bytes);
     let ok = Command::new("/usr/bin/ditto").args(["-x", "-k"]).arg(&zip).arg(&dir).status().map_err(|e| e.to_string())?;
     let app = dir.join("usAgI.app");
     if !ok.success() || !app.join("Contents/MacOS/usAgI").exists() {
-        return Err("받은 압축 파일에 usAgI.app 없음".into());
+        return Err(usagi_core::tr!("받은 압축 파일에 usAgI.app 없음", "usAgI.app not found in the downloaded archive").into());
     }
     Ok(app)
 }
 
 /// 새 .app으로 바꾸고 다시 시작 (성공하면 호출한 쪽이 종료해야 함)
 pub fn apply(staged: &Path) -> Result<(), String> {
-    let app = current_app().ok_or("앱 묶음(.app) 밖에서 실행 중이라 교체 불가")?;
+    let app = current_app().ok_or(usagi_core::tr!("앱 묶음(.app) 밖에서 실행 중이라 교체 불가", "Can't replace the app: not running from an .app bundle"))?;
     let old = app.with_extension("app.old");
     let _ = std::fs::remove_dir_all(&old);
-    std::fs::rename(&app, &old).map_err(|e| format!("업데이트 적용 실패 (폴더 권한 확인 필요): {e}"))?;
+    std::fs::rename(&app, &old).map_err(|e| usagi_core::tr!(format!("업데이트 적용 실패 (폴더 권한 확인 필요): {e}"), format!("Couldn't apply the update (check folder permissions): {e}")))?;
     // 다른 디스크일 수 있어 rename 대신 ditto로 복사
     let ok = Command::new("/usr/bin/ditto").arg(staged).arg(&app).status().map(|s| s.success()).unwrap_or(false);
     if !ok {
         let _ = std::fs::remove_dir_all(&app);
         let _ = std::fs::rename(&old, &app);
-        return Err("새 버전 복사 실패".into());
+        return Err(usagi_core::tr!("새 버전 복사 실패", "Couldn't copy the new version").into());
     }
     let _ = Command::new("/usr/bin/xattr").args(["-dr", "com.apple.quarantine"]).arg(&app).status();
     // 지금 프로세스가 끝난 뒤 새 앱을 열고 예전 앱을 지움
     let q = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
     let script = format!("sleep 1; /usr/bin/open -n {}; sleep 3; rm -rf {}", q(&app), q(&old));
-    Command::new("/bin/sh").args(["-c", &script]).spawn().map(|_| ()).map_err(|e| format!("다시 시작 실패: {e}"))
+    Command::new("/bin/sh").args(["-c", &script]).spawn().map(|_| ()).map_err(|e| usagi_core::tr!(format!("다시 시작 실패: {e}"), format!("Couldn't restart: {e}")))
 }

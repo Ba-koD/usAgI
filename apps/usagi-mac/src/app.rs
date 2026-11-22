@@ -2,16 +2,16 @@
 //!
 //! - 메뉴 막대: [로고] 5h 53%  7d 64%  │  [로고] 7d 92% (토끼 없이, 공급자 로고만)
 //! - 누르면: 설정 열기, 계정별 사용량·리셋까지 남은 시간, 로그인, 새로고침, 보기 바꾸기, 종료
-//! - 설정 창: Windows와 같은 화면(settings.html), 화면 상태와 명령 처리도 Windows와 같은
+//! - 설정 창: Windows와 같은 Slint 화면, 화면 상태와 명령 처리도 Windows와 같은
 //!   usagi-core 컨트롤러. 이 파일은 메뉴 막대·창·알림·로그인할 때 실행·업데이트 적용만 맡아요.
 
-use crate::settings::SettingsWindow;
+use usagi_settings::SettingsWindow;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
-use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS, EventLoopWindowTargetExtMacOS};
+use tao::event::{Event, StartCause};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use usagi_core::accounts::{self, Account};
@@ -29,7 +29,7 @@ const IDLE_FRAME: Duration = Duration::from_secs(1);
 pub enum UserEvent {
     Snapshot,
     Menu(MenuEvent),
-    Ipc(String),
+    SettingsInput,
     Update(UpdateEvent),
 }
 
@@ -113,43 +113,33 @@ pub fn run() {
         exit: false,
     };
 
-    event_loop.run(move |event, target, control_flow| {
+    event_loop.run(move |event, _, control_flow| {
         match event {
             Event::NewEvents(StartCause::Init) => {
                 app.create_tray();
                 let fx = app.ctl.startup();
-                app.run(fx, target);
+                app.run(fx);
             }
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 // 로그인 진행·재확인, 업데이트 확인 시각은 컨트롤러가 스스로 셈
                 let fx = app.ctl.tick();
                 if !fx.is_empty() {
-                    app.run(fx, target);
+                    app.run(fx);
                 }
             }
             Event::UserEvent(UserEvent::Snapshot) => {
                 if let Some(s) = latest.lock().ok().and_then(|mut g| g.take()) {
                     let fx = app.ctl.apply_snapshot(s);
-                    app.run(fx, target);
+                    app.run(fx);
                 }
             }
-            Event::UserEvent(UserEvent::Menu(e)) => app.on_menu(e.id().0.as_str(), target),
+            Event::UserEvent(UserEvent::Menu(e)) => app.on_menu(e.id().0.as_str()),
             // 실행 중에 Finder·Launchpad에서 다시 열면 설정 창 (Windows에서 한 번 더 실행할 때와 같음)
-            Event::Reopen { .. } => app.open_settings(target),
-            Event::UserEvent(UserEvent::Ipc(raw)) => {
-                // 진단: 화면 명령 이름과 결과 오류만 (값·이메일은 남기지 않음)
-                let msg: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-                let cmd = msg.get("cmd").and_then(|c| c.as_str()).unwrap_or("?").to_string();
-                if cmd == "ready" {
-                    log("설정 화면 준비됨");
-                } else {
-                    let target_id = msg.get("id").or_else(|| msg.get("provider")).and_then(|v| v.as_str()).unwrap_or("");
-                    log(&format!("화면 명령: {cmd} {target_id}"));
-                }
-                let fx = app.ctl.handle_ipc(&raw);
-                app.run(fx, target);
-                if let Some(e) = app.ctl.error() {
-                    log(&format!("화면 오류: {e}"));
+            Event::Reopen { .. } => app.open_settings(),
+            Event::UserEvent(UserEvent::SettingsInput) => {
+                while let Some(raw) = app.settings.as_ref().and_then(SettingsWindow::next_command) {
+                    let fx = app.ctl.handle_ipc(&raw);
+                    app.run(fx);
                 }
             }
             Event::UserEvent(UserEvent::Update(ev)) => {
@@ -157,12 +147,7 @@ pub fn run() {
                     UpdateEvent::Checked(r, manual) => app.ctl.update_checked(r, manual),
                     UpdateEvent::Downloaded(rel, r, install) => app.ctl.update_downloaded(rel, r, install),
                 };
-                app.run(fx, target);
-            }
-            Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. } => {
-                if app.settings.as_ref().is_some_and(|s| s.id() == window_id) {
-                    app.run(vec![Effect::CloseSettings], target);
-                }
+                app.run(fx);
             }
             _ => {}
         }
@@ -178,31 +163,36 @@ pub fn run() {
 
 impl App {
     fn create_tray(&mut self) {
-        let menu = Menu::new();
-        let _ = menu.append(&MenuItem::with_id("settings", "설정 열기…", true, None));
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id("quit", "usAgI 종료", true, None));
         // 토끼 아이콘 없이 글자만 (공급자 로고는 글자 안에)
-        match TrayIconBuilder::new().with_menu(Box::new(menu)).with_title("usAgI").with_tooltip("usAgI").build() {
+        match TrayIconBuilder::new().with_menu(Box::new(base_menu())).with_title("usAgI").with_tooltip("usAgI").build() {
             Ok(t) => {
                 log("메뉴 막대 항목 만듦");
                 self.tray = Some(t);
             }
             Err(e) => {
                 log(&format!("메뉴 막대 항목 실패: {e}"));
-                notify("usAgI", &format!("메뉴 막대 표시 실패: {e}"));
+                notify("usAgI", &usagi_core::tr!(format!("메뉴 막대 표시 실패: {e}"), format!("Couldn't show the menu bar item: {e}")));
             }
         }
     }
 
     /// 공통 컨트롤러(usagi-core)가 돌려준 일을 실행. 설정 화면은 마지막에 한 번만 다시 보냄.
-    fn run(&mut self, effects: Vec<Effect>, target: &EventLoopWindowTarget<UserEvent>) {
+    fn run(&mut self, effects: Vec<Effect>) {
         let mut queue: std::collections::VecDeque<Effect> = effects.into();
         let mut push = false;
         while let Some(e) = queue.pop_front() {
             match e {
                 Effect::Push => push = true,
                 Effect::Redraw => self.refresh_ui(),
+                // 언어가 바뀜: 메뉴를 새 언어로 다시 만듦 (뒤따르는 Redraw가 사용량 메뉴를 다시 채움)
+                Effect::PlatformPref(key) if key == "locale" => {
+                    self.menu_sig.clear();
+                    if self.ctl.snap.is_none() {
+                        if let Some(t) = &self.tray {
+                            t.set_menu(Some(Box::new(base_menu())));
+                        }
+                    }
+                }
                 // 위젯 위치·모니터·중요 알림은 Windows 전용
                 Effect::PlatformPref(_) => {}
                 Effect::Open(target) => open(&target),
@@ -218,7 +208,6 @@ impl App {
                 }
                 Effect::CloseSettings => {
                     self.settings = None;
-                    target.set_activation_policy_at_runtime(ActivationPolicy::Accessory);
                     queue.extend(self.ctl.settings_closed());
                 }
                 Effect::Quit => {
@@ -329,7 +318,7 @@ impl App {
             };
             lines.push((format!("head:{}", acc.id), head, false));
             if login.and_then(|l| l.logged_in) == Some(false) {
-                lines.push((format!("login:{}", acc.id), "    로그인 필요 — 눌러서 로그인".into(), true));
+                lines.push((format!("login:{}", acc.id), usagi_core::tr!("    로그인 필요 — 눌러서 로그인", "    Login required — click to log in").into(), true));
                 continue;
             }
             match v {
@@ -338,29 +327,39 @@ impl App {
                         let left = ui::meter_left(state, &alert_key(&acc.id, &m.label));
                         let val = if m.exact {
                             let pct = ((if left { 1.0 - m.ratio } else { m.ratio }) * 100.0).round().max(0.0);
-                            format!("{pct:.0}% {}", if left { "남음" } else { "사용" })
+                            let word = if left { usagi_core::tr!("남음", "left") } else { usagi_core::tr!("사용", "used") };
+                            format!("{pct:.0}% {word}")
                         } else {
                             "–".into()
                         };
                         let reset = m
                             .resets_at
                             .filter(|&r| r > now && m.exact)
-                            .map(|r| format!(" · {} 뒤 리셋 ({})", texts::fmt_duration(r - now), texts::fmt_clock(r, now)))
+                            .map(|r| {
+                                let (dur, at) = (texts::fmt_duration(r - now), texts::fmt_clock(r, now));
+                                usagi_core::tr!(format!(" · {dur} 뒤 리셋 ({at})"), format!(" · resets in {dur} ({at})"))
+                            })
                             .unwrap_or_default();
-                        lines.push((format!("m:{}:{}", acc.id, m.label), format!("    {}  {val}{reset}", m.label), false));
+                        // 메뉴 id는 저장된 그래프 이름, 보이는 글자는 언어에 맞춘 이름
+                        lines.push((format!("m:{}:{}", acc.id, m.label), format!("    {}  {val}{reset}", texts::meter_label(&m.label)), false));
                     }
                 }
-                _ => lines.push((format!("wait:{}", acc.id), "    사용량을 받는 중…".into(), false)),
+                _ => lines.push((format!("wait:{}", acc.id), usagi_core::tr!("    사용량 받는 중…", "    Fetching usage…").into(), false)),
             }
         }
-        let mode = if self.time_mode() { "퍼센트로 보기" } else { "남은 시간으로 보기" };
-        let sig = format!("{lines:?}{mode}");
+        let mode = if self.time_mode() {
+            usagi_core::tr!("퍼센트로 보기", "Show percent")
+        } else {
+            usagi_core::tr!("남은 시간으로 보기", "Show remaining time")
+        };
+        // 언어도 넣어 둠: 바뀌면 고정 항목(설정 열기·새로고침·종료)까지 새 언어로 다시 만듦
+        let sig = format!("{lines:?}{mode}{}", usagi_core::i18n::lang().code());
         if sig == self.menu_sig {
             return;
         }
         self.menu_sig = sig;
         let menu = Menu::new();
-        let _ = menu.append(&MenuItem::with_id("settings", "설정 열기…", true, None));
+        let _ = menu.append(&MenuItem::with_id("settings", usagi_core::tr!("설정 열기…", "Open settings…"), true, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
         for (i, (id, text, enabled)) in lines.iter().enumerate() {
             if id.starts_with("head:") && i > 0 {
@@ -369,29 +368,29 @@ impl App {
             let _ = menu.append(&MenuItem::with_id(id.as_str(), text, *enabled, None));
         }
         let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id("refresh", "지금 새로고침", true, None));
+        let _ = menu.append(&MenuItem::with_id("refresh", usagi_core::tr!("지금 새로고침", "Refresh now"), true, None));
         let _ = menu.append(&MenuItem::with_id("mode", mode, true, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id("quit", "usAgI 종료", true, None));
+        let _ = menu.append(&MenuItem::with_id("quit", usagi_core::tr!("usAgI 종료", "Quit usAgI"), true, None));
         if let Some(t) = &self.tray {
             t.set_menu(Some(Box::new(menu)));
         }
     }
 
     /// 메뉴 누름
-    fn on_menu(&mut self, id: &str, target: &EventLoopWindowTarget<UserEvent>) {
+    fn on_menu(&mut self, id: &str) {
         match id {
             "quit" => self.exit = true,
-            "settings" => self.open_settings(target),
+            "settings" => self.open_settings(),
             "refresh" => self.ctl.refresh_all(),
             "mode" => {
                 let fx = self.ctl.toggle_mode();
-                self.run(fx, target);
+                self.run(fx);
             }
             other => {
                 if let Some(acc_id) = other.strip_prefix("login:") {
                     // 설정 창에서 공식 로그인 진행 상황을 보여 줌
-                    self.open_settings(target);
+                    self.open_settings();
                     self.ctl.login_account(acc_id);
                     self.push_settings();
                 }
@@ -401,23 +400,20 @@ impl App {
 
     // -------------------------------------------------------------- 설정 창
 
-    fn open_settings(&mut self, target: &EventLoopWindowTarget<UserEvent>) {
-        // 창을 앞으로 가져오려면 잠깐 일반 앱이 됨 (Dock 아이콘), 닫으면 다시 메뉴 막대 앱으로
-        target.set_activation_policy_at_runtime(ActivationPolicy::Regular);
-        target.show_application();
+    fn open_settings(&mut self) {
         if let Some(s) = &self.settings {
             s.focus();
             return;
         }
-        match SettingsWindow::open(target, self.proxy.clone()) {
+        let proxy = self.proxy.clone();
+        match SettingsWindow::open(move || { let _ = proxy.send_event(UserEvent::SettingsInput); }) {
             Ok(s) => {
                 self.settings = Some(s);
                 self.ctl.settings_opened();
             }
             Err(e) => {
-                log(&e);
-                notify("usAgI", &e);
-                target.set_activation_policy_at_runtime(ActivationPolicy::Accessory);
+                log(&e.to_string());
+                notify("usAgI", &e.to_string());
             }
         }
     }
@@ -429,9 +425,18 @@ impl App {
 
     fn push_settings(&self) {
         if let Some(s) = &self.settings {
-            s.push(&self.ctl.settings_state(&self.host_info()).to_string());
+            s.push(self.ctl.settings_state(&self.host_info()).to_string());
         }
     }
+}
+
+/// 사용량을 받기 전의 메뉴 (설정 열기·종료만). 언어를 바꾸면 이걸로 다시 만듦
+fn base_menu() -> Menu {
+    let menu = Menu::new();
+    let _ = menu.append(&MenuItem::with_id("settings", usagi_core::tr!("설정 열기…", "Open settings…"), true, None));
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&MenuItem::with_id("quit", usagi_core::tr!("usAgI 종료", "Quit usAgI"), true, None));
+    menu
 }
 
 fn view<'a>(snap: &'a Snapshot, acc: &Account) -> Option<&'a ProviderView> {
@@ -448,8 +453,18 @@ fn esc_applescript(s: &str) -> String {
 
 /// macOS 알림 (알림 센터)
 pub fn notify(title: &str, msg: &str) {
+    use std::io::Write;
+    use std::process::Stdio;
     let script = format!("display notification \"{}\" with title \"{}\"", esc_applescript(msg), esc_applescript(title));
-    let _ = Command::new("/usr/bin/osascript").args(["-e", &script]).spawn();
+    let child = Command::new("/usr/bin/osascript").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    if let Ok(mut child) = child {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(script.as_bytes());
+        }
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 // ------------------------------------------------------------------ 로그인할 때 실행 (LaunchAgent)
@@ -472,12 +487,12 @@ fn app_path() -> Option<std::path::PathBuf> {
 }
 
 fn set_autostart(on: bool) -> Result<(), String> {
-    let path = agent_path().ok_or("홈 폴더 찾기 실패")?;
+    let path = agent_path().ok_or(usagi_core::tr!("홈 폴더 찾기 실패", "Couldn't find the home folder"))?;
     if !on {
         let _ = std::fs::remove_file(&path);
         return Ok(());
     }
-    let app = app_path().ok_or("앱 위치 찾기 실패")?;
+    let app = app_path().ok_or(usagi_core::tr!("앱 위치 찾기 실패", "Couldn't find the app location"))?;
     let target = app.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;");
     let args = if app.extension().is_some_and(|e| e == "app") {
         format!("<string>/usr/bin/open</string><string>-a</string><string>{target}</string>")
@@ -499,7 +514,7 @@ fn set_autostart(on: bool) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::write(&path, plist).map_err(|e| format!("로그인할 때 실행 켜기 실패: {e}"))
+    std::fs::write(&path, plist).map_err(|e| usagi_core::tr!(format!("로그인 시 실행 켜기 실패: {e}"), format!("Couldn't turn on open at login: {e}")))
 }
 
 /// 앱 아이콘 .iconset (빌드 스크립트가 iconutil로 .icns를 만듦)

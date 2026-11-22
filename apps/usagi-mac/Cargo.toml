@@ -18,8 +18,7 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "pn
 [target.'cfg(target_os = "macos")'.dependencies]
 tao = "0.37"
 tray-icon = "0.26"
-# 설정 창 (WKWebView, Windows와 같은 settings.html)
-wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+usagi-settings = { path = "../../crates/usagi-settings" }
 # 메뉴 막대 글자 꾸미기 (tray-icon과 같은 objc2 버전)
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }

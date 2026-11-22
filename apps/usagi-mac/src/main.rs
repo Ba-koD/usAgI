@@ -3,8 +3,6 @@
 #[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
-mod settings;
-#[cfg(target_os = "macos")]
 mod title;
 #[cfg(target_os = "macos")]
 mod updater;
@@ -14,6 +12,7 @@ fn main() {
     {
         let args: Vec<String> = std::env::args().collect();
         match args.get(1).map(String::as_str) {
+            Some(usagi_settings::SETTINGS_ARG) => usagi_settings::main_window(),
             // Claude Code 상태 표시줄 (실시간 연결)
             Some("statusline") => statusline(&args),
             // 빌드 스크립트용: 앱 아이콘(.iconset) PNG 만들기
