@@ -79,11 +79,7 @@ Claude와 ChatGPT·Codex 계정을 여러 개 연결.
 curl -fsSL https://raw.githubusercontent.com/Ba-koD/usAgI/main/scripts/install-mac.sh | bash
 ```
 
-Homebrew 사용 시:
-
-```bash
-brew install --cask Ba-koD/usagi/usagi
-```
+업데이트도 같은 명령으로 실행.
 
 ### 처음 실행
 
