@@ -24,7 +24,8 @@ try {
     # exe 옆에 data 폴더가 있으면 포터블 모드 (zip은 빈 폴더를 빼므로 안내 파일을 하나 넣어 둠)
     $data = Join-Path $out 'data'
     New-Item -ItemType Directory -Force $data | Out-Null
-    Set-Content -Encoding utf8 (Join-Path $data '읽어보기.txt') 'usAgI 포터블 데이터 폴더. 설정과 받은 사용량 저장 위치. 이 폴더를 지우면 일반 모드(%APPDATA%\usAgI)로 전환.'
+    Set-Content -Encoding utf8 (Join-Path $data 'usagi.portable') 'usAgI portable data folder'
+    Set-Content -Encoding utf8 (Join-Path $data '읽어보기.txt') 'usAgI 포터블 데이터 폴더. 설정과 받은 사용량 저장 위치. 계정을 추가하면 profiles 폴더에 공식 CLI의 로그인 파일이 생기므로 이 폴더를 다른 사람에게 주거나 공유 폴더에 올리지 말 것. 이 폴더를 지우면 일반 모드(%APPDATA%\usAgI)로 전환.'
     Set-Content -Encoding utf8 (Join-Path $out '읽어보기.txt') @"
 usAgI $ver (포터블)
 
@@ -35,16 +36,18 @@ usAgI $ver (포터블)
 저장 위치
   usagi.exe 옆에 data 폴더가 있으면 포터블 모드. 모든 설정과 받은 사용량을 data 폴더에 저장.
   폴더째 이동 가능. data 폴더를 지우면 일반 모드로 전환, %APPDATA%\usAgI 사용.
+  usAgI에서 계정을 추가하면 data\profiles 폴더에 공식 CLI의 로그인 파일이 생김.
+  data 폴더를 압축해 다른 사람에게 주거나 공유·동기화 폴더에 두면 로그인 정보가 함께 넘어가므로 주의.
 
 필요한 것
   - Windows 10 / 11
-  - Microsoft Edge WebView2 런타임 (Windows 11 기본 포함)
   - 공식 Claude Code CLI / Codex CLI (로그인과 사용량 확인용. usAgI는 토큰 저장 없음)
 
 참고
   - Windows 알림용으로 앱 이름만 사용자 레지스트리에 등록
     (HKCU\Software\Classes\AppUserModelId\usAgI.UsageRabbit). 포터블 모드에서는 시작 메뉴 바로 가기 미생성.
-  - "Windows 시작 시 실행"을 켜면 이 exe 경로 기록. 폴더를 옮긴 뒤에는 한 번 껐다 켜기.
+  - "Windows 시작 시 실행"을 켜면 작업 스케줄러에 로그온 작업(usAgI)으로 이 exe 경로 등록.
+    폴더를 옮긴 뒤에는 새 위치에서 한 번 실행하면 등록 경로도 갱신.
   - Claude Code 실시간 연결(상태 표시줄)은 자동. 폴더를 옮기면 다음 실행 때 새 경로로 다시 연결.
 "@
 

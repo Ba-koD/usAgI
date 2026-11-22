@@ -36,7 +36,10 @@ try {
 
     # 4) 커밋·태그 (선택, 로컬만)
     if ($Tag) {
-        git add -A
+        # 버전 파일만 커밋 (작업 폴더의 다른 변경을 함께 쓸어 담지 않음)
+        git add Cargo.toml Cargo.lock CHANGELOG.md
+        $other = git status --porcelain | Where-Object { $_ -notmatch '^[MA]  ' }
+        if ($other) { Write-Host "커밋하지 않은 다른 변경 있음 (이 커밋에는 넣지 않음):"; $other | ForEach-Object { Write-Host "  $_" } }
         git commit -m "Chore: Prepare release version $ver" -m "- 버전 $ver 릴리스 준비"
         if ($LASTEXITCODE -ne 0) { throw "커밋 실패" }
         git tag -a "v$ver" -m "usAgI v$ver"
@@ -45,6 +48,7 @@ try {
         Write-Host "커밋과 태그 v$ver 생성 완료. 푸시하면 GitHub Actions가 릴리스 생성:"
         Write-Host "  git push origin main"
         Write-Host "  git push origin v$ver"
+        Write-Host "서명(.minisig)은 게시 단계에서 자동 생성 (비밀값 UPDATE_SIGNING_KEY 필요)"
     } else {
         Write-Host ""
         Write-Host "준비 완료. 커밋·태그까지:  scripts\release.ps1 -Version $ver -Tag"

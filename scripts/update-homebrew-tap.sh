@@ -19,8 +19,10 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 # 토큰은 주소에 넣지 않고 요청 헤더로만 보냄 (주소는 오류 메시지·.git/config에 남을 수 있음)
-AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '
-')"
+B64="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '\n')"
+# GitHub Actions는 비밀 값 자체만 가려 주므로, base64로 바꾼 값도 로그에서 가리게 등록
+if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::add-mask::${B64}"; fi
+AUTH="AUTHORIZATION: basic ${B64}"
 git -c "http.https://github.com/.extraheader=${AUTH}" clone --depth 1 "https://github.com/${TAP}.git" "$WORK/tap"
 mkdir -p "$WORK/tap/Casks"
 sed -e "s|{{VERSION}}|${VER}|g" -e "s|{{SHA256}}|${SHA}|g" -e "s|{{REPO}}|${REPO}|g" \

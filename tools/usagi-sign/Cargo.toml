@@ -1,0 +1,11 @@
+[package]
+name = "usagi-sign"
+description = "usAgI release signing tool (minisign): create the update signing key and sign release files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+minisign = "0.10"
+usagi-core = { path = "../../crates/usagi-core" }
