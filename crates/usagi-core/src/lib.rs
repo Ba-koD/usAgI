@@ -20,6 +20,7 @@
 pub mod accounts;
 pub mod animator;
 pub mod bridge;
+pub mod changelog;
 pub mod codex;
 pub mod config;
 mod connection;

@@ -344,7 +344,8 @@ impl Controller {
             "status": status,
             "current": crate::VERSION,
             "latest": u.latest.as_ref().map(|r| r.version.clone()),
-            "notes": u.latest.as_ref().map(|r| r.notes.chars().take(1200).collect::<String>()),
+            // 새 버전 안내 (릴리스 노트, 마크다운). 너무 길면 줄 단위로 자름
+            "notes": u.latest.as_ref().map(|r| crate::changelog::clip(&r.notes, 6000)),
             "page": u.latest.as_ref().map(|r| r.page.clone()),
             "checkedAt": u.checked_at.map(|t| texts::fmt_clock(t, time::now())),
             "error": u.error,
