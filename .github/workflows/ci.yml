@@ -1,0 +1,68 @@
+# PR 확인: 공통 로직 테스트 + 플랫폼 앱 컴파일 확인 (세 OS 동시에)
+#
+# - main 푸시와 태그는 release.yml(Build & Release)이 실제 묶기까지 하므로 여기서는 PR만 봐요.
+# - 릴리스 최적화(LTO) 없이 cargo check로 컴파일만 확인해서 빨라요.
+# - Linux 줄은 앱이 아직 없어서 공통 로직만 (Linux 앱을 만들 때 깨져 있지 않게).
+# - 같은 PR에 새로 올리면 이전 실행은 취소해요. 문서만 바뀌면 돌지 않아요.
+name: CI
+
+on:
+  pull_request:
+    paths-ignore: ["**.md", "scripts/install-mac.sh", "scripts/release.ps1"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (공통 로직)
+            os: ubuntu-latest
+            app: ""
+          - name: Windows
+            os: windows-latest
+            app: usagi-win
+          - name: macOS
+            os: macos-latest
+            app: usagi-mac
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # 러너에 설치된 rustup을 그대로 씀 (서드파티 액션을 거치지 않음)
+      - name: Rust 준비
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # 서드파티 액션은 태그가 아니라 커밋으로 고정
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci-${{ matrix.os }}
+
+      - name: 공통 로직 테스트
+        run: cargo test -p usagi-core --locked
+
+      - name: 앱 컴파일 확인
+        if: matrix.app != ''
+        env:
+          APP: ${{ matrix.app }}
+        shell: bash
+        run: cargo check -p "$APP" --locked
