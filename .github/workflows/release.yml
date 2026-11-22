@@ -175,6 +175,7 @@ jobs:
       TAG: v${{ needs.prepare.outputs.version }}
       PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
       HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+      HAS_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -195,10 +196,40 @@ jobs:
           sha256sum usagi.exe usAgI-portable-*.zip usAgI-mac-*.zip usAgI-mac.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # 업데이트 서명: 앱에 들어 있는 공개 키(packaging/usagi-update.pub)와 짝인 비밀 키로 파일마다 .minisig 생성.
+      # 설치된 앱은 서명이 없거나 맞지 않는 업데이트를 받지 않으므로, 공개 키가 있는데 비밀값이 없으면 게시하지 않고 실패.
+      # 비밀 키는 이 단계에만 전달 (다른 단계·서드파티 액션에는 보이지 않음)
+      - name: 서명 (.minisig)
+        env:
+          USAGI_SIGN_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          USAGI_SIGN_PASSWORD: ${{ secrets.UPDATE_SIGNING_PASSWORD }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if ! grep -qvE '^(untrusted comment:.*|#.*|[[:space:]]*)$' packaging/usagi-update.pub; then
+            echo "서명 공개 키 없음: 서명 건너뜀"
+            exit 0
+          fi
+          if [[ "$HAS_SIGNING_KEY" != "true" ]]; then
+            echo "::error::packaging/usagi-update.pub에 공개 키가 있는데 UPDATE_SIGNING_KEY 비밀값이 없음 (서명 없는 릴리스는 앱이 받지 않음)"
+            exit 1
+          fi
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          key="$RUNNER_TEMP/update-signing.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077; printf '%s\n' "$USAGI_SIGN_KEY" > "$key")
+          cargo run --quiet --locked -p usagi-sign -- sign --version "$VERSION" --key "$key" \
+            out/usagi.exe out/usAgI-mac.zip out/usAgI-portable-*.zip out/usAgI-mac-*.zip
+          ls -l out/*.minisig
+
       - name: 릴리스 만들기 (초안에 모두 올린 뒤 공개)
         working-directory: out
         run: |
           files=(usagi.exe usagi.exe.sha256 usAgI-portable-*.zip usAgI-mac-*.zip usAgI-mac.zip usAgI-mac.zip.sha256 SHA256SUMS.txt)
+          # 서명 파일 (서명 단계를 건너뛴 경우에는 없음)
+          shopt -s nullglob
+          files+=(*.minisig)
+          shopt -u nullglob
           if gh release view "$TAG" >/dev/null 2>&1; then
             # 다시 실행한 경우: 파일과 노트만 바꿔 올림
             gh release upload "$TAG" "${files[@]}" --clobber
