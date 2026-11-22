@@ -1,0 +1,27 @@
+[package]
+name = "usagi-mac"
+description = "usAgI for macOS: menu bar rabbit + usage (RunCat style)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "usagi-mac"
+path = "src/main.rs"
+
+[dependencies]
+usagi-core = { path = "../../crates/usagi-core" }
+serde_json = { version = "1", features = ["preserve_order"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "png-format"] }
+
+# 맥에서만 쓰는 메뉴 막대·이벤트 루프 (Windows 빌드에는 들어가지 않음)
+[target.'cfg(target_os = "macos")'.dependencies]
+tao = "0.37"
+tray-icon = "0.26"
+# 설정 창 (WKWebView, Windows와 같은 settings.html)
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+# 메뉴 막대 글자 꾸미기 (tray-icon과 같은 objc2 버전)
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSAttributedString", "NSDictionary", "NSString", "NSData", "NSValue", "NSObject", "NSGeometry", "NSUserDefaults"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSAttributedString", "NSFont", "NSFontDescriptor", "NSColor", "NSTextAttachment", "NSImage", "NSAppearance", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSResponder", "NSCell"] }
