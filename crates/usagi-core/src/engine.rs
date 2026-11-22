@@ -13,7 +13,7 @@ use crate::codex::{self, CodexReader, CodexSnapshot};
 use crate::config::{self, Config, State};
 use crate::login::{self, LoginStatus};
 use crate::logs::LogReader;
-use crate::probe;
+
 use crate::texts;
 use crate::time::{self, DAY, HOUR};
 use crate::tracker::{apply_exact, forecast_from, mood_of, Forecast, ForecastKind, Reading, Status, Tracker};
@@ -25,6 +25,28 @@ use std::time::Duration;
 
 /// 기본 갱신 주기(분). 설정: 1 / 3 / 5 / 10 / 15
 pub const DEFAULT_REFRESH_MIN: f64 = 5.0;
+/// 리필권 만료 알림 기본 시점 (만료 몇 분 전)
+pub const DEFAULT_REFILL_LEAD_MIN: f64 = 24.0 * 60.0;
+/// 리필권 만료 알림 시점 범위 (1분 ~ 7일 전)
+pub const MAX_REFILL_LEAD_MIN: f64 = 7.0 * 24.0 * 60.0;
+
+/// 리필권 만료 알림 규칙 (켜짐, 만료 몇 분 전). 계정별 설정이 있으면 그것, 없으면 전체 설정
+pub fn refill_rule(state: &State, account_id: &str) -> (bool, f64) {
+    let on = state.pref_bool("refillNotify", false);
+    let lead = state.pref_f64("refillLead").unwrap_or(DEFAULT_REFILL_LEAD_MIN);
+    match state.0.get("refill_rules").and_then(|r| r.get(account_id)) {
+        Some(r) => (
+            r.get("on").and_then(|v| v.as_bool()).unwrap_or(on),
+            r.get("lead").and_then(|v| v.as_f64()).unwrap_or(lead).clamp(1.0, MAX_REFILL_LEAD_MIN),
+        ),
+        None => (on, lead.clamp(1.0, MAX_REFILL_LEAD_MIN)),
+    }
+}
+/// 쓰는 중이라 상태 표시줄·Codex 기록으로 새 값이 계속 들어오면 CLI 확인 간격을 이만큼 늘림
+/// (모델별 주간 한도처럼 그쪽에 없는 값만 가끔 맞추면 됨)
+const LIVE_STRETCH: f64 = 3.0;
+/// 로그인 상태 확인 간격 (설정 창을 열거나 로그인·새로고침할 때는 바로 확인)
+const LOGIN_CHECK: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProviderId {
@@ -69,6 +91,8 @@ pub struct ProviderView {
     /// Codex 크레딧·리필권
     pub credits: Option<codex::Credits>,
     pub refills: Option<codex::Refills>,
+    /// Claude 추가 사용량·지출 한도 (보일 글자)
+    pub extra: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +130,17 @@ pub fn refresh_minutes(state: &State) -> f64 {
     state.pref_f64("refresh_minutes").unwrap_or(DEFAULT_REFRESH_MIN).clamp(1.0, 60.0)
 }
 
+/// 공식 CLI로 사용량을 다시 받을 때인지 (`/usage`, `codex app-server` 모두 토큰 0이지만 CLI를 띄우는 비용이 있음).
+/// - `tried`: 마지막으로 CLI로 확인한 시각
+/// - `live_at`: 상태 표시줄(Claude)·실행 기록(Codex)으로 마지막 값이 들어온 시각
+/// 마지막 확인 뒤에 쓰는 중인 값이 따로 들어왔으면 이미 최신이므로 간격을 늘림.
+pub fn usage_due(tried: Option<f64>, live_at: Option<f64>, interval_min: f64, now: f64) -> bool {
+    let Some(tried) = tried else { return true }; // 처음 한 번
+    let gap = interval_min * 60.0;
+    let live = live_at.is_some_and(|at| at > tried + 5.0 && now - at < gap);
+    now - tried >= if live { gap * LIVE_STRETCH } else { gap } - 5.0
+}
+
 /// Claude 확인 요청을 보낼지. 5시간 창은 첫 요청부터 시작하므로 창이 닫혀 있으면 자동으로 보내지 않음
 /// (처음 한 번과 사용자가 누른 새로고침만 예외).
 pub fn probe_due(file: Option<&BridgeFile>, tried_at: Option<f64>, interval_min: f64, now: f64) -> bool {
@@ -130,10 +165,17 @@ fn display_name(id: ProviderId, acc: &Account) -> String {
 
 pub fn age_text(secs: f64) -> String {
     if secs < 90.0 {
-        "방금".into()
+        crate::tr!("방금", "just now").into()
     } else {
-        format!("{} 전", texts::fmt_duration(secs))
+        let age = texts::fmt_duration(secs);
+        crate::tr!(format!("{age} 전"), format!("{age} ago"))
     }
+}
+
+/// 카드에 보이는 값 시점: "3분 전 기준" / "Updated 3m ago"
+fn updated_note(secs: f64) -> String {
+    let age = age_text(secs);
+    crate::tr!(format!("{age} 기준"), format!("Updated {age}"))
 }
 
 pub fn claude_view(acc: &Account, st: &Status, updated_at: Option<f64>) -> ProviderView {
@@ -147,13 +189,14 @@ pub fn claude_view(acc: &Account, st: &Status, updated_at: Option<f64>) -> Provi
             Meter { label: "주간".into(), ratio: st.weekly_pct, resets_at: st.weekly_reset_at, exact },
         ],
         updated_at,
-        note: updated_at.map(|t| format!("{} 기준", age_text(st.now - t))),
+        note: updated_at.map(|t| updated_note(st.now - t)),
         forecast: if exact { Some(texts::forecast_line(st)).filter(|f| !f.is_empty()) } else { None },
         show: acc.show,
         email: None,
         plan: None,
         credits: None,
         refills: None,
+        extra: None,
     }
 }
 
@@ -177,13 +220,14 @@ pub fn codex_view(acc: &Account, s: &CodexSnapshot, now: f64) -> ProviderView {
             })
             .collect(),
         updated_at: Some(s.ts),
-        note: Some(format!("{} 기준", age_text(now - s.ts))),
+        note: Some(updated_note(now - s.ts)),
         forecast: None,
         show: acc.show,
         email: s.email.clone(),
         plan: s.plan.clone(),
         credits: s.credits.clone(),
         refills: s.refills.clone(),
+        extra: None,
     }
 }
 
@@ -194,20 +238,72 @@ pub fn alert_key(account_id: &str, label: &str) -> String {
     format!("{account_id}:{label}")
 }
 
-/// 알림 규칙: alerts["계정:라벨"] = {"on": bool, "at": [50, 80, 95]} (예전 형식 "at": 80도 읽음).
-/// 기본은 기준 없음: 사용자가 그래프에 추가한 기준에서만 알려요.
-pub fn alert_rule(state: &State, key: &str) -> (bool, Vec<f64>) {
-    let rule = state.0.get("alerts").and_then(|a| a.get(key));
-    let on = rule.and_then(|r| r.get("on")).and_then(|v| v.as_bool()).unwrap_or(true);
-    let mut at: Vec<f64> = match rule.and_then(|r| r.get("at")) {
+/// 리셋 임박 알림 시점 범위 (리셋 1분 ~ 7일 전)
+pub const MAX_RESET_LEAD_MIN: f64 = 7.0 * 24.0 * 60.0;
+
+/// 사용량 기준 범위 (%)
+pub fn pct_in_range(v: f64) -> bool {
+    (1.0..100.0).contains(&v)
+}
+
+/// 리셋 임박 시점 범위 (리셋 몇 분 전)
+pub fn lead_in_range(v: f64) -> bool {
+    (1.0..=MAX_RESET_LEAD_MIN).contains(&v)
+}
+
+/// 그래프 하나의 알림 설정.
+/// alerts["계정:라벨"] = {"on": 그래프 전체, "at": [사용량 %], "at_off": [꺼 둔 사용량 %],
+/// "before": [리셋 몇 분 전], "before_off": [꺼 둔 리셋 임박 시점]}
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlertSet {
+    /// 그래프 전체 알림 (기본 켜짐)
+    pub on: bool,
+    /// 켜 둔 사용량 기준 (%)
+    pub at: Vec<f64>,
+    /// 꺼 둔 사용량 기준 (남겨 두지만 알리지 않음)
+    pub at_off: Vec<f64>,
+    /// 켜 둔 리셋 임박 시점 (리셋 몇 분 전)
+    pub before: Vec<f64>,
+    /// 꺼 둔 리셋 임박 시점
+    pub before_off: Vec<f64>,
+}
+
+/// 알림 목록 하나: 숫자 배열 (예전 형식 "at": 80처럼 숫자 하나도 읽음), 범위 밖 값은 버리고 정렬·중복 제거
+fn alert_list(rule: Option<&serde_json::Value>, field: &str, ok: fn(f64) -> bool) -> Vec<f64> {
+    let mut v: Vec<f64> = match rule.and_then(|r| r.get(field)) {
         Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_f64()).collect(),
         Some(v) => v.as_f64().into_iter().collect(),
         None => Vec::new(),
     };
-    at.retain(|v| (1.0..100.0).contains(v));
-    at.sort_by(|a, b| a.total_cmp(b));
-    at.dedup();
-    (on, at)
+    v.retain(|&x| ok(x));
+    v.sort_by(|a, b| a.total_cmp(b));
+    v.dedup();
+    v
+}
+
+/// 그래프 알림 설정 읽기. 기본은 기준 없음: 사용자가 그래프에 추가한 기준에서만 알림.
+/// 켜 둔 목록과 꺼 둔 목록에 같은 값이 있으면 켜 둔 쪽으로 봄.
+pub fn alert_set(state: &State, key: &str) -> AlertSet {
+    let rule = state.0.get("alerts").and_then(|a| a.get(key));
+    let at = alert_list(rule, "at", pct_in_range);
+    let before = alert_list(rule, "before", lead_in_range);
+    let mut at_off = alert_list(rule, "at_off", pct_in_range);
+    at_off.retain(|v| !at.contains(v));
+    let mut before_off = alert_list(rule, "before_off", lead_in_range);
+    before_off.retain(|v| !before.contains(v));
+    AlertSet {
+        on: rule.and_then(|r| r.get("on")).and_then(|v| v.as_bool()).unwrap_or(true),
+        at,
+        at_off,
+        before,
+        before_off,
+    }
+}
+
+/// 알림 규칙: (그래프 전체 켜짐, 켜 둔 사용량 기준 %)
+pub fn alert_rule(state: &State, key: &str) -> (bool, Vec<f64>) {
+    let s = alert_set(state, key);
+    (s.on, s.at)
 }
 
 /// 계정 순서대로 (목록에 없는 건 뒤로, 원래 순서 유지)
@@ -260,7 +356,13 @@ impl Notices {
                         .find(|p| &p.account_id == id)
                         .map(|p| p.name.clone())
                         .unwrap_or_else(|| if id.starts_with("codex") { "Codex".into() } else { "Claude".into() });
-                    out.push(("로그인 필요".into(), format!("{name} 계정 로그인 만료. usAgI 설정에서 다시 로그인 필요.")));
+                    out.push((
+                        crate::tr!("로그인 필요", "Sign-in required").into(),
+                        crate::tr!(
+                            format!("{name} 계정 로그인 만료. usAgI 설정에서 다시 로그인 필요."),
+                            format!("{name} sign-in expired. Sign in again in usAgI settings.")
+                        ),
+                    ));
                 }
                 Some(true) if self.state.get_str(&key).is_some() => {
                     self.state.0.remove(&key);
@@ -268,6 +370,27 @@ impl Notices {
                 }
                 _ => {}
             }
+        }
+        // 리필권 만료 임박: 정한 시간 전부터, 만료 시각마다 한 번 (계정별 설정 우선)
+        for p in &snap.providers {
+            let Some(r) = p.refills.as_ref().filter(|r| r.available > 0) else { continue };
+            let (on, lead) = refill_rule(&self.state, &p.account_id);
+            let Some(at) = r.expires_at.filter(|&t| on && t > snap.now && t - snap.now <= lead * 60.0) else { continue };
+            let key = format!("refill:{}", p.account_id);
+            let stamp = ((at / 60.0).round() as i64).to_string();
+            if self.state.get_str(&key) == Some(stamp.as_str()) {
+                continue;
+            }
+            self.state.set_str(&key, &stamp);
+            dirty = true;
+            let (n, left, clock) = (r.available, texts::fmt_duration(at - snap.now), texts::fmt_clock(at, snap.now));
+            out.push((
+                crate::tr!("리필권 만료 임박", "Refill expiring soon").into(),
+                crate::tr!(
+                    format!("{} 리필권 {n}장 · {left} 뒤 만료 ({clock})", p.name),
+                    format!("{}: {n} refill{} expire in {left} ({clock})", p.name, if n == 1 { "" } else { "s" })
+                ),
+            ));
         }
         // 사용량별 알림: 넘은 기준 중 가장 높은 것 하나만, 창마다 한 번
         for p in snap.providers.iter().filter(|p| p.show) {
@@ -290,6 +413,30 @@ impl Notices {
                     dirty = true;
                     let st = if p.id == ProviderId::Claude { snap.claude.as_ref() } else { None };
                     out.push(texts::tired_notice(&p.name, &m.label, m.ratio, st));
+                }
+            }
+        }
+        // 리셋 임박: 켜 둔 시점 중 지금 맞는 가장 작은 것 하나만, 창마다 한 번
+        for p in snap.providers.iter().filter(|p| p.show) {
+            for m in p.meters.iter().filter(|m| m.exact && m.ratio > 0.0) {
+                let Some(reset) = m.resets_at.filter(|&r| r > snap.now) else { continue };
+                let key = alert_key(&p.account_id, &m.label);
+                let set = alert_set(&self.state, &key);
+                if !set.on {
+                    continue;
+                }
+                // before는 오름차순이라 처음 맞는 값이 가장 작은 시점
+                let Some(&hit) = set.before.iter().find(|&&b| reset - snap.now <= b * 60.0) else { continue };
+                let stamp = (reset / 60.0).round() as i64;
+                let seen_key = format!("soon:{key}");
+                // 같은 창(리셋 시각 10분 안쪽)에서 이 시점 이하를 이미 알렸으면 생략 → 더 큰 시점도 보낸 것으로 봄
+                let already = self.state.get_str(&seen_key).and_then(|s| s.split_once(':')).is_some_and(|(r, b)| {
+                    r.parse::<i64>().is_ok_and(|r| (r - stamp).abs() <= 10) && b.parse::<f64>().is_ok_and(|b| b <= hit)
+                });
+                if !already {
+                    self.state.set_str(&seen_key, &format!("{stamp}:{hit}"));
+                    dirty = true;
+                    out.push(texts::soon_notice(&p.name, &m.label, reset, snap.now));
                 }
             }
         }
@@ -388,6 +535,7 @@ impl Sources {
                 st.mood = mood_of(&st, tired);
             }
             let mut view = claude_view(&src.acc, &st, file.as_ref().map(|b| b.updated_at));
+            view.extra = file.as_ref().and_then(|b| b.spend.as_ref().map(|s| s.label()).or_else(|| b.extra.clone()));
             if let Some(b) = file.as_ref().filter(|_| st.exact) {
                 for m in &b.models {
                     view.meters.push(Meter {
@@ -486,10 +634,12 @@ impl Shown {
 impl Engine {
     /// 백그라운드 스레드 시작. on_snapshot은 다른 스레드에서 불리므로 UI 스레드로 넘기세요.
     pub fn start<F: Fn(Snapshot) + Send + 'static>(on_snapshot: F) -> Engine {
+        // 첫 스냅숏·설정 파일 오류·새 설정 파일도 저장된 언어로 (컨트롤러보다 먼저 시작함)
+        State::load().apply_locale();
         let cfg = Arc::new(Mutex::new(config::load()));
         let (tx, rx) = mpsc::channel();
 
-        // 로그인 상태: 15분마다(또는 요청 시) 공식 CLI로 확인
+        // 로그인 상태: 한 시간마다(또는 요청 시) 공식 CLI로 확인
         let logins: Arc<Mutex<HashMap<String, LoginStatus>>> = Arc::new(Mutex::new(HashMap::new()));
         let (login_tx, login_rx) = mpsc::channel::<()>();
         {
@@ -505,7 +655,7 @@ impl Engine {
                         }
                     }
                     let _ = poke.send(Cmd::Poke);
-                    match login_rx.recv_timeout(Duration::from_secs(15 * 60)) {
+                    match login_rx.recv_timeout(LOGIN_CHECK) {
                         Ok(()) | Err(RecvTimeoutError::Timeout) => while login_rx.try_recv().is_ok() {},
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
@@ -513,12 +663,15 @@ impl Engine {
                 .expect("spawn login thread");
         }
 
-        // 사용량 확인: 갱신 주기마다 (Claude는 창이 열려 있을 때만), 새로고침이면 즉시
+        // 사용량 확인: 갱신 주기마다 (쓰는 중이라 새 값이 따로 들어오면 덜 자주), 새로고침이면 즉시
         let probes: Arc<Mutex<HashMap<String, ProbeState>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Codex 실행 기록에서 마지막으로 새 값을 읽은 시각 (계정별, 기록을 읽는 쪽이 채움)
+        let live: Arc<Mutex<HashMap<String, f64>>> = Arc::new(Mutex::new(HashMap::new()));
         let (probe_tx, probe_rx) = mpsc::channel::<Option<String>>();
         {
             let probes = probes.clone();
             let logins = logins.clone();
+            let live = live.clone();
             let poke = tx.clone();
             std::thread::Builder::new()
                 .name("usagi-probe".into())
@@ -534,20 +687,21 @@ impl Engine {
                         let state = State::load();
                         let interval = refresh_minutes(&state);
                         for acc in accounts::load(&state) {
+                            let force = matches!(&forced, Some(None)) || matches!(&forced, Some(Some(id)) if *id == acc.id);
                             let logged_out =
                                 logins.lock().ok().and_then(|g| g.get(&acc.id).and_then(|l| l.logged_in)) == Some(false);
-                            if logged_out {
+                            if !force && logged_out {
                                 continue;
                             }
                             let now = time::now();
                             let tried = probes.lock().ok().and_then(|g| g.get(&acc.id).and_then(|p| p.tried_at));
-                            let force = matches!(&forced, Some(None)) || matches!(&forced, Some(Some(id)) if *id == acc.id);
                             let due = match acc.provider.as_str() {
-                                // /usage는 토큰을 쓰지 않고 창도 열지 않으므로 주기마다. 안 되는 CLI면 기존 규칙
-                                "claude" if usage_cmd::supported(&acc.id) => tried.is_none_or(|t| now - t >= interval * 60.0 - 5.0),
-                                "claude" => probe_due(bridge::read(&acc.id).as_ref(), tried, interval, now),
-                                // Codex 읽기는 토큰을 쓰지 않으므로 창과 상관없이 주기마다
-                                "codex" => tried.is_none_or(|t| now - t >= interval * 60.0 - 5.0),
+                                // /usage는 토큰을 쓰지 않고 창도 열지 않음. 상태 표시줄로 값이 들어오는 중이면 덜 자주
+                                "claude" if usage_cmd::supported(&acc.id) => {
+                                    usage_due(tried, bridge::read(&acc.id).map(|b| b.updated_at), interval, now)
+                                }
+                                // Codex 읽기도 토큰 0. Codex를 쓰는 중이면 실행 기록에 값이 남으므로 덜 자주
+                                "codex" => usage_due(tried, live.lock().ok().and_then(|g| g.get(&acc.id).copied()), interval, now),
                                 _ => false,
                             };
                             if !force && !due {
@@ -558,16 +712,15 @@ impl Engine {
                             }
                             let _ = poke.send(Cmd::Poke);
                             let result = match acc.provider.as_str() {
+                                "claude" if !usage_cmd::supported(&acc.id) => Err(crate::tr!(
+                                    "설치된 Claude Code 버전은 사용량 조회 미지원. Claude Code 업데이트 필요",
+                                    "This Claude Code version does not support usage checks. Update Claude Code."
+                                )
+                                .into()),
                                 "claude" => match usage_cmd::run(&acc) {
                                     Ok(file) => {
                                         bridge::save(&acc.id, file);
                                         Ok(())
-                                    }
-                                    // /usage가 없는 버전: 창이 열려 있을 때만 아주 작은 요청으로
-                                    Err(_) if !usage_cmd::supported(&acc.id)
-                                        && (force || probe_due(bridge::read(&acc.id).as_ref(), None, interval, now)) =>
-                                    {
-                                        probe::run(&acc).map(|o| bridge::save(&acc.id, o.file))
                                     }
                                     Err(e) => Err(e),
                                 },
@@ -600,11 +753,18 @@ impl Engine {
                 let mut force = true;
                 loop {
                     let mut snap = sources.snapshot(&c);
+                    if let Ok(mut g) = live.lock() {
+                        for src in &sources.codex {
+                            if let Some(s) = &src.reader.snapshot {
+                                g.insert(src.acc.id.clone(), s.ts);
+                            }
+                        }
+                    }
                     if let Ok(g) = logins.lock() {
-                        snap.logins = g.clone();
+                        for (id, login) in g.iter() { snap.logins.entry(id.clone()).or_insert_with(|| login.clone()); }
                     }
                     if let Ok(g) = probes.lock() {
-                        snap.probes = g.clone();
+                        for (id, probe) in g.iter() { snap.probes.entry(id.clone()).or_insert_with(|| probe.clone()); }
                     }
                     let shown = Shown::of(&snap);
                     if force || last.as_ref() != Some(&shown) || snap.now - last_sent >= QUIET_SECS {
@@ -669,8 +829,10 @@ impl Engine {
 
 /// 한 번만 계산 (CLI `--status` 등)
 pub fn snapshot_once() -> Snapshot {
+    let state = State::load();
+    state.apply_locale();
     let c = config::load();
-    Sources::build(&c, &accounts::load(&State::load())).snapshot(&c)
+    Sources::build(&c, &accounts::load(&state)).snapshot(&c)
 }
 
 #[cfg(test)]
@@ -687,7 +849,7 @@ mod tests {
             five_hour: Some(BridgeWindow { used_percentage: 10.0, resets_at: Some(now + 3600.0) }),
             seven_day: None,
             weekly_anchor: None,
-            models: Vec::new(),
+            ..Default::default()
         };
         let closed = BridgeFile { five_hour: Some(BridgeWindow { used_percentage: 10.0, resets_at: Some(now - 10.0) }), ..open.clone() };
         assert!(probe_due(None, None, 5.0, now)); // 처음 한 번
@@ -696,6 +858,23 @@ mod tests {
         assert!(probe_due(Some(&open), Some(now - 400.0), 5.0, now)); // 5분 지남
         assert!(!probe_due(Some(&open), Some(now - 100.0), 5.0, now));
         assert!(!probe_due(Some(&open), Some(now - 400.0), 10.0, now));
+    }
+
+    #[test]
+    fn usage_checks_less_often_while_live_values_arrive() {
+        let now = 1_000_000.0;
+        let min = 60.0;
+        assert!(usage_due(None, None, 10.0, now), "처음 한 번");
+        assert!(!usage_due(Some(now - 5.0 * min), None, 10.0, now));
+        assert!(usage_due(Some(now - 10.0 * min), None, 10.0, now), "주기 지남");
+        // 마지막 확인 뒤 상태 표시줄로 새 값이 들어옴 → 30분까지 미룸
+        let tried = now - 12.0 * min;
+        assert!(!usage_due(Some(tried), Some(now - 1.0 * min), 10.0, now));
+        assert!(usage_due(Some(now - 31.0 * min), Some(now - 1.0 * min), 10.0, now));
+        // 들어온 값이 오래됐으면 원래 주기
+        assert!(usage_due(Some(tried), Some(now - 11.0 * min), 10.0, now));
+        // 우리 확인이 남긴 값은 쓰는 중 값이 아님
+        assert!(usage_due(Some(tried), Some(tried + 2.0), 10.0, now));
     }
 
     #[test]
@@ -721,6 +900,7 @@ mod tests {
                 plan: None,
                 credits: None,
                 refills: None,
+                extra: None,
             }],
             logins: HashMap::new(),
             probes: HashMap::new(),
@@ -731,6 +911,106 @@ mod tests {
         assert_eq!(n.check(None, &mk(0.6), &cfg).len(), 0); // 같은 기준 다시 안 알림
         assert_eq!(n.check(None, &mk(0.85), &cfg).len(), 1); // 80%
         assert_eq!(n.check(None, &mk(0.9), &cfg).len(), 0);
+    }
+
+    #[test]
+    fn alert_set_reads_old_and_new_shapes() {
+        let mut st = State::default();
+        st.0.insert(
+            "alerts".into(),
+            serde_json::json!({
+                "a:5시간": { "on": false, "at": 80 },
+                "a:주간": { "at": [80, 50, 0, 100, 50], "at_off": [80, 30], "before": [30, 10, 10, 20000], "before_off": [10, 60] },
+            }),
+        );
+        // 예전 형식 (on/at만, at이 숫자 하나)
+        let old = alert_set(&st, "a:5시간");
+        assert_eq!((old.on, old.at.clone()), (false, vec![80.0]));
+        assert!(old.at_off.is_empty() && old.before.is_empty() && old.before_off.is_empty());
+        assert_eq!(alert_rule(&st, "a:5시간"), (false, vec![80.0]));
+        // 새 형식: 범위 밖 값은 버리고, 켜짐·꺼짐 양쪽에 있으면 켜짐
+        let s = alert_set(&st, "a:주간");
+        assert_eq!(
+            s,
+            AlertSet { on: true, at: vec![50.0, 80.0], at_off: vec![30.0], before: vec![10.0, 30.0], before_off: vec![60.0] }
+        );
+        assert_eq!(alert_rule(&st, "a:주간"), (true, vec![50.0, 80.0]));
+        // 설정 없음: 켜짐, 기준 없음
+        let none = alert_set(&st, "a:없음");
+        assert!(none.on && none.at.is_empty() && none.before.is_empty());
+    }
+
+    fn reset_snap(now: f64, resets_at: f64, ratio: f64) -> Snapshot {
+        Snapshot {
+            now,
+            claude: None,
+            providers: vec![ProviderView {
+                id: ProviderId::Claude,
+                account_id: "claude-1".into(),
+                name: "Claude".into(),
+                meters: vec![Meter { label: "5시간".into(), ratio, resets_at: Some(resets_at), exact: true }],
+                updated_at: Some(now),
+                note: None,
+                forecast: None,
+                show: true,
+                email: None,
+                plan: None,
+                credits: None,
+                refills: None,
+                extra: None,
+            }],
+            logins: HashMap::new(),
+            probes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn reset_soon_fires_once_per_window_with_the_smallest_lead() {
+        let mut n = Notices { state: State::default() };
+        n.state.0.insert("alerts".into(), serde_json::json!({ "claude-1:5시간": { "before": [10, 30, 60] } }));
+        let cfg = Config::default();
+        let reset = time::now() + 3.0 * HOUR;
+        let at = |left_min: f64| reset_snap(reset - left_min * 60.0, reset, 0.3);
+        assert!(n.check(None, &at(120.0), &cfg).is_empty(), "아직 어느 시점에도 안 맞음");
+        let first = n.check(None, &at(50.0), &cfg);
+        assert_eq!(first.len(), 1, "60분 전 기준");
+        assert_eq!(first[0].0, "리셋 임박");
+        assert!(first[0].1.starts_with("Claude 5시간 한도 50분 뒤 리셋 ("), "{}", first[0].1);
+        assert!(n.check(None, &at(40.0), &cfg).is_empty(), "같은 창에서 다시 안 알림");
+        assert_eq!(n.check(None, &at(25.0), &cfg).len(), 1, "30분 전 기준");
+        // 창 안에서 다시 시작해도 이미 보낸 시점은 생략
+        let mut again = Notices { state: n.state.clone() };
+        assert!(again.check(None, &at(20.0), &cfg).is_empty());
+        assert_eq!(again.check(None, &at(5.0), &cfg).len(), 1, "10분 전 기준");
+        assert!(again.check(None, &at(4.0), &cfg).is_empty());
+        // 창 중간에 처음 보면 맞는 시점 중 가장 작은 것 하나만 (더 큰 시점은 보낸 것으로 봄)
+        let mut late = Notices { state: State::default() };
+        late.state.0.insert("alerts".into(), n.state.0["alerts"].clone());
+        assert_eq!(late.check(None, &at(5.0), &cfg).len(), 1);
+        assert!(late.check(None, &at(3.0), &cfg).is_empty());
+        // 다음 창은 다시 알림
+        let next = reset + 5.0 * HOUR;
+        assert_eq!(late.check(None, &reset_snap(next - 300.0, next, 0.3), &cfg).len(), 1);
+    }
+
+    #[test]
+    fn reset_soon_respects_graph_item_and_global_switches() {
+        let reset = time::now() + HOUR;
+        let snap = reset_snap(reset - 300.0, reset, 0.3);
+        let quiet = |rule: serde_json::Value, cfg: &Config| {
+            let mut n = Notices { state: State::default() };
+            n.state.0.insert("alerts".into(), serde_json::json!({ "claude-1:5시간": rule }));
+            n.check(None, &snap, cfg).is_empty()
+        };
+        let cfg = Config::default();
+        assert!(!quiet(serde_json::json!({ "before": [10] }), &cfg), "켜 둔 시점은 알림");
+        assert!(quiet(serde_json::json!({ "on": false, "before": [10] }), &cfg), "그래프 알림 꺼짐");
+        assert!(quiet(serde_json::json!({ "before_off": [10, 30] }), &cfg), "꺼 둔 시점");
+        assert!(quiet(serde_json::json!({ "before": [10] }), &Config { notify: false, ..Config::default() }), "전체 알림 꺼짐");
+        // 쓴 양이 없으면 리셋 알림 없음
+        let mut n = Notices { state: State::default() };
+        n.state.0.insert("alerts".into(), serde_json::json!({ "claude-1:5시간": { "before": [10] } }));
+        assert!(n.check(None, &reset_snap(reset - 300.0, reset, 0.0), &cfg).is_empty());
     }
 
     #[test]

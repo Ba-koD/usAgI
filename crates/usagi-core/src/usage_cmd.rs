@@ -50,10 +50,16 @@ fn mark_unsupported(account_id: &str) {
 
 /// `/usage` 글자 → 사용량 파일. 알아볼 줄이 하나도 없으면 None.
 pub fn parse(text: &str, now: f64) -> Option<BridgeFile> {
-    let mut file = BridgeFile { updated_at: now, ..Default::default() };
+    let mut file = BridgeFile { updated_at: now, from_usage: true, ..Default::default() };
     let mut any = false;
     for raw in text.lines() {
         let line = raw.trim();
+        // 추가 사용량(크레딧)을 켠 계정만 나오는 줄. 형식이 공개되지 않아 글자 그대로 보관
+        let lower = line.to_lowercase();
+        if file.extra.is_none() && !line.starts_with("Current ") && (lower.starts_with("extra usage") || lower.starts_with("usage credits") || lower.starts_with("credits")) {
+            file.extra = Some(line.chars().take(60).collect());
+            continue;
+        }
         let Some(rest) = line.strip_prefix("Current ") else { continue };
         let Some(colon) = rest.find(':') else { continue };
         let (head, tail) = (rest[..colon].trim(), &rest[colon + 1..]);
@@ -82,24 +88,39 @@ pub fn parse(text: &str, now: f64) -> Option<BridgeFile> {
 /// 공식 CLI로 `/usage`를 실행해 사용량을 받습니다.
 pub fn run(acc: &Account) -> Result<BridgeFile, String> {
     let out = run_cli(acc, USAGE_ARGS, 60)?;
-    let v: serde_json::Value = serde_json::from_str(out.trim()).map_err(|_| "사용량 결과 읽기 실패".to_string())?;
+    let v: serde_json::Value = serde_json::from_str(out.trim())
+        .map_err(|_| crate::tr!("사용량 결과 읽기 실패", "Failed to read the usage result").to_string())?;
     // 모델이 불렸다면 로컬 명령이 아님 → 다시 쓰지 않음 (토큰 낭비 방지)
     let model_used = v.get("modelUsage").and_then(|m| m.as_object()).is_some_and(|m| !m.is_empty())
         || v.get("total_cost_usd").and_then(|c| c.as_f64()).is_some_and(|c| c > 0.0);
     if model_used {
         mark_unsupported(&acc.id);
-        return Err("이 Claude Code 버전은 /usage 바로 실행 불가".into());
+        return Err(crate::tr!("이 Claude Code 버전은 /usage 바로 실행 불가", "This Claude Code version cannot run /usage directly").into());
     }
     let text = v.get("result").and_then(|r| r.as_str()).unwrap_or("");
     if v.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
-        return Err(text.lines().next().unwrap_or("사용량 수신 실패").to_string());
+        return Err(text.lines().next().unwrap_or(crate::tr!("사용량 수신 실패", "Failed to receive usage")).to_string());
     }
-    parse(text, crate::time::now()).ok_or_else(|| text.lines().next().filter(|l| !l.is_empty()).unwrap_or("사용량 정보 없음").to_string())
+    parse(text, crate::time::now()).ok_or_else(|| {
+        text.lines().next().filter(|l| !l.is_empty()).unwrap_or(crate::tr!("사용량 정보 없음", "No usage info")).to_string()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_extra_usage_line_as_is() {
+        let text = "Current session: 30% used · resets Nov 22, 8am (Asia/Seoul)
+Extra usage: $3.20 of $50.00 used
+";
+        let file = parse(text, 1_795_000_000.0).unwrap();
+        assert_eq!(file.extra.as_deref(), Some("Extra usage: $3.20 of $50.00 used"));
+        assert!(file.from_usage);
+        assert!(parse("Current session: 30% used
+", 0.0).unwrap().extra.is_none());
+    }
 
     #[test]
     fn parses_usage_text_with_model_windows() {

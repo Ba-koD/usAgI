@@ -14,6 +14,10 @@ use crate::accounts::{default_claude_dir, default_codex_dir, Account};
 use crate::time;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+static SELECTED: std::sync::LazyLock<Mutex<std::collections::HashMap<String, PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LoginStatus {
@@ -29,9 +33,12 @@ pub struct LoginStatus {
     pub error: Option<String>,
 }
 
-fn same_dir(a: &Path, b: Option<PathBuf>) -> bool {
-    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
-    b.is_some_and(|b| norm(a) == norm(&b))
+pub(crate) fn same_dir(a: &Path, b: Option<PathBuf>) -> bool {
+    b.is_some_and(|b| {
+        let a = a.canonicalize().unwrap_or_else(|_| a.to_owned());
+        let b = b.canonicalize().unwrap_or(b);
+        if cfg!(windows) { a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()) } else { a == b }
+    })
 }
 
 /// 기본 프로필이 아니면 프로필 폴더를 환경 변수로 넘김
@@ -63,17 +70,32 @@ pub(crate) fn program_candidates(provider: &str) -> Vec<PathBuf> {
             }
         }
         _ => {
+            out.push(PathBuf::from("codex"));
             if cfg!(windows) {
-                out.push(PathBuf::from("codex.cmd"));
                 if let Some(appdata) = std::env::var_os("APPDATA") {
-                    out.push(PathBuf::from(appdata).join("npm").join("codex.cmd"));
+                    let npm = PathBuf::from(appdata).join("npm");
+                    let (arch, triple) = if std::env::consts::ARCH == "aarch64" {
+                        ("arm64", "aarch64-pc-windows-msvc")
+                    } else {
+                        ("x64", "x86_64-pc-windows-msvc")
+                    };
+                    let modules = npm.join("node_modules").join("@openai");
+                    for packages in [modules.join("codex/node_modules/@openai"), modules] {
+                        out.push(packages.join(format!("codex-win32-{arch}/vendor/{triple}/bin/codex.exe")));
+                    }
+                    out.push(npm.join("codex.cmd"));
+                }
+                out.push(PathBuf::from("codex.cmd"));
+                // 공식 설치 프로그램 위치
+                if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                    out.push(PathBuf::from(local).join("Programs").join("OpenAI").join("Codex").join("bin").join("codex.exe"));
                 }
             }
-            out.push(PathBuf::from("codex"));
             if !cfg!(windows) {
                 out.push(PathBuf::from("/opt/homebrew/bin/codex"));
                 out.push(PathBuf::from("/usr/local/bin/codex"));
                 if let Some(h) = &home {
+                    out.push(h.join(".local").join("bin").join("codex")); // 공식 설치 프로그램 위치
                     out.push(h.join(".npm-global").join("bin").join("codex"));
                 }
             }
@@ -98,7 +120,11 @@ fn which(name: &Path) -> Option<PathBuf> {
 /// 실제로 설치돼 있는 CLI 실행 파일들 (찾은 순서대로, 중복 없음)
 pub(crate) fn installed_programs(provider: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for c in program_candidates(provider) {
+    let selected = SELECTED.lock().ok().and_then(|map| map.get(provider).cloned());
+    for c in selected.into_iter()
+        .chain(program_candidates(provider))
+        .chain(crate::desktop::desktop_programs(provider))
+        .chain(crate::desktop::previously_installed(provider)) {
         if let Some(p) = which(&c) {
             if !out.contains(&p) {
                 out.push(p);
@@ -108,55 +134,114 @@ pub(crate) fn installed_programs(provider: &str) -> Vec<PathBuf> {
     out
 }
 
+pub(crate) fn remember_program(provider: &str, path: PathBuf) {
+    if let Ok(mut selected) = SELECTED.lock() {
+        selected.insert(provider.into(), path);
+    }
+}
+
+pub(crate) fn quiet_command(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    if crate::desktop::previously_installed("claude").as_deref() == Some(program) {
+        cmd.env("DISABLE_UPDATES", "1");
+    }
+    cmd
+}
+
+fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<String, String> {
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().map_err(|e| e.to_string())?;
+    let read = |mut output: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut output).take(256 * 1024).read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let out = read(Box::new(child.stdout.take().expect("stdout")));
+    let err = read(Box::new(child.stderr.take().expect("stderr")));
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) if out.is_finished() && err.is_finished() => break,
+            Ok(_) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(50)),
+            state => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(state
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| crate::tr!("연결 도구 응답 시간 초과", "The CLI did not respond in time").into()));
+            }
+        }
+    }
+    let mut output = out.join().unwrap_or_default();
+    output.push_str(&err.join().unwrap_or_default());
+    Ok(output)
+}
+
+pub(crate) fn usable_program(provider: &str, path: &Path) -> bool {
+    let mut cmd = quiet_command(path);
+    cmd.arg("--version");
+    output_with_timeout(cmd, Duration::from_secs(8)).is_ok_and(|text| match provider {
+        "codex" => text.contains("codex-cli "),
+        "claude" => text.contains("(Claude Code)"),
+        _ => false,
+    })
+}
+
+/// Ask the official command whether the default profile already has a subscription.
+pub(crate) fn has_subscription(provider: &str, path: &Path) -> bool {
+    let mut cmd = quiet_command(path);
+    let args: &[&str] = if provider == "claude" { &["auth", "status"] } else { &["login", "status"] };
+    cmd.args(args);
+    if provider == "claude" {
+        cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
+    }
+    let Ok(output) = output_with_timeout(cmd, Duration::from_secs(12)) else { return false };
+    if provider == "claude" {
+        let Ok(status) = serde_json::from_str::<serde_json::Value>(&output) else { return false };
+        status["loggedIn"].as_bool() == Some(true) && status["authMethod"].as_str() == Some("claude.ai")
+    } else {
+        output.lines().any(|line| line.trim().eq_ignore_ascii_case("Logged in using ChatGPT"))
+    }
+}
+
 /// 공식 CLI가 설치돼 있는지 (계정을 추가하기 전에 확인)
 pub fn cli_installed(provider: &str) -> bool {
     !installed_programs(provider).is_empty()
 }
 
-/// CLI가 없을 때 보여 줄 설치 안내
+/// 자동 설치가 안 될 때 보여 줄 직접 설치 방법 (각 회사의 공식 설치 프로그램)
 pub fn install_hint(provider: &str) -> String {
-    if provider == "claude" {
-        if cfg!(windows) {
-            "Claude Code CLI 미설치. PowerShell에서 irm https://claude.ai/install.ps1 | iex (또는 npm i -g @anthropic-ai/claude-code)로 설치 후 다시 시도".into()
-        } else {
-            "Claude Code CLI 미설치. 터미널에서 curl -fsSL https://claude.ai/install.sh | bash (또는 npm i -g @anthropic-ai/claude-code)로 설치 후 다시 시도".into()
-        }
-    } else if cfg!(windows) {
-        "Codex CLI 미설치. PowerShell에서 npm i -g @openai/codex로 설치 후 다시 시도".into()
-    } else {
-        "Codex CLI 미설치. 터미널에서 brew install codex (또는 npm i -g @openai/codex)로 설치 후 다시 시도".into()
-    }
+    let (name, script) = match (provider, cfg!(windows)) {
+        ("claude", true) => ("Claude Code CLI", "irm https://claude.ai/install.ps1 | iex"),
+        ("claude", false) => ("Claude Code CLI", "curl -fsSL https://claude.ai/install.sh | bash"),
+        (_, true) => ("Codex CLI", "irm https://chatgpt.com/codex/install.ps1 | iex"),
+        (_, false) => ("Codex CLI", "curl -fsSL https://chatgpt.com/codex/install.sh | sh"),
+    };
+    let shell = if cfg!(windows) { "PowerShell" } else { crate::tr!("터미널", "Terminal") };
+    crate::tr!(format!("{name} 직접 설치: {shell}에서 {script}"), format!("Install {name} manually: in {shell}, run {script}"))
 }
 
-/// 설치된 CLI 목록. 하나도 없으면 설치 안내를 오류로.
+/// 설치된 CLI 목록. 하나도 없으면 공식 설치 프로그램으로 자동 설치 (실패하면 직접 설치 방법을 오류로).
 pub(crate) fn programs_or_hint(provider: &str) -> Result<Vec<PathBuf>, String> {
-    let list = installed_programs(provider);
-    if list.is_empty() {
-        Err(install_hint(provider))
-    } else {
-        Ok(list)
-    }
+    crate::install::ensure(provider, false)
 }
 
 fn run(acc: &Account, args: &[&str]) -> Result<String, String> {
-    let mut last_err = String::from("CLI 찾기 실패");
+    let mut last_err = String::from(crate::tr!("CLI 찾기 실패", "CLI not found"));
     for prog in programs_or_hint(&acc.provider)? {
-        let mut cmd = Command::new(&prog);
-        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut cmd = quiet_command(&prog);
+        cmd.args(args);
         if let Some((k, v)) = profile_env(acc) {
             cmd.env(k, v);
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: 콘솔 창 깜빡임 방지
-        }
-        match cmd.output() {
-            Ok(out) => {
-                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-                return Ok(text);
-            }
+        match output_with_timeout(cmd, Duration::from_secs(15)) {
+            Ok(text) => return Ok(text),
             Err(e) => last_err = format!("{}: {e}", prog.display()),
         }
     }
@@ -178,12 +263,14 @@ pub fn parse_claude(text: &str) -> LoginStatus {
     let low = text.to_lowercase();
     let expired = get("login").is_some_and(|v| v.to_lowercase().starts_with("expired")) || low.contains("not logged in");
     let logged_in = if expired {
-        false
+        Some(false)
+    } else if ["email", "login method", "login", "sign-in ends"].iter().any(|key| get(key).is_some()) {
+        Some(true)
     } else {
-        get("email").is_some() || get("login method").is_some() || get("login").is_some() || get("sign-in ends").is_some()
+        None
     };
     LoginStatus {
-        logged_in: Some(logged_in),
+        logged_in,
         email: get("email"),
         org: get("organization"),
         plan: get("login method"),
@@ -194,13 +281,19 @@ pub fn parse_claude(text: &str) -> LoginStatus {
 }
 
 pub fn parse_codex(text: &str) -> LoginStatus {
-    let low = text.to_lowercase();
-    let logged_in = low.contains("logged in") && !low.contains("not logged in");
+    let account = text.lines().find_map(|line| line.trim().strip_prefix("Logged in using "));
+    let logged_in = if account.is_some() {
+        Some(true)
+    } else if text.to_ascii_lowercase().contains("not logged in") {
+        Some(false)
+    } else {
+        None
+    };
     LoginStatus {
-        logged_in: Some(logged_in),
+        logged_in,
         email: None,
         plan: None,
-        org: logged_in.then(|| text.lines().next().unwrap_or("").trim().replace("Logged in using ", "")).filter(|s| !s.is_empty()),
+        org: account.map(str::to_owned),
         ends: None,
         checked_at: time::now(),
         error: None,
@@ -381,11 +474,15 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// https 주소 중 마지막 것 (localhost 콜백 주소가 아닌 실제 로그인 주소)
+/// Only expose provider authorization links in the UI.
 fn find_url(text: &str) -> Option<String> {
     text.split_whitespace()
-        .filter(|w| w.starts_with("https://"))
-        .map(|w| w.trim_end_matches(['.', ',', ')', '"', '\'']).to_string())
+        .filter_map(|word| {
+            let url = word.trim_end_matches(['.', ',', ')', '"', '\'']);
+            let (host, path) = url.strip_prefix("https://")?.split_once('/')?;
+            let official = matches!(host, "auth.openai.com" | "claude.ai" | "claude.com" | "platform.claude.com" | "console.anthropic.com");
+            (official && path.contains("oauth")).then(|| url.to_owned())
+        })
         .last()
 }
 
@@ -414,43 +511,46 @@ fn spawn_reader(pipe: Box<dyn std::io::Read + Send>, out: Arc<Mutex<String>>) {
 
 impl LoginSession {
     pub fn start(acc: &Account) -> Result<Self, String> {
-        let (_, args) = login_args(acc);
-        let mut last_err = String::from("CLI 찾기 실패");
+        let mut last_err = String::from(crate::tr!("CLI 찾기 실패", "CLI not found"));
         for prog in programs_or_hint(&acc.provider)? {
-            let mut cmd = Command::new(&prog);
-            cmd.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            if let Some((k, v)) = profile_env(acc) {
-                cmd.env(k, v);
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-            }
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    let output = Arc::new(Mutex::new(String::new()));
-                    if let Some(p) = child.stdout.take() {
-                        spawn_reader(Box::new(p), output.clone());
-                    }
-                    if let Some(p) = child.stderr.take() {
-                        spawn_reader(Box::new(p), output.clone());
-                    }
-                    let stdin = child.stdin.take();
-                    return Ok(Self {
-                        account_id: acc.id.clone(),
-                        child,
-                        stdin,
-                        output,
-                        view: SessionView { account_id: acc.id.clone(), ..Default::default() },
-                        started: time::now(),
-                    });
-                }
-                Err(e) => last_err = format!("{}: {e}", prog.display()),
+            match Self::start_with(acc, &prog) {
+                Ok(session) => return Ok(session),
+                Err(error) => last_err = error,
             }
         }
         Err(last_err)
     }
+
+    pub(crate) fn start_with(acc: &Account, prog: &Path) -> Result<Self, String> {
+        let (_, args) = login_args(acc);
+        let mut cmd = quiet_command(prog);
+        cmd.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some((k, v)) = profile_env(acc) {
+            cmd.env(k, v);
+        }
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let output = Arc::new(Mutex::new(String::new()));
+                if let Some(p) = child.stdout.take() {
+                    spawn_reader(Box::new(p), output.clone());
+                }
+                if let Some(p) = child.stderr.take() {
+                    spawn_reader(Box::new(p), output.clone());
+                }
+                let stdin = child.stdin.take();
+                Ok(Self {
+                    account_id: acc.id.clone(),
+                    child,
+                    stdin,
+                    output,
+                    view: SessionView { account_id: acc.id.clone(), ..Default::default() },
+                    started: time::now(),
+                })
+            }
+            Err(e) => Err(format!("{}: {e}", prog.display())),
+        }
+    }
+
 
     /// 출력과 프로세스 상태를 읽어 진행 상황 갱신
     pub fn poll(&mut self) -> &SessionView {
@@ -463,21 +563,26 @@ impl LoginSession {
             self.view.url = Some(u);
         }
         self.view.accepts_code =
-            low.contains("paste code") || low.contains("enter code") || low.contains("authorization code");
+            low.contains("paste code") || low.contains("enter code") || low.contains("authorization code") || low.contains("paste the code");
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 let said_ok = low.contains("login successful") || low.contains("successfully logged in");
-                let ok = said_ok || (status.success() && !low.contains("error") && !low.contains("failed"));
+                let ok = status.success() && (said_ok || (!low.contains("error") && !low.contains("failed")));
                 self.view.done = Some(ok);
                 if !ok {
                     let last = text.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("").to_string();
-                    self.view.message = Some(if last.is_empty() { format!("종료 코드 {:?}", status.code()) } else { last });
+                    self.view.message = Some(if last.is_empty() {
+                        crate::tr!(format!("종료 코드 {:?}", status.code()), format!("Exit code {:?}", status.code()))
+                    } else {
+                        last
+                    });
                 }
                 self.stdin = None;
             }
             Ok(None) if time::now() - self.started > 600.0 => {
                 self.cancel();
-                self.view.message = Some("10분 동안 로그인이 끝나지 않아 취소".into());
+                self.view.message =
+                    Some(crate::tr!("10분 동안 로그인이 끝나지 않아 취소", "Sign-in canceled after 10 minutes without finishing").into());
             }
             _ => {}
         }
@@ -492,9 +597,9 @@ impl LoginSession {
     pub fn submit_code(&mut self, code: &str) -> Result<(), String> {
         let code = code.trim();
         if code.is_empty() {
-            return Err("코드 입력 필요".into());
+            return Err(crate::tr!("코드 입력 필요", "Enter the code").into());
         }
-        let stdin = self.stdin.as_mut().ok_or("이미 끝난 로그인")?;
+        let stdin = self.stdin.as_mut().ok_or(crate::tr!("이미 끝난 로그인", "Sign-in already finished"))?;
         stdin
             .write_all(format!("{code}\n").as_bytes())
             .and_then(|_| stdin.flush())
@@ -508,7 +613,7 @@ impl LoginSession {
             let _ = self.child.kill();
             let _ = self.child.wait();
             self.view.done = Some(false);
-            self.view.message = Some("취소".into());
+            self.view.message = Some(crate::tr!("취소", "Canceled").into());
         }
         self.stdin = None;
     }
@@ -517,7 +622,7 @@ impl LoginSession {
 impl Drop for LoginSession {
     fn drop(&mut self) {
         if self.view.done.is_none() {
-            let _ = self.child.kill();
+            self.cancel();
         }
     }
 }

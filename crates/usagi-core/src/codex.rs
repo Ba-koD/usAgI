@@ -285,20 +285,15 @@ mod tests {
 /// 로그인 토큰은 Codex가 직접 다루며 usAgI는 보지 않습니다.
 pub fn read_via_app_server(acc: &crate::accounts::Account) -> Result<CodexSnapshot, String> {
     use std::io::{BufRead, BufReader, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::Duration;
 
-    let mut last_err = String::from("Codex CLI 찾기 실패");
+    let mut last_err = String::from(crate::tr!("Codex CLI 찾기 실패", "Codex CLI not found"));
     for prog in crate::login::programs_or_hint("codex")? {
-        let mut cmd = Command::new(&prog);
+        let mut cmd = crate::login::quiet_command(&prog);
         cmd.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         if let Some((k, v)) = crate::login::profile_env(acc) {
             cmd.env(k, v);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -317,8 +312,12 @@ pub fn read_via_app_server(acc: &crate::accounts::Account) -> Result<CodexSnapsh
                 }
             }
         });
+        let init = format!(
+            r#"{{"method":"initialize","id":1,"params":{{"clientInfo":{{"name":"usagi","title":"usAgI","version":"{}"}}}}}}"#,
+            crate::VERSION
+        );
         let msgs = [
-            r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"usagi","title":"usAgI","version":"0.1.0"}}}"#,
+            init.as_str(),
             r#"{"method":"initialized"}"#,
             r#"{"method":"account/rateLimits/read","id":2}"#,
             r#"{"method":"account/read","id":3,"params":{}}"#,
@@ -326,7 +325,7 @@ pub fn read_via_app_server(acc: &crate::accounts::Account) -> Result<CodexSnapsh
         let mut email: Option<String> = None;
         let mut plan: Option<String> = None;
         let mut got = (false, false);
-        let mut result = Err("Codex 사용량 응답 없음".to_string());
+        let mut result = Err(crate::tr!("Codex 사용량 응답 없음", "No usage response from Codex").to_string());
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut sent = 0;
         // initialize 응답을 받은 뒤 나머지를 보냄
@@ -347,7 +346,12 @@ pub fn read_via_app_server(acc: &crate::accounts::Account) -> Result<CodexSnapsh
                 Some(2) => {
                     result = match v.get("result") {
                         Some(r) => parse_app_server(r, crate::time::now()),
-                        None => Err(v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("오류").to_string()),
+                        None => Err(v
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or(crate::tr!("오류", "Error"))
+                            .to_string()),
                     };
                     got.0 = true;
                 }
@@ -399,7 +403,7 @@ pub fn plan_label(id: &str) -> String {
 }
 
 pub fn parse_app_server(r: &serde_json::Value, now: f64) -> Result<CodexSnapshot, String> {
-    let limits = r.get("rateLimits").ok_or("사용량 정보 없음")?;
+    let limits = r.get("rateLimits").ok_or(crate::tr!("사용량 정보 없음", "No usage info"))?;
     let mut windows = Vec::new();
     for key in ["primary", "secondary"] {
         if let Some(w) = limits.get(key).filter(|w| !w.is_null()) {
@@ -409,7 +413,7 @@ pub fn parse_app_server(r: &serde_json::Value, now: f64) -> Result<CodexSnapshot
         }
     }
     if windows.is_empty() {
-        return Err("사용량 창 정보 없음".into());
+        return Err(crate::tr!("사용량 창 정보 없음", "No usage window info").into());
     }
     windows.sort_by_key(|w| w.minutes);
     Ok(CodexSnapshot {
@@ -437,7 +441,7 @@ pub fn parse_app_server(r: &serde_json::Value, now: f64) -> Result<CodexSnapshot
     })
 }
 
-fn saved_path(account_id: &str) -> PathBuf {
+pub(crate) fn saved_path(account_id: &str) -> PathBuf {
     let safe: String = account_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
     crate::config::config_dir().join(format!("codex-usage-{safe}.json"))
 }

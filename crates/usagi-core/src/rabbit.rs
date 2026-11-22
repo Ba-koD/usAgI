@@ -225,6 +225,19 @@ mod tests {
     }
 
     #[test]
+    fn app_icon_has_no_background() {
+        for n in [16u32, 32, 96] {
+            let rgba = icon_rgba(n, ICON_INK);
+            assert_eq!(rgba.len(), (n * n * 4) as usize);
+            assert_eq!(rgba[3], 0, "모서리는 투명 (사각형 배경 없음)");
+            let center = (((n / 2) * n + n / 2) * 4) as usize;
+            assert_eq!(&rgba[center..center + 4], &[0x1b, 0x1b, 0x1b, 255]);
+            let pm = app_icon(n).unwrap();
+            assert_eq!(pm.data()[3], 0);
+        }
+    }
+
+    #[test]
     fn renders_all_sizes_and_poses() {
         let poses = [
             Pose::gauges(0.1, 0.05),
@@ -244,44 +257,46 @@ mod tests {
     }
 }
 
-/// 앱 아이콘 (검은 둥근 사각형 + 흰 토끼 실루엣). tiny-skia 픽스맵 데이터(premultiplied RGBA) 그대로.
-/// exe 아이콘(빌드 때), 알림 아이콘에 같이 씀.
-pub fn app_icon(n: u32) -> Option<tiny_skia::Pixmap> {
-    use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
-    let mut pm = Pixmap::new(n, n)?;
-    let s = n as f32;
-    let r = s * 0.23;
-    let mut pb = PathBuilder::new();
-    pb.move_to(r, 0.0);
-    pb.line_to(s - r, 0.0);
-    pb.quad_to(s, 0.0, s, r);
-    pb.line_to(s, s - r);
-    pb.quad_to(s, s, s - r, s);
-    pb.line_to(r, s);
-    pb.quad_to(0.0, s, 0.0, s - r);
-    pb.line_to(0.0, r);
-    pb.quad_to(0.0, 0.0, r, 0.0);
-    pb.close();
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
-    paint.set_color_rgba8(0x14, 0x14, 0x14, 255);
-    pm.fill_path(&pb.finish()?, &paint, FillRule::Winding, Transform::identity(), None);
-    // 흰 토끼: 작은 크기에서도 보이게 비율을 조금 키움
-    let size = ((s * if n <= 24 { 0.86 } else { 0.74 }).round() as u32).max(8);
+/// 흰 토끼 (어두운 바탕용)
+pub const ICON_WHITE: [u8; 3] = [0xff, 0xff, 0xff];
+/// 진한 토끼 (밝은 바탕용: 라이트 모드 작업 표시줄·알림·제목 표시줄)
+pub const ICON_INK: [u8; 3] = [0x1b, 0x1b, 0x1b];
+
+/// 앱 아이콘 모양: 배경 없는 토끼 실루엣의 n×n 알파 마스크
+fn icon_alpha(n: u32) -> Vec<u8> {
+    // 배경이 없으니 칸을 거의 다 채움 (작은 크기는 조금 더 크게)
+    let size = ((n as f32 * if n <= 24 { 0.96 } else { 0.9 }).round() as u32).clamp(8.min(n), n);
     let mask = render(&Pose::default(), size);
     let off = (n - size) / 2;
-    let data = pm.data_mut();
+    let mut out = vec![0u8; (n * n) as usize];
     for y in 0..size {
         for x in 0..size {
-            let a = mask[(y * size + x) as usize] as u32;
-            if a == 0 {
-                continue;
-            }
-            let i = (((y + off) * n + (x + off)) * 4) as usize;
-            for c in 0..4 {
-                data[i + c] = ((255 * a + data[i + c] as u32 * (255 - a)) / 255) as u8;
-            }
+            out[((y + off) * n + (x + off)) as usize] = mask[(y * size + x) as usize];
         }
+    }
+    out
+}
+
+/// 앱 아이콘을 원하는 색으로 (premultiplied가 아닌 RGBA, 창·작업 표시줄 아이콘용)
+pub fn icon_rgba(n: u32, rgb: [u8; 3]) -> Vec<u8> {
+    icon_alpha(n).into_iter().flat_map(|a| [rgb[0], rgb[1], rgb[2], a]).collect()
+}
+
+/// 앱 아이콘: 배경 없이 흰 토끼 실루엣만. tiny-skia 픽스맵(premultiplied RGBA).
+/// exe 아이콘(빌드 때), macOS 앱 아이콘에 씀.
+pub fn app_icon(n: u32) -> Option<tiny_skia::Pixmap> {
+    app_icon_colored(n, ICON_WHITE)
+}
+
+/// 앱 아이콘을 원하는 색으로 (알림 아이콘: 라이트 모드면 진한 토끼)
+pub fn app_icon_colored(n: u32, rgb: [u8; 3]) -> Option<tiny_skia::Pixmap> {
+    let mut pm = tiny_skia::Pixmap::new(n, n)?;
+    for (px, a) in pm.data_mut().chunks_exact_mut(4).zip(icon_alpha(n)) {
+        let a32 = a as u32;
+        px[0] = (rgb[0] as u32 * a32 / 255) as u8;
+        px[1] = (rgb[1] as u32 * a32 / 255) as u8;
+        px[2] = (rgb[2] as u32 * a32 / 255) as u8;
+        px[3] = a;
     }
     Some(pm)
 }

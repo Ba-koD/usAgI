@@ -12,3 +12,13 @@ memchr = "2"
 jiff = "0.2"
 toml = "0.8"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+tempfile = "3"
+# 업데이트 서명 검증 (minisign, Ed25519). 의존성 없는 검증 전용
+minisign-verify = "0.3"
+
+[dev-dependencies]
+# 테스트에서 서명을 직접 만들어 검증 (앱에는 들어가지 않음)
+minisign = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }

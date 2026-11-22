@@ -14,7 +14,7 @@ use crate::config::config_dir;
 use crate::login::{profile_env, programs_or_hint};
 use crate::time;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 pub const PROBE_ARGS: &[&str] = &[
@@ -72,7 +72,7 @@ pub fn parse_output(out: &str, now: f64) -> Result<ProbeOutcome, String> {
                 }
                 if five.is_some() || seven.is_some() {
                     found = Some(ProbeOutcome {
-                        file: BridgeFile { updated_at: now, five_hour: five, weekly_anchor: seven.and_then(|w| w.resets_at), seven_day: seven, models: Vec::new() },
+                        file: BridgeFile { updated_at: now, five_hour: five, weekly_anchor: seven.and_then(|w| w.resets_at), seven_day: seven, ..Default::default() },
                         status,
                     });
                 }
@@ -86,7 +86,7 @@ pub fn parse_output(out: &str, now: f64) -> Result<ProbeOutcome, String> {
     match (found, error) {
         (Some(f), _) => Ok(f),
         (None, Some(e)) => Err(e),
-        (None, None) => Err("응답에 사용량 정보 없음".into()),
+        (None, None) => Err(crate::tr!("응답에 사용량 정보 없음", "No usage info in the response").into()),
     }
 }
 
@@ -98,9 +98,9 @@ pub fn run(acc: &Account) -> Result<ProbeOutcome, String> {
 
 /// 공식 Claude Code CLI를 창 없이 실행하고 표준 출력을 돌려줌 (프로필 폴더 기준, 시간 제한)
 pub(crate) fn run_cli(acc: &Account, args: &[&str], timeout_secs: u64) -> Result<String, String> {
-    let mut last_err = String::from("Claude Code CLI 찾기 실패");
+    let mut last_err = String::from(crate::tr!("Claude Code CLI 찾기 실패", "Claude Code CLI not found"));
     for prog in programs_or_hint("claude")? {
-        let mut cmd = Command::new(&prog);
+        let mut cmd = crate::login::quiet_command(&prog);
         cmd.args(args)
             .current_dir(config_dir()) // 프로젝트 설정·CLAUDE.md를 읽지 않게
             .stdin(Stdio::null())
@@ -109,12 +109,6 @@ pub(crate) fn run_cli(acc: &Account, args: &[&str], timeout_secs: u64) -> Result
         if let Some((k, v)) = profile_env(acc) {
             cmd.env(k, v);
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let _ = std::fs::create_dir_all(config_dir());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -135,7 +129,7 @@ pub(crate) fn run_cli(acc: &Account, args: &[&str], timeout_secs: u64) -> Result
                 Ok(None) if started.elapsed() > Duration::from_secs(timeout_secs) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("확인 시간 초과 ({timeout_secs}초)"));
+                    return Err(crate::tr!(format!("확인 시간 초과 ({timeout_secs}초)"), format!("Check timed out ({timeout_secs}s)")));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                 Err(e) => return Err(e.to_string()),

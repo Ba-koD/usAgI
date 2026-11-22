@@ -45,6 +45,57 @@ pub struct BridgeFile {
     /// 모델별 주간 한도 (예: Fable). `/usage`에서만 옴
     #[serde(default)]
     pub models: Vec<ModelWindow>,
+    /// 지출 한도 (상태 표시줄 rate_limits.spend_limit, 지출 한도를 정한 환경에서만 옴)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<Spend>,
+    /// `/usage`의 추가 사용량·크레딧 줄 (형식이 공개되지 않아 글자 그대로)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<String>,
+    /// `/usage`에서 온 기록인지 (저장하지 않음). 추가 사용량 줄은 `/usage`만 알려 줌
+    #[serde(skip)]
+    pub from_usage: bool,
+}
+
+/// 지출 한도 (금액은 Claude Code가 토큰 수로 추정한 값)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Spend {
+    pub used_percentage: f64,
+    #[serde(default)]
+    pub resets_at: Option<f64>,
+    #[serde(default)]
+    pub used_usd: Option<f64>,
+    #[serde(default)]
+    pub limit_usd: Option<f64>,
+    /// daily | weekly | monthly
+    #[serde(default)]
+    pub period: Option<String>,
+}
+
+impl Spend {
+    fn from_json(v: &serde_json::Value) -> Option<Self> {
+        Some(Spend {
+            used_percentage: v.get("used_percentage")?.as_f64()?,
+            resets_at: v.get("resets_at").and_then(|r| r.as_f64()),
+            used_usd: v.get("used_usd").and_then(|r| r.as_f64()),
+            limit_usd: v.get("limit_usd").and_then(|r| r.as_f64()),
+            period: v.get("period").and_then(|r| r.as_str()).map(str::to_string),
+        })
+    }
+
+    /// 계정 카드 표시: "추가 사용 $12.30 / $50 · 월" (금액이 없으면 퍼센트)
+    pub fn label(&self) -> String {
+        let period = match self.period.as_deref() {
+            Some("daily") => crate::tr!(" · 일", " · daily"),
+            Some("weekly") => crate::tr!(" · 주", " · weekly"),
+            Some("monthly") => crate::tr!(" · 월", " · monthly"),
+            _ => "",
+        };
+        let amount = match (self.used_usd, self.limit_usd) {
+            (Some(u), Some(l)) => format!("${u:.2} / ${l:.0}"),
+            _ => format!("{:.0}%", self.used_percentage),
+        };
+        crate::tr!(format!("추가 사용 {amount}{period}"), format!("Extra usage {amount}{period}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,8 +124,12 @@ pub fn roll_weekly(anchor: f64, now: f64) -> f64 {
 
 /// 계정별 기록 파일
 pub fn path(account_id: &str) -> PathBuf {
-    let safe: String = account_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
-    config_dir().join(format!("claude-usage-{safe}.json"))
+    config_dir().join(format!("claude-usage-{}.json", safe_id(account_id)))
+}
+
+/// 파일 이름에 쓸 계정 ID (영문·숫자·-·_ 만). 명령줄로 받은 값이 경로를 벗어나지 않게
+fn safe_id(account_id: &str) -> String {
+    account_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect()
 }
 
 pub fn read(account_id: &str) -> Option<BridgeFile> {
@@ -110,21 +165,25 @@ pub fn parse_statusline(input: &str, now: f64) -> (Option<BridgeFile>, String) {
         five_hour: rl.get("five_hour").and_then(window),
         weekly_anchor: seven_day.and_then(|w| w.resets_at),
         seven_day,
-        models: Vec::new(),
+        spend: rl.get("spend_limit").and_then(Spend::from_json),
+        ..Default::default()
     };
     let mut parts = Vec::new();
     if !model.is_empty() {
         parts.push(model);
     }
     if let Some(w) = file.five_hour {
-        let mut s = format!("5시간 {}", fmt_pct(w.ratio_at(now)));
+        let pct = fmt_pct(w.ratio_at(now));
+        let mut s = crate::tr!(format!("5시간 {pct}"), format!("5-hour {pct}"));
         if let Some(r) = w.live_reset(now) {
-            s += &format!(" ({} 뒤 리셋)", fmt_hm(r - now));
+            let left = fmt_hm(r - now);
+            s += &crate::tr!(format!(" ({left} 뒤 리셋)"), format!(" (resets in {left})"));
         }
         parts.push(s);
     }
     if let Some(w) = file.seven_day {
-        parts.push(format!("주간 {}", fmt_pct(w.ratio_at(now))));
+        let pct = fmt_pct(w.ratio_at(now));
+        parts.push(crate::tr!(format!("주간 {pct}"), format!("Weekly {pct}")));
     }
     (Some(file), parts.join(" · "))
 }
@@ -134,6 +193,13 @@ pub fn save(account_id: &str, mut file: BridgeFile) {
     let old = read(account_id);
     if file.weekly_anchor.is_none() {
         file.weekly_anchor = old.as_ref().and_then(|o| o.weekly_anchor);
+    }
+    // 지출 한도는 상태 표시줄에서만, 추가 사용량 줄은 `/usage`에서만 옴 → 다른 쪽 기록은 이어 씀
+    if file.spend.is_none() {
+        file.spend = old.as_ref().and_then(|o| o.spend.clone()).filter(|s| s.resets_at.is_none_or(|r| r > file.updated_at));
+    }
+    if !file.from_usage {
+        file.extra = old.as_ref().and_then(|o| o.extra.clone());
     }
     // 상태 표시줄은 모델별 창을 모르므로, 마지막 `/usage` 값을 리셋 전까지 이어 씀
     if file.models.is_empty() {
@@ -146,7 +212,7 @@ pub fn save(account_id: &str, mut file: BridgeFile) {
         return;
     }
     if let Ok(text) = serde_json::to_string(&file) {
-        let tmp = dir.join(format!("claude-usage.{}.{}.tmp", std::process::id(), account_id));
+        let tmp = dir.join(format!("claude-usage.{}.{}.tmp", std::process::id(), safe_id(account_id)));
         if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path(account_id)).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -155,6 +221,8 @@ pub fn save(account_id: &str, mut file: BridgeFile) {
 
 /// `usagi statusline --account <id>` 진입점: stdin을 받아 파일에 쓰고 출력할 글자를 돌려줍니다.
 pub fn run_statusline(input: &str, account_id: &str) -> String {
+    // Claude Code가 따로 띄우는 프로세스라 저장된 언어 설정을 여기서 읽음
+    crate::config::State::load().apply_locale();
     let now = time::now();
     let (file, line) = parse_statusline(input, now);
     if let Some(file) = file {
@@ -177,6 +245,21 @@ mod tests {
         assert_eq!(file.seven_day.unwrap().resets_at, Some(1_795_300_000.0));
         assert_eq!(line, "Opus · 5시간 37% (2시간 13분 뒤 리셋) · 주간 30%");
         assert_eq!(file.five_hour.unwrap().ratio_at(1_795_008_000.0), 0.0);
+        crate::i18n::set(crate::i18n::Lang::En);
+        let (_, line) = parse_statusline(input, now);
+        crate::i18n::set(crate::i18n::Lang::Ko);
+        assert_eq!(line, "Opus · 5-hour 37% (resets in 2h 13m) · Weekly 30%");
+    }
+
+    #[test]
+    fn reads_spend_limit_when_present() {
+        let input = r#"{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":2000000000},
+            "spend_limit":{"used_percentage":24.6,"resets_at":2000000000,"used_usd":12.3,"limit_usd":50,"period":"monthly"}}}"#;
+        let (file, _) = parse_statusline(input, 1_900_000_000.0);
+        let spend = file.unwrap().spend.unwrap();
+        assert_eq!(spend.label(), "추가 사용 $12.30 / $50 · 월");
+        let pct_only = Spend { used_percentage: 37.0, resets_at: None, used_usd: None, limit_usd: None, period: None };
+        assert_eq!(pct_only.label(), "추가 사용 37%");
     }
 
     #[test]

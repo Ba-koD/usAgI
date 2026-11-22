@@ -1,6 +1,6 @@
 //! 설정 화면 컨트롤러 — 화면 상태(JSON)와 화면에서 오는 모든 명령을 플랫폼과 상관없이 한 곳에서 처리.
 //!
-//! Windows·macOS·(나중에) Linux 앱은 같은 `settings.html`을 띄우고:
+//! Windows·macOS 앱은 같은 Slint 화면을 띄우고:
 //! 1. 화면에서 온 명령을 [`Controller::handle_ipc`]에 넘기고
 //! 2. 돌려받은 [`Effect`]만 실행해요 (주소 열기, 알림, 시작 시 실행, 위젯·메뉴 막대 다시 그리기, 업데이트 받기·적용).
 //! 3. 화면에 보낼 상태는 [`Controller::settings_state`]가 만들어요. 플랫폼은 몇 가지 값([`HostInfo`])만 채워요.
@@ -10,6 +10,7 @@
 
 use crate::accounts::{self, Account, Link};
 use crate::config::{self, Config, State};
+use crate::connection::{Connection, Destination};
 use crate::engine::{self, Engine, Notices, Snapshot};
 use crate::login::{self, LoginSession};
 use crate::update::{self, Release};
@@ -19,7 +20,8 @@ use std::path::PathBuf;
 
 /// 공식 사용량 페이지 (정해진 주소만 엶)
 pub const USAGE_URL_CLAUDE: &str = "https://claude.ai/settings/usage";
-pub const USAGE_URL_CODEX: &str = "https://chatgpt.com/settings/usage?tab=overview";
+pub const USAGE_URL_CODEX: &str = "https://chatgpt.com/codex/settings/usage";
+
 
 const LOGIN_POLL_SECS: f64 = 0.4;
 /// 로그인이 끝난 뒤 CLI가 상태를 쓰는 데 잠깐 걸릴 수 있어 몇 번 더 확인
@@ -69,7 +71,7 @@ pub struct Platform {
     pub name: &'static str,
     /// 업데이트 저장소 ("owner/name")
     pub repo: &'static str,
-    /// 패키지 관리자(Homebrew 등)가 버전을 관리해 스스로 바꾸지 않음 → 이 안내를 보여 줌
+    /// 패키지 관리자(Homebrew 등)가 버전을 관리해 스스로 바꾸지 않음 → 이 업데이트 명령을 안내
     pub managed_update: Option<&'static str>,
 }
 
@@ -84,6 +86,10 @@ pub struct HostInfo {
     pub urgent_allowed: Option<bool>,
     /// 위젯을 놓을 모니터 목록 [{id, label}] (없으면 비움)
     pub monitors: Vec<Value>,
+    /// 위젯 막대 길이 범위 (논리 px): 최소(가장 긴 남은 시간 글자), 기본(예전 고정 길이), 최대. 위젯이 없으면 None
+    pub bar_range: Option<(f64, f64, f64)>,
+    /// 작업 표시줄이 밝은지 (Windows 모드). 설정 창의 작업 표시줄 아이콘 색을 고름. 모르면 None
+    pub taskbar_light: Option<bool>,
 }
 
 #[derive(Default)]
@@ -103,22 +109,24 @@ pub struct Controller {
     last_error: Option<String>,
     /// 콘솔 없이 돌고 있는 공식 로그인 (한 번에 하나)
     login: Option<LoginSession>,
+    connecting: Option<Connection>,
+    /// 마지막으로 화면에 보낸 연결 준비 문구
+    connect_message: String,
     login_finished_at: Option<f64>,
     last_login_poll: f64,
     login_rechecks: u32,
     next_recheck: f64,
-    /// 방금 "추가"로 만든 계정 (로그인을 끝내지 않고 닫으면 지움)
-    pending_new: Option<String>,
+    /// "추가"로 만들어 공식 로그인 중인, 아직 등록 전인 프로필
+    pending_new: Option<Account>,
     update: UpdateState,
     next_update_check: f64,
     settings_open: bool,
-    /// 공식 CLI가 설치돼 있는지 (테스트에서 바꿔 끼움)
-    cli_check: fn(&str) -> bool,
 }
 
 impl Controller {
     pub fn new(engine: Engine, platform: Platform) -> Self {
         let mut notices = Notices::load();
+        crate::i18n::set(crate::i18n::resolve(&notices.state.pref_str("locale", "system")));
         if notices.state.0.remove("tiers").is_some() {
             notices.state.save(); // 예전 수동 요금제 단계 (이제 자동만)
         }
@@ -129,6 +137,8 @@ impl Controller {
             platform,
             last_error: None,
             login: None,
+            connecting: None,
+            connect_message: String::new(),
             login_finished_at: None,
             last_login_poll: 0.0,
             login_rechecks: 0,
@@ -137,7 +147,6 @@ impl Controller {
             update: UpdateState::default(),
             next_update_check: time::now() + UPDATE_FIRST_SECS,
             settings_open: false,
-            cli_check: login::cli_installed,
         }
     }
 
@@ -175,13 +184,21 @@ impl Controller {
     pub fn startup(&mut self) -> Vec<Effect> {
         let mut fx = Vec::new();
         self.ensure_links();
+        self.drop_legacy_accounts();
+        std::thread::spawn(|| {
+            remove_legacy_data();
+            accounts::protect_profiles();
+        });
         if let Some(err) = self.engine.config().error {
-            fx.push(Effect::Notify("usAgI 설정 오류".into(), err));
+            fx.push(Effect::Notify(crate::tr!("usAgI 설정 오류", "usAgI config error").into(), err));
         }
         let last = self.notices.state.get_str("last_version").map(str::to_string);
         if last.as_deref() != Some(crate::VERSION) {
             if last.is_some() {
-                fx.push(Effect::Notify("usAgI 업데이트 완료".into(), format!("v{}로 업데이트 완료.", crate::VERSION)));
+                fx.push(Effect::Notify(
+                    crate::tr!("usAgI 업데이트 완료", "usAgI updated").into(),
+                    crate::tr!(format!("v{}로 업데이트 완료.", crate::VERSION), format!("Updated to v{}.", crate::VERSION)),
+                ));
             }
             self.notices.state.set_str("last_version", crate::VERSION);
             self.notices.state.save();
@@ -203,6 +220,7 @@ impl Controller {
     pub fn tick(&mut self) -> Vec<Effect> {
         let now = time::now();
         let mut fx = Vec::new();
+        self.poll_connection(&mut fx);
         if self.login.is_some() && now - self.last_login_poll >= LOGIN_POLL_SECS {
             self.last_login_poll = now;
             if self.poll_login(now) {
@@ -228,7 +246,7 @@ impl Controller {
 
     /// 로그인 진행을 보고 있어 tick을 자주(0.2초쯤) 불러야 하는지. 아니면 1초에 한 번이면 충분해요.
     pub fn busy(&self) -> bool {
-        self.login.is_some()
+        self.login.is_some() || self.connecting.is_some()
     }
 
     pub fn settings_opened(&mut self) {
@@ -266,6 +284,8 @@ impl Controller {
         let now = time::now();
         json!({
             "platform": self.platform.name,
+            // 지금 쓰는 언어 (설정 창이 같은 언어로 그림)
+            "lang": crate::i18n::lang().code(),
             "version": crate::VERSION,
             "update": self.update_json(),
             "portable": config::is_portable(),
@@ -275,12 +295,22 @@ impl Controller {
                 "side": st.pref_str("side", "right"),
                 "monitor": st.pref_str("monitor", "primary"),
                 "mode": st.pref_str("mode", "percent"),
+                "theme": st.pref_str("theme", "system"),
+                "logo": st.pref_str("logo", "auto"),
+                "locale": st.pref_str("locale", "system"),
+                // 막대 길이(px, 남은 시간 표시일 때). 설정이 없으면 기본(예전 고정 길이)
+                "barPx": st.pref_f64("barPx"),
+                "barMin": host.bar_range.map(|r| r.0),
+                "barDefault": host.bar_range.map(|r| r.1),
+                "barMax": host.bar_range.map(|r| r.2),
                 "basis": st.pref_str("basis", "used"),
                 "refresh": engine::refresh_minutes(st),
                 "rabbit": st.pref_bool("rabbit", true),
                 "notify": cfg.notify,
                 "napNotify": st.pref_bool("napNotify", false),
                 "loginNotify": st.pref_bool("loginNotify", false),
+                "refillNotify": st.pref_bool("refillNotify", false),
+                "refillLead": st.pref_f64("refillLead").unwrap_or(engine::DEFAULT_REFILL_LEAD_MIN),
                 "urgent": st.pref_bool("urgent", true),
                 "urgentSupported": host.urgent_supported,
                 "urgentAllowed": host.urgent_allowed,
@@ -289,9 +319,13 @@ impl Controller {
                 "autostart": host.autostart,
             },
             "monitors": host.monitors,
+            "taskbarLight": host.taskbar_light,
             "accounts": ui::accounts_json(st, self.snap.as_ref(), self.login_rechecks > 0, now),
             "error": self.last_error,
-            "loginSession": ui::login_session_json(self.login.as_ref()),
+            "loginSession": self.connecting.as_ref().map(|connection| json!({
+                "id": connection.account_id.as_deref().unwrap_or(connection.provider),
+                "message": connection.message(),
+            })).unwrap_or_else(|| ui::login_session_json(self.login.as_ref())),
         })
     }
 
@@ -316,7 +350,7 @@ impl Controller {
             "error": u.error,
             "repo": self.platform.repo,
             "brew": self.platform.managed_update.is_some(),
-            "managedHint": self.platform.managed_update,
+            "managedHint": self.managed_hint(),
         })
     }
 
@@ -337,12 +371,42 @@ impl Controller {
         let mut fx = Vec::new();
         match cmd.as_str() {
             "ready" => {}
+            "settingsError" => {
+                let message = msg["error"].as_str().unwrap_or(crate::tr!("설정 창 열기 실패", "Failed to open the settings window")).to_string();
+                fx.push(Effect::Notify(crate::tr!("usAgI 설정", "usAgI settings").into(), message));
+            }
             "close" => return vec![Effect::CloseSettings],
             "quit" => return vec![Effect::Quit],
             "probeNow" => self.engine.probe_now(Some(id)),
             "refresh" => self.refresh_all(),
+            "resetSettings" => return self.reset_settings(),
+            // 한 페이지(위젯·알림·일반)만 기본값으로
+            "resetPrefs" => return self.reset_scope(msg.get("scope").and_then(|s| s.as_str()).unwrap_or("")),
+            // 계정별 리필권 만료 알림: default(전체 설정) | on(이 계정 시점) | off
+            "refillRule" => {
+                let mode = msg.get("mode").and_then(|m| m.as_str()).unwrap_or("default");
+                let lead = msg.get("lead").and_then(|l| l.as_f64()).filter(|l| l.is_finite());
+                let st = &mut self.notices.state;
+                let rules = st.0.entry("refill_rules").or_insert_with(|| json!({}));
+                if let Some(rules) = rules.as_object_mut() {
+                    match mode {
+                        "on" | "off" => {
+                            let lead = lead.unwrap_or(engine::DEFAULT_REFILL_LEAD_MIN).round().clamp(1.0, engine::MAX_REFILL_LEAD_MIN);
+                            rules.insert(id.clone(), json!({"on": mode == "on", "lead": lead}));
+                        }
+                        _ => {
+                            rules.remove(&id);
+                        }
+                    }
+                }
+                st.save();
+            }
             "login" => self.login_account(&id),
-            "addNew" => self.add_new(if provider == "codex" { "codex" } else { "claude" }),
+            "addNew" => match provider.as_str() {
+                "claude" => self.connect("claude", None),
+                "codex" => self.connect("codex", None),
+                _ => {}
+            },
             "loginCode" => {
                 let code = msg.get("code").and_then(|c| c.as_str()).unwrap_or("").to_string();
                 if let Some(s) = self.login.as_mut() {
@@ -357,10 +421,8 @@ impl Controller {
                 }
             }
             "loginCancel" => {
-                if let Some(mut s) = self.login.take() {
-                    s.cancel();
-                    self.drop_unfinished_new(&s.view().account_id.clone());
-                }
+                self.cancel_connection();
+                self.drop_unfinished_new();
                 fx.push(Effect::Redraw);
             }
             "pref" => {
@@ -406,8 +468,12 @@ impl Controller {
                 }
             }
             "testNotify" => fx.push(Effect::Notify(
-                "사용량 알림".into(),
-                "알림 미리 보기 · Claude 5시간 한도의 80% 사용. 이 속도면 오후 4시 20분에 한도 도달.".into(),
+                crate::tr!("사용량 알림", "Usage alert").into(),
+                crate::tr!(
+                    "알림 미리 보기 · Claude 5시간 한도의 80% 사용. 이 속도면 오후 4시 20분에 한도 도달.",
+                    "Preview · Claude 5-hour limit 80% used. At this pace, limit expected at 4:20 PM."
+                )
+                .into(),
             )),
             "openUsage" => match provider.as_str() {
                 "claude" => fx.push(Effect::Open(USAGE_URL_CLAUDE.into())),
@@ -421,7 +487,7 @@ impl Controller {
             }
             "openConfig" => match config::ensure_file() {
                 Ok(p) => fx.push(Effect::OpenText(p)),
-                Err(e) => self.last_error = Some(format!("설정 파일 만들기 실패: {e}")),
+                Err(e) => self.last_error = Some(crate::tr!(format!("설정 파일 만들기 실패: {e}"), format!("Failed to create the config file: {e}"))),
             },
             "openNotifySettings" => fx.push(Effect::OpenNotifySettings),
             "checkUpdate" => fx.extend(self.check_update(true)),
@@ -452,10 +518,48 @@ impl Controller {
                 let m = value.as_f64().unwrap_or(5.0);
                 let m = [1.0, 3.0, 5.0, 10.0, 15.0].into_iter().min_by(|a, b| (a - m).abs().total_cmp(&(b - m).abs())).unwrap_or(5.0);
                 st.set_pref("refresh_minutes", json!(m));
+                self.engine.refresh();
             }
             "poll" => {
                 st.set_pref("poll", json!(value.as_f64().unwrap_or(3.0).clamp(1.0, 60.0)));
                 self.engine.refresh();
+            }
+            // 위젯 막대 길이 (논리 px, 남은 시간 표시일 때의 길이). "default"·null이면 기본(예전 고정 길이)으로
+            "barPx" => {
+                match value.as_f64().filter(|v| v.is_finite()) {
+                    Some(v) => st.set_pref(key, json!(v.round().clamp(1.0, 400.0))),
+                    None => {
+                        if let Some(p) = st.0.get_mut("prefs").and_then(|p| p.as_object_mut()) {
+                            p.remove(key);
+                        }
+                        st.save();
+                    }
+                }
+                return vec![Effect::PlatformPref(key.into()), Effect::Redraw, Effect::Push];
+            }
+            // 언어: 시스템(기본) / 한국어 / 영어. 위젯·메뉴·알림 문구도 바뀌므로 다시 그림
+            "locale" => {
+                if let Some(v) = one_of(&value, &["system", "ko", "en"]) {
+                    crate::i18n::set(crate::i18n::resolve(v.as_str().unwrap_or("system")));
+                    st.set_pref(key, v);
+                    return vec![Effect::PlatformPref(key.into()), Effect::Redraw, Effect::Push];
+                }
+                return Vec::new();
+            }
+            // 로고 색: 자동(라이트·다크 모드를 따름) / 흰색 / 검은색. 작업 표시줄 단추·제목 표시줄·알림 아이콘
+            "logo" => {
+                if let Some(v) = one_of(&value, &["auto", "white", "ink"]) {
+                    st.set_pref(key, v);
+                    return vec![Effect::PlatformPref(key.into()), Effect::Push];
+                }
+                return Vec::new();
+            }
+            // 설정 창 테마: 기본은 시스템 설정을 따름
+            "theme" => {
+                if let Some(v) = one_of(&value, &["system", "light", "dark"]) {
+                    st.set_pref(key, v);
+                }
+                return vec![Effect::Push];
             }
             "mode" => {
                 if let Some(v) = one_of(&value, &["percent", "time"]) {
@@ -473,7 +577,14 @@ impl Controller {
                     st.set_pref(key, json!(v.clamp(1.0, 99.0)));
                 }
             }
-            "notify" | "autoUpdate" | "rabbit" | "napNotify" | "loginNotify" => {
+            // 리필권 만료 알림 시점 (만료 몇 분 전)
+            "refillLead" => {
+                if let Some(v) = value.as_f64().filter(|v| v.is_finite()) {
+                    st.set_pref(key, json!(v.round().clamp(1.0, engine::MAX_REFILL_LEAD_MIN)));
+                }
+                return vec![Effect::Push];
+            }
+            "notify" | "autoUpdate" | "rabbit" | "napNotify" | "loginNotify" | "refillNotify" => {
                 if let Some(v) = value.as_bool() {
                     st.set_pref(key, json!(v));
                 }
@@ -528,63 +639,116 @@ impl Controller {
         }
     }
 
-    /// 새 계정: CLI가 있는지 먼저 확인 → usAgI 프로필 폴더를 만들고 곧바로 공식 로그인
-    fn add_new(&mut self, provider: &str) {
-        if !(self.cli_check)(provider) {
-            self.last_error = Some(login::install_hint(provider));
-            return;
+    /// 예전 브라우저 연결 계정(프로필 폴더 없음)을 저장된 목록에서도 지움
+    fn drop_legacy_accounts(&mut self) {
+        let stored = self.notices.state.0.get("accounts").and_then(|v| v.as_array()).map_or(0, Vec::len);
+        let list = accounts::load(&self.notices.state);
+        if list.len() != stored {
+            accounts::save(&mut self.notices.state, &list);
         }
+    }
+
+    fn connect(&mut self, provider: &'static str, id: Option<String>) {
+        self.cancel_connection();
+        if self.pending_new.as_ref().is_some_and(|a| Some(a.id.as_str()) != id.as_deref()) {
+            self.drop_unfinished_new();
+        }
+        match Connection::start(provider, id, &accounts::load(&self.notices.state)) {
+            Ok(connection) => self.connecting = Some(connection),
+            Err(e) => self.set_error(crate::tr!(format!("계정 연결 준비 실패: {e}"), format!("Failed to prepare the account connection: {e}"))),
+        }
+    }
+
+    fn cancel_connection(&mut self) {
+        self.connecting = None;
+        if let Some(mut login) = self.login.take() {
+            login.cancel();
+        }
+    }
+
+    fn poll_connection(&mut self, effects: &mut Vec<Effect>) {
+        let Some(connection) = self.connecting.as_ref() else { return };
+        let Some(result) = connection.next() else {
+            // 설치가 시작되면 화면 문구도 바꿈
+            let message = connection.message();
+            if message != self.connect_message {
+                self.connect_message = message;
+                effects.push(Effect::Push);
+            }
+            return;
+        };
+        let attempt = self.connecting.take().expect("connection attempt");
+        self.connect_message.clear();
+        match result {
+            Ok(destination) => self.finish_connection(attempt.provider, attempt.account_id.as_deref(), destination),
+            Err(error) => self.set_error(error),
+        }
+        effects.extend([Effect::Redraw, Effect::Push]);
+    }
+
+    fn finish_connection(&mut self, provider: &str, target: Option<&str>, destination: Destination) {
         let mut list = accounts::load(&self.notices.state);
-        let acc = match accounts::create_profile(provider, &list) {
-            Ok(a) => a,
-            Err(e) => {
-                self.last_error = Some(format!("새 계정 폴더 만들기 실패: {e}"));
+        let program = match destination {
+            Destination::Existing { profile, program } => {
+                login::remember_program(provider, program);
+                let acc = Account {
+                    id: accounts::new_id(provider, &list),
+                    provider: provider.into(),
+                    dir: profile.to_string_lossy().into(),
+                    label: String::new(),
+                    show: true,
+                    chain: None,
+                };
+                let id = acc.id.clone();
+                list.push(acc);
+                accounts::save(&mut self.notices.state, &list);
+                self.ensure_links();
+                self.engine.check_logins();
+                self.engine.refresh();
+                self.engine.probe_now(Some(id));
                 return;
             }
+            Destination::SignIn(program) => program,
         };
-        list.push(acc.clone());
-        accounts::save(&mut self.notices.state, &list);
-        self.engine.refresh();
-        if self.start_login(&acc) {
-            self.pending_new = Some(acc.id.clone());
-            self.engine.check_logins();
-            self.ensure_links();
+        let fresh = target.is_none();
+        let acc = if let Some(id) = target {
+            let Some(acc) = list.iter().chain(&self.pending_new).find(|a| a.id == id).cloned() else { return };
+            acc
         } else {
-            // 로그인을 띄우지 못했으면 방금 만든 계정을 남기지 않음
-            self.edit_accounts(|list| {
-                list.retain(|a| a.id != acc.id);
-                Ok(())
-            });
-            let _ = std::fs::remove_dir_all(acc.path());
+            match accounts::create_profile(provider, &list) {
+                Ok(acc) => acc,
+                Err(e) => {
+                    self.set_error(crate::tr!(format!("새 계정 폴더 만들기 실패: {e}"), format!("Failed to create the new account folder: {e}")));
+                    return;
+                }
+            }
+        };
+        match LoginSession::start_with(&acc, &program) {
+            Ok(session) => {
+                login::remember_program(provider, program);
+                self.login = Some(session);
+                self.login_finished_at = None;
+                self.last_login_poll = 0.0;
+                if fresh {
+                    self.pending_new = Some(acc);
+                }
+            }
+            Err(e) => {
+                self.set_error(crate::tr!(format!("공식 로그인 시작 실패: {e}"), format!("Failed to start the official sign-in: {e}")));
+                if fresh {
+                    let _ = std::fs::remove_dir(acc.path());
+                }
+            }
         }
     }
 
     /// 계정 id로 공식 로그인 시작 (메뉴 막대·설정 화면의 "로그인")
     pub fn login_account(&mut self, id: &str) {
-        if let Some(acc) = accounts::load(&self.notices.state).into_iter().find(|a| a.id == id) {
-            self.start_login(&acc);
-        }
-    }
-
-    /// 콘솔 창 없이 공식 로그인 실행 (한 번에 하나). 브라우저는 CLI가 엶. 시작했으면 true.
-    fn start_login(&mut self, acc: &Account) -> bool {
-        if let Some(mut old) = self.login.take() {
-            old.cancel();
-            let old_id = old.view().account_id.clone();
-            if old_id != acc.id {
-                self.drop_unfinished_new(&old_id);
-            }
-        }
-        match LoginSession::start(acc) {
-            Ok(s) => {
-                self.login = Some(s);
-                self.login_finished_at = None;
-                self.last_login_poll = 0.0;
-                true
-            }
-            Err(e) => {
-                self.last_error = Some(format!("로그인 시작 실패: {e}"));
-                false
+        if let Some(acc) = accounts::load(&self.notices.state).into_iter().chain(self.pending_new.clone()).find(|a| a.id == id) {
+            match acc.provider.as_str() {
+                "claude" => self.connect("claude", Some(id.into())),
+                "codex" => self.connect("codex", Some(id.into())),
+                _ => {}
             }
         }
     }
@@ -597,15 +761,18 @@ impl Controller {
         let mut linked = false;
         if view.done.is_some() && self.login_finished_at.is_none() {
             self.login_finished_at = Some(now);
-            self.engine.check_logins();
             if view.done == Some(true) {
+                if let Some(account) = self.pending_new.take() {
+                    self.edit_accounts(|accounts| {
+                        accounts.push(account);
+                        Ok(())
+                    });
+                }
                 // 로그인한 계정의 사용량을 바로 받아 옴 (Codex는 토큰을 쓰지 않음)
                 self.engine.probe_now(Some(view.account_id.clone()));
-                if self.pending_new.as_deref() == Some(view.account_id.as_str()) {
-                    self.pending_new = None;
-                }
                 linked = true;
             }
+            self.engine.check_logins();
             self.login_rechecks = LOGIN_RECHECKS;
             self.next_recheck = now + LOGIN_RECHECK_SECS;
         }
@@ -622,25 +789,24 @@ impl Controller {
     }
 
     /// "추가"로 만든 계정을 로그인하지 않은 채 닫으면 지움 (빈 카드가 남지 않게)
-    fn drop_unfinished_new(&mut self, id: &str) {
-        if self.pending_new.as_deref() != Some(id) {
-            return;
-        }
-        self.pending_new = None;
-        let logged_in = self.snap.as_ref().and_then(|s| s.logins.get(id)).and_then(|l| l.logged_in) == Some(true);
-        if !logged_in {
-            self.remove_account(id);
+    fn drop_unfinished_new(&mut self) {
+        if let Some(a) = self.pending_new.take() {
+            ui::forget_account(&mut self.notices.state, &a);
         }
     }
 
     fn remove_account(&mut self, id: &str) {
+        if self.connecting.as_ref().is_some_and(|c| c.account_id.as_deref() == Some(id)) {
+            self.connecting = None;
+        }
         if self.login.as_ref().is_some_and(|s| s.view().account_id == id) {
             if let Some(mut s) = self.login.take() {
                 s.cancel();
             }
         }
-        if self.pending_new.as_deref() == Some(id) {
-            self.pending_new = None;
+        if self.pending_new.as_ref().is_some_and(|a| a.id == id) {
+            self.drop_unfinished_new();
+            return;
         }
         let mut removed: Option<Account> = None;
         self.edit_accounts(|list| {
@@ -659,6 +825,65 @@ impl Controller {
     }
 
     // -------------------------------------------------------------- 업데이트
+
+    /// 설정 초기화: 계정·로그인은 그대로, 나머지 설정과 그래프별 알림 기준을 기본값으로
+    pub fn reset_settings(&mut self) -> Vec<Effect> {
+        let st = &mut self.notices.state;
+        st.0.remove("prefs");
+        st.0.remove("alerts");
+        st.0.remove("refill_rules");
+        st.save();
+        crate::i18n::set(crate::i18n::resolve("system"));
+        self.engine.refresh();
+        // 위젯(표시·위치·모니터·막대), 로고 색, 언어를 플랫폼이 다시 맞춤
+        vec![
+            Effect::PlatformPref("widget".into()),
+            Effect::PlatformPref("logo".into()),
+            Effect::PlatformPref("locale".into()),
+            Effect::Redraw,
+            Effect::Push,
+        ]
+    }
+
+    /// 한 페이지 설정만 기본값으로. 계정·로그인, 다른 페이지 설정, 시작 시 실행(시스템 등록)은 그대로
+    /// - widget: 위젯 표시·위치·모니터·표시 값·막대 길이
+    /// - alerts: 알림 켜기·끄기, 리필권 알림(계정별 포함), 그래프별 알림 기준
+    /// - general: 화면 테마·언어·로고 색·갱신 주기
+    pub fn reset_scope(&mut self, scope: &str) -> Vec<Effect> {
+        let keys: &[&str] = match scope {
+            "widget" => &["widget", "side", "monitor", "mode", "barPx"],
+            "alerts" => &["notify", "napNotify", "loginNotify", "refillNotify", "refillLead", "urgent"],
+            "general" => &["theme", "locale", "logo", "refresh_minutes", "poll"],
+            _ => return Vec::new(),
+        };
+        let st = &mut self.notices.state;
+        if let Some(prefs) = st.0.get_mut("prefs").and_then(|p| p.as_object_mut()) {
+            for key in keys {
+                prefs.remove(*key);
+            }
+        }
+        if scope == "alerts" {
+            st.0.remove("alerts");
+            st.0.remove("refill_rules");
+        }
+        st.save();
+        let mut fx = match scope {
+            "widget" => vec![Effect::PlatformPref("widget".into())],
+            "alerts" => vec![Effect::PlatformPref("urgent".into())],
+            _ => {
+                crate::i18n::set(crate::i18n::resolve("system"));
+                self.engine.refresh();
+                vec![Effect::PlatformPref("logo".into()), Effect::PlatformPref("locale".into())]
+            }
+        };
+        fx.extend([Effect::Redraw, Effect::Push]);
+        fx
+    }
+
+    /// 패키지 관리자 업데이트 안내 문장 (명령은 플랫폼이, 문장은 지금 언어로)
+    fn managed_hint(&self) -> Option<String> {
+        self.platform.managed_update.map(|cmd| crate::tr!(format!("{cmd} 로 업데이트."), format!("Update with {cmd}.")))
+    }
 
     fn check_update(&mut self, manual: bool) -> Vec<Effect> {
         if self.update.busy.is_some() {
@@ -699,8 +924,11 @@ impl Controller {
                 if self.auto_update() {
                     fx.extend(self.download_update(true));
                 } else if first || manual {
-                    let how = self.platform.managed_update.unwrap_or("설정 → 정보에서 업데이트 가능.");
-                    fx.push(Effect::Notify("usAgI 새 버전".into(), format!("v{ver} 출시. {how}")));
+                    let how = self.managed_hint().unwrap_or_else(|| crate::tr!("설정 → 정보에서 업데이트 가능.", "Update from Settings → About.").into());
+                    fx.push(Effect::Notify(
+                        crate::tr!("usAgI 새 버전", "usAgI update available").into(),
+                        crate::tr!(format!("v{ver} 출시. {how}"), format!("v{ver} is available. {how}")),
+                    ));
                 }
             }
             Ok(None) => self.update.latest = None,
@@ -736,6 +964,23 @@ impl Controller {
     }
 }
 
+/// 더 쓰지 않는 예전 데이터 정리: 브라우저 연결용 프로필·사용량 파일, 예전 설정 창(WebView2) 데이터
+fn remove_legacy_data() {
+    let dir = config::config_dir();
+    for name in ["browser-profiles", "webview"] {
+        let _ = std::fs::remove_dir_all(dir.join(name));
+    }
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("browser-usage-") && name.ends_with(".json") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// 계정 목록을 ids 순서대로 (ids에 없는 계정은 뒤에, 원래 순서 유지)
 fn reorder(list: &mut [Account], ids: &[String]) {
     list.sort_by_key(|a| ids.iter().position(|i| *i == a.id).unwrap_or(usize::MAX));
@@ -760,12 +1005,119 @@ mod tests {
         accounts::save(&mut c.notices.state, &list);
     }
 
+    #[test]
+    fn threshold_edits_preserve_other_rules_and_ignore_stale_drag_targets() {
+        let mut c = ctl("windows", None);
+        let key = "claude-1:5시간";
+        ipc(&mut c, json!({"cmd":"alert","key":key,"on":false,"at":[50,80]}));
+        for (op, old, new) in [("replace",80,70), ("replace",80,60), ("add",0,80), ("delete",50,0)] {
+            ipc(&mut c, json!({"cmd":"threshold","key":key,"op":op,"old":old,"new":new}));
+        }
+        assert_eq!(engine::alert_rule(c.state(), key), (true, vec![70.0, 80.0]));
+    }
+
+    #[test]
+    fn threshold_edits_for_usage_and_reset_alerts() {
+        let mut c = ctl("windows", None);
+        let key = "claude-1:5시간";
+        ipc(&mut c, json!({"cmd":"alert","key":key,"on":false}));
+        let edits = [
+            ("pct", "add", 0.0, 50.0),
+            ("pct", "add", 0.0, 80.0),
+            ("pct", "add", 0.0, 80.0),      // 이미 있음
+            ("pct", "add", 0.0, 100.0),     // 범위 밖
+            ("reset", "add", 0.0, 30.0),
+            ("reset", "add", 0.0, 60.0),
+            ("reset", "add", 0.0, 20000.0), // 7일 넘음
+            ("reset", "replace", 60.0, 120.0),
+            ("reset", "replace", 30.0, 120.0), // 이미 있는 값으로는 안 바꿈
+            ("reset", "replace", 45.0, 15.0),  // 없는 값
+            ("pct", "delete", 50.0, 0.0),
+            ("bogus", "add", 0.0, 40.0),
+        ];
+        for (kind, op, old, new) in edits {
+            ipc(&mut c, json!({"cmd":"threshold","key":key,"kind":kind,"op":op,"old":old,"new":new}));
+        }
+        let s = engine::alert_set(c.state(), key);
+        assert!(s.on, "기준을 추가하면 그래프 알림 켬");
+        assert_eq!((s.at, s.before), (vec![80.0], vec![30.0, 120.0]));
+        // kind 없이 보내면 사용량 기준
+        ipc(&mut c, json!({"cmd":"threshold","key":key,"op":"add","new":40}));
+        assert_eq!(engine::alert_rule(c.state(), key), (true, vec![40.0, 80.0]));
+        ipc(&mut c, json!({"cmd":"threshold","key":key,"kind":"reset","op":"delete","old":120}));
+        assert_eq!(engine::alert_set(c.state(), key).before, vec![30.0]);
+    }
+
+    #[test]
+    fn alert_items_move_between_on_and_off_lists() {
+        let mut c = ctl("windows", None);
+        let key = "claude-1:주간";
+        for (kind, new) in [("pct", 80), ("pct", 50), ("reset", 30), ("reset", 1440)] {
+            ipc(&mut c, json!({"cmd":"threshold","key":key,"kind":kind,"op":"add","new":new}));
+        }
+        ipc(&mut c, json!({"cmd":"alertItem","key":key,"kind":"pct","value":80,"on":false}));
+        ipc(&mut c, json!({"cmd":"alertItem","key":key,"kind":"reset","value":30.0,"on":false}));
+        ipc(&mut c, json!({"cmd":"alertItem","key":key,"kind":"reset","value":999,"on":false})); // 없는 값
+        let s = engine::alert_set(c.state(), key);
+        assert_eq!((s.at.clone(), s.at_off.clone()), (vec![50.0], vec![80.0]));
+        assert_eq!((s.before.clone(), s.before_off.clone()), (vec![1440.0], vec![30.0]));
+        assert_eq!(c.state().0["alerts"][key]["at_off"], json!([80.0]));
+        // 꺼 둔 값도 있는 값: 추가 안 함, 바꾸기·지우기는 됨
+        ipc(&mut c, json!({"cmd":"threshold","key":key,"op":"add","new":80}));
+        ipc(&mut c, json!({"cmd":"threshold","key":key,"op":"replace","old":80,"new":70}));
+        ipc(&mut c, json!({"cmd":"threshold","key":key,"kind":"reset","op":"delete","old":30}));
+        let s = engine::alert_set(c.state(), key);
+        assert_eq!((s.at.clone(), s.at_off.clone()), (vec![50.0], vec![70.0]));
+        assert!(s.before_off.is_empty());
+        assert!(c.state().0["alerts"][key].get("before_off").is_none(), "빈 목록은 저장 안 함");
+        // 다시 켜기
+        ipc(&mut c, json!({"cmd":"alertItem","key":key,"kind":"pct","value":70,"on":true}));
+        let s = engine::alert_set(c.state(), key);
+        assert_eq!((s.at, s.at_off), (vec![50.0, 70.0], vec![]));
+        // 계정 카드에 꺼 둔 항목과 리셋 임박 시점도 같이 보냄
+        seed(&mut c, &["codex-1"]);
+        let now = time::now();
+        let snap = Snapshot {
+            now,
+            claude: None,
+            providers: vec![engine::ProviderView {
+                id: engine::ProviderId::Codex,
+                account_id: "codex-1".into(),
+                name: "Codex".into(),
+                meters: vec![engine::Meter { label: "주간".into(), ratio: 0.4, resets_at: Some(now + 3600.0), exact: true }],
+                updated_at: Some(now),
+                note: None,
+                forecast: None,
+                show: true,
+                email: None,
+                plan: None,
+                credits: None,
+                refills: None,
+                extra: None,
+            }],
+            logins: Default::default(),
+            probes: Default::default(),
+        };
+        let mk = "codex-1:주간";
+        ipc(&mut c, json!({"cmd":"threshold","key":mk,"op":"add","new":60}));
+        ipc(&mut c, json!({"cmd":"threshold","key":mk,"op":"add","new":90}));
+        ipc(&mut c, json!({"cmd":"threshold","key":mk,"kind":"reset","op":"add","new":30}));
+        ipc(&mut c, json!({"cmd":"threshold","key":mk,"kind":"reset","op":"add","new":60}));
+        ipc(&mut c, json!({"cmd":"alertItem","key":mk,"kind":"pct","value":90,"on":false}));
+        ipc(&mut c, json!({"cmd":"alertItem","key":mk,"kind":"reset","value":60,"on":false}));
+        let cards = ui::accounts_json(c.state(), Some(&snap), false, now);
+        let m = &cards[0]["meters"][0];
+        assert_eq!((&m["alertKey"], &m["alertOn"]), (&json!(mk), &json!(true)));
+        assert_eq!((&m["alertAt"], &m["alertAtOff"]), (&json!([60.0]), &json!([90.0])));
+        assert_eq!((&m["before"], &m["beforeOff"]), (&json!([30.0]), &json!([60.0])));
+    }
+
     fn ipc(c: &mut Controller, v: Value) -> Vec<Effect> {
         c.handle_ipc(&v.to_string())
     }
 
     fn rel(v: &str) -> Release {
-        Release { version: v.into(), page: format!("https://github.com/o/r/releases/tag/v{v}"), notes: String::new(), asset_url: "https://x/a".into(), sha_url: "https://x/a.sha256".into() }
+        Release { version: v.into(), page: format!("https://github.com/o/r/releases/tag/v{v}"), notes: String::new(), asset_url: "https://x/a".into(), sha_url: "https://x/a.sha256".into(), sig_url: None }
     }
 
     #[test]
@@ -836,6 +1188,119 @@ mod tests {
     }
 
     #[test]
+    fn theme_follows_the_system_by_default() {
+        let mut c = ctl("windows", None);
+        let host = HostInfo::default();
+        assert_eq!(c.settings_state(&host)["prefs"]["theme"], "system");
+        let fx = ipc(&mut c, json!({"cmd": "pref", "key": "theme", "value": "light"}));
+        assert!(fx.contains(&Effect::Push) && !fx.contains(&Effect::Redraw), "위젯은 다시 그리지 않음");
+        assert_eq!(c.settings_state(&host)["prefs"]["theme"], "light");
+        ipc(&mut c, json!({"cmd": "pref", "key": "theme", "value": "sepia"}));
+        assert_eq!(c.settings_state(&host)["prefs"]["theme"], "light", "잘못된 값은 무시");
+    }
+
+    #[test]
+    fn page_reset_only_touches_that_page() {
+        let mut c = ctl("windows", None);
+        seed(&mut c, &["claude-1", "codex-1"]);
+        ipc(&mut c, json!({"cmd": "pref", "key": "mode", "value": "time"}));
+        ipc(&mut c, json!({"cmd": "pref", "key": "barPx", "value": 180}));
+        ipc(&mut c, json!({"cmd": "pref", "key": "theme", "value": "dark"}));
+        ipc(&mut c, json!({"cmd": "pref", "key": "napNotify", "value": true}));
+        c.notices.state.0.insert("alerts".into(), json!({"claude-1:5시간": {"on": true, "at": [80]}}));
+        // 위젯: 표시 값·막대 길이만
+        let fx = ipc(&mut c, json!({"cmd": "resetPrefs", "scope": "widget"}));
+        assert!(fx.contains(&Effect::PlatformPref("widget".into())) && fx.contains(&Effect::Push));
+        assert!(!c.time_mode());
+        assert_eq!(c.state().pref_f64("barPx"), None);
+        assert_eq!(c.state().pref_str("theme", "system"), "dark", "일반 설정은 그대로");
+        assert!(c.state().0.get("alerts").is_some(), "알림 기준은 그대로");
+        // 알림: 알림 켜기·끄기와 그래프별 기준
+        ipc(&mut c, json!({"cmd": "resetPrefs", "scope": "alerts"}));
+        assert!(!c.state().pref_bool("napNotify", false));
+        assert!(c.state().0.get("alerts").is_none());
+        assert_eq!(c.state().pref_str("theme", "system"), "dark");
+        // 일반: 테마
+        ipc(&mut c, json!({"cmd": "resetPrefs", "scope": "general"}));
+        assert_eq!(c.state().pref_str("theme", "system"), "system");
+        assert_eq!(accounts::load(c.state()).len(), 2, "계정은 그대로");
+        assert!(ipc(&mut c, json!({"cmd": "resetPrefs", "scope": "nope"})).is_empty());
+    }
+
+    #[test]
+    fn reset_keeps_accounts_and_clears_settings() {
+        let mut c = ctl("windows", None);
+        seed(&mut c, &["claude-1", "codex-1"]);
+        let before = accounts::load(c.state()).len();
+        ipc(&mut c, json!({"cmd": "pref", "key": "mode", "value": "time"}));
+        ipc(&mut c, json!({"cmd": "pref", "key": "barPx", "value": 180}));
+        c.notices.state.0.insert("alerts".into(), json!({"claude-1:5시간": {"on": true, "at": [80]}}));
+        let fx = ipc(&mut c, json!({"cmd": "resetSettings"}));
+        assert!(fx.contains(&Effect::PlatformPref("widget".into())) && fx.contains(&Effect::Push));
+        assert!(!c.time_mode());
+        assert_eq!(c.state().pref_f64("barPx"), None);
+        assert!(c.state().0.get("alerts").is_none());
+        assert_eq!(accounts::load(c.state()).len(), before, "계정은 그대로");
+    }
+
+    #[test]
+    fn refill_rules_per_account_override_the_default() {
+        let mut c = ctl("windows", None);
+        assert_eq!(engine::refill_rule(c.state(), "codex-1"), (false, engine::DEFAULT_REFILL_LEAD_MIN));
+        ipc(&mut c, json!({"cmd": "pref", "key": "refillNotify", "value": true}));
+        ipc(&mut c, json!({"cmd": "pref", "key": "refillLead", "value": 90}));
+        assert_eq!(engine::refill_rule(c.state(), "codex-1"), (true, 90.0));
+        ipc(&mut c, json!({"cmd": "refillRule", "id": "codex-2", "mode": "on", "lead": 30}));
+        ipc(&mut c, json!({"cmd": "refillRule", "id": "codex-3", "mode": "off"}));
+        assert_eq!(engine::refill_rule(c.state(), "codex-2"), (true, 30.0));
+        assert!(!engine::refill_rule(c.state(), "codex-3").0);
+        ipc(&mut c, json!({"cmd": "refillRule", "id": "codex-2", "mode": "default"}));
+        assert_eq!(engine::refill_rule(c.state(), "codex-2"), (true, 90.0));
+    }
+
+    #[test]
+    fn locale_switches_language() {
+        let mut c = ctl("windows", None);
+        let host = HostInfo::default();
+        assert_eq!(c.settings_state(&host)["prefs"]["locale"], "system");
+        let fx = ipc(&mut c, json!({"cmd": "pref", "key": "locale", "value": "en"}));
+        assert!(fx.contains(&Effect::PlatformPref("locale".into())) && fx.contains(&Effect::Redraw));
+        assert_eq!(c.settings_state(&host)["lang"], "en");
+        assert_eq!(crate::texts::meter_label("Fable 주간"), "Fable weekly");
+        ipc(&mut c, json!({"cmd": "pref", "key": "locale", "value": "ko"}));
+        assert_eq!(c.settings_state(&host)["lang"], "ko");
+        assert_eq!(crate::texts::meter_label("5시간"), "5시간");
+        ipc(&mut c, json!({"cmd": "pref", "key": "locale", "value": "fr"}));
+        assert_eq!(c.settings_state(&host)["prefs"]["locale"], "ko", "잘못된 값은 무시");
+    }
+
+    #[test]
+    fn bar_length_is_pixels_with_a_default() {
+        let mut c = ctl("windows", None);
+        let host = HostInfo { bar_range: Some((75.0, 77.0, 240.0)), ..HostInfo::default() };
+        let st = c.settings_state(&host);
+        assert!(st["prefs"]["barPx"].is_null(), "설정 없음 = 기본");
+        assert_eq!(st["prefs"]["barDefault"], 77.0);
+        let fx = ipc(&mut c, json!({"cmd": "pref", "key": "barPx", "value": 130.4}));
+        assert!(fx.contains(&Effect::PlatformPref("barPx".into())) && fx.contains(&Effect::Redraw));
+        assert_eq!(c.state().pref_f64("barPx"), Some(130.0));
+        ipc(&mut c, json!({"cmd": "pref", "key": "barPx", "value": null}));
+        assert_eq!(c.state().pref_f64("barPx"), None, "기본값으로");
+    }
+
+    #[test]
+    fn logo_color_can_be_fixed() {
+        let mut c = ctl("windows", None);
+        let host = HostInfo::default();
+        assert_eq!(c.settings_state(&host)["prefs"]["logo"], "auto");
+        let fx = ipc(&mut c, json!({"cmd": "pref", "key": "logo", "value": "ink"}));
+        assert!(fx.contains(&Effect::PlatformPref("logo".into())), "알림 아이콘을 다시 쓰게 플랫폼에 알림");
+        assert_eq!(c.settings_state(&host)["prefs"]["logo"], "ink");
+        ipc(&mut c, json!({"cmd": "pref", "key": "logo", "value": "gold"}));
+        assert_eq!(c.settings_state(&host)["prefs"]["logo"], "ink", "잘못된 값은 무시");
+    }
+
+    #[test]
     fn toggle_mode_flips() {
         let mut c = ctl("mac", None);
         c.toggle_mode();
@@ -853,14 +1318,11 @@ mod tests {
     }
 
     #[test]
-    fn add_without_cli_shows_hint_and_creates_nothing() {
+    fn invalid_provider_does_not_start_a_connection() {
         let mut c = ctl("mac", None);
-        c.cli_check = |_| false;
-        let before = accounts::load(c.state()).len();
-        ipc(&mut c, json!({"cmd": "addNew", "provider": "codex"}));
-        assert_eq!(accounts::load(c.state()).len(), before, "계정이 생기면 안 됨");
-        let st = c.settings_state(&HostInfo::default());
-        assert!(st["error"].as_str().unwrap().contains("Codex CLI 미설치"));
+        ipc(&mut c, json!({"cmd":"addNew","provider":"other"}));
+        assert!(!c.busy());
+        assert!(accounts::load(c.state()).is_empty());
     }
 
     #[test]
@@ -891,7 +1353,8 @@ mod tests {
 
     #[test]
     fn same_state_shape_on_every_platform() {
-        let win = ctl("windows", None).settings_state(&HostInfo { autostart: true, urgent_supported: true, urgent_allowed: Some(false), monitors: vec![json!({"id": "D1", "label": "모니터 1"})] });
+        let win = ctl("windows", None).settings_state(&HostInfo { autostart: true, urgent_supported: true, urgent_allowed: Some(false), monitors: vec![json!({"id": "D1", "label": "모니터 1"})], taskbar_light: Some(true), bar_range: None });
+        assert_eq!(win["taskbarLight"], true);
         let mac = ctl("mac", None).settings_state(&HostInfo::default());
         assert_eq!(win["platform"], "windows");
         assert_eq!(mac["platform"], "mac");
@@ -920,7 +1383,7 @@ mod tests {
 
     #[test]
     fn managed_install_only_notifies() {
-        let mut c = ctl("mac", Some("brew upgrade --cask usagi 로 업데이트."));
+        let mut c = ctl("mac", Some("brew upgrade --cask usagi"));
         let fx = c.update_checked(Ok(Some(rel("9.0.0"))), true);
         assert!(!fx.iter().any(|e| matches!(e, Effect::DownloadUpdate { .. })));
         assert!(fx.iter().any(|e| matches!(e, Effect::Notify(_, m) if m.contains("brew upgrade"))));

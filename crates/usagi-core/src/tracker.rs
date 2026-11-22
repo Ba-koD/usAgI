@@ -303,7 +303,7 @@ mod tests {
             five_hour: Some(BridgeWindow { used_percentage: 60.0, resets_at: Some(NOW + H) }),
             seven_day: Some(BridgeWindow { used_percentage: 85.0, resets_at: Some(NOW + 3.0 * DAY) }),
             weekly_anchor: None,
-            models: Vec::new(),
+            ..Default::default()
         };
         apply_exact(&mut st, &b, 0.8);
         assert!(st.exact);

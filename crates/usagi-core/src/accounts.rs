@@ -59,6 +59,10 @@ pub fn load(state: &State) -> Vec<Account> {
         .get("accounts")
         .and_then(|v| serde_json::from_value::<Vec<Account>>(v.clone()).ok())
         .unwrap_or_default()
+        .into_iter()
+        // 예전 브라우저 연결 계정은 프로필 폴더가 없음 → 목록에서 제외
+        .filter(|a| !a.dir.is_empty())
+        .collect()
 }
 
 pub fn save(state: &mut State, accounts: &[Account]) {
@@ -89,18 +93,32 @@ pub fn is_managed(acc: &Account) -> bool {
     }
 }
 
+/// 이미 있는 프로필 폴더도 이 사용자 전용으로 (앱 시작 때 한 번)
+pub fn protect_profiles() {
+    let base = profiles_dir();
+    if base.is_dir() {
+        crate::private_dir::make_private(&base);
+    }
+}
+
 /// 새 계정용 빈 프로필을 만들고 계정 항목을 돌려줌 (이어서 공식 로그인을 띄움)
 pub fn create_profile(provider: &str, existing: &[Account]) -> std::io::Result<Account> {
+    let base = profiles_dir();
+    std::fs::create_dir_all(&base)?;
+    // 공식 CLI의 로그인 파일이 들어갈 자리: 이 사용자만 접근 (상위 폴더 권한을 물려받지 않게)
+    crate::private_dir::make_private(&base);
     let id = new_id(provider, existing);
-    let dir = profiles_dir().join(&id);
-    std::fs::create_dir_all(&dir)?;
+    let dir = base.join(&id);
+    std::fs::create_dir(&dir)?;
+    #[cfg(unix)]
+    crate::private_dir::make_private(&dir);
     Ok(Account { id, provider: provider.into(), dir: dir.to_string_lossy().into(), label: String::new(), show: true, chain: None })
 }
 
 pub fn new_id(provider: &str, existing: &[Account]) -> String {
     (1..)
         .map(|n| format!("{provider}-{n}"))
-        .find(|id| !existing.iter().any(|a| &a.id == id))
+        .find(|id| !existing.iter().any(|a| &a.id == id) && !profiles_dir().join(id).exists())
         .expect("id")
 }
 
@@ -117,6 +135,12 @@ pub fn bridge_command(exe: &Path, account_id: &str) -> String {
     } else {
         format!("'{}' statusline --account {id}", exe.replace('\'', "'\\''"))
     }
+}
+
+/// 이 위치의 실행 파일을 상태 표시줄 명령으로 걸어도 되는지.
+/// Windows는 큰따옴표 안에서도 Git Bash가 `$(…)`·백틱·`$변수`를, cmd가 `%변수%`를 풀어 쓰므로 그런 글자가 든 경로는 걸지 않음
+pub fn linkable(exe: &Path) -> bool {
+    !cfg!(windows) || !exe.to_string_lossy().chars().any(|c| matches!(c, '$' | '`' | '%' | '"'))
 }
 
 pub fn is_our_command(cmd: &str) -> bool {
@@ -143,22 +167,36 @@ fn read_settings(path: &Path) -> std::io::Result<serde_json::Map<String, serde_j
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|v| v.as_object().cloned())
-            .ok_or_else(|| std::io::Error::other("settings.json 형식 읽기 실패")),
+            .ok_or_else(|| std::io::Error::other(crate::tr!("settings.json 형식 읽기 실패", "settings.json could not be parsed"))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
         Err(e) => Err(e),
     }
 }
 
 fn write_settings(path: &Path, map: &serde_json::Map<String, serde_json::Value>) -> std::io::Result<()> {
+    use std::io::Write;
     let text = serde_json::to_string_pretty(map).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.usagi-tmp");
-    std::fs::write(&tmp, text + "\n")?;
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // 원래 파일의 권한을 그대로 (사용자가 0600으로 좁혀 둔 settings.json을 넓히지 않게). 만들 때부터 그 권한으로
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(meta) = std::fs::metadata(path) {
+            options.mode(meta.permissions().mode() & 0o777);
+        }
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all((text + "\n").as_bytes())?;
+    drop(file);
     std::fs::rename(&tmp, path)
 }
 
 pub fn link_state(acc: &Account) -> Link {
     if !acc.path().is_dir() {
-        return Link::Missing("폴더 없음".into());
+        return Link::Missing(crate::tr!("폴더 없음", "Folder not found").into());
     }
     match read_settings(&settings_path(acc)) {
         Ok(map) => {
@@ -176,7 +214,7 @@ pub fn link_state(acc: &Account) -> Link {
 /// 실시간 연결(상태 표시줄 브리지)을 걸어야 하는지: 아직 없거나, 다른 위치의 usAgI(옮기기 전 경로)를 가리킬 때.
 /// 폴더가 없거나 settings.json을 읽을 수 없으면 건드리지 않음.
 pub fn needs_link(acc: &Account, exe: &Path) -> bool {
-    if !acc.is_claude() || !acc.path().is_dir() {
+    if !acc.is_claude() || !acc.path().is_dir() || !linkable(exe) {
         return false;
     }
     match read_settings(&settings_path(acc)) {
@@ -187,6 +225,9 @@ pub fn needs_link(acc: &Account, exe: &Path) -> bool {
 
 /// Claude Code 프로필에 브리지를 넣습니다. 처음 한 번은 settings.json을 백업합니다.
 pub fn link(acc: &mut Account, exe: &Path) -> std::io::Result<()> {
+    if !linkable(exe) {
+        return Err(std::io::Error::other(crate::tr!("실행 파일 경로에 $ ` % 글자가 있어 연결 불가", "Can't link: the app path contains $, ` or %")));
+    }
     let path = settings_path(acc);
     let mut map = read_settings(&path)?;
     let backup = acc.path().join("settings.json.usagi-backup");
@@ -244,6 +285,14 @@ mod tests {
         let sibling = PathBuf::from(format!("{}2", base.to_string_lossy())).join("x");
         assert!(!is_managed(&acc(sibling)), "이름만 비슷한 옆 폴더");
         assert!(!is_managed(&acc(PathBuf::from("relative"))));
+    }
+
+    #[test]
+    fn paths_with_shell_characters_are_not_linked_on_windows() {
+        assert!(linkable(Path::new(if cfg!(windows) { r"C:\Program Files\usAgI\usagi.exe" } else { "/Applications/usAgI.app/Contents/MacOS/usAgI" })));
+        for bad in [r"C:\Tools\$(calc)\usagi.exe", r"C:\Tools\`x`\usagi.exe", r"C:\Tools\%TEMP%\usagi.exe"] {
+            assert_eq!(linkable(Path::new(bad)), !cfg!(windows), "{bad}");
+        }
     }
 
     #[test]

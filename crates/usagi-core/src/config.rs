@@ -20,6 +20,22 @@ claude_dirs = []
 providers = ["claude", "codex"]
 "#;
 
+/// 영어 화면일 때 새로 만드는 설정 파일 (키는 같음)
+pub const TEMPLATE_EN: &str = r#"# usAgI advanced settings. Most options are in the settings window.
+# After saving, press Refresh in the settings window to apply.
+
+[alerts]
+# Usage (%) at which the tray icon changes. Alert thresholds are added per graph in the settings window (none by default).
+tired_percent = 80
+notify = true
+
+[data]
+# Extra Claude Code log folders to read (for the in-use indicator). Usually empty.
+claude_dirs = []
+# Providers to show: "claude", "codex"
+providers = ["claude", "codex"]
+"#;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub tired_percent: f64,
@@ -76,9 +92,17 @@ pub fn portable_dir() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let dir = exe.parent()?;
         let data = dir.join("data");
-        (data.is_dir() || dir.join("usagi.portable").exists()).then_some(data)
+        is_portable_layout(dir).then_some(data)
     })
     .clone()
+}
+
+/// exe 폴더가 포터블 배치인지: `data\usagi.portable` 표시 파일, 예전 표시 파일(exe 옆 `usagi.portable`),
+/// 또는 이미 usAgI 데이터(`config.toml`·`state.json`)가 든 `data` 폴더. 이름만 `data`인 다른 폴더는 쓰지 않음
+fn is_portable_layout(dir: &std::path::Path) -> bool {
+    let data = dir.join("data");
+    dir.join("usagi.portable").exists()
+        || (data.is_dir() && ["usagi.portable", "config.toml", "state.json"].iter().any(|f| data.join(f).is_file()))
 }
 
 pub fn is_portable() -> bool {
@@ -112,7 +136,7 @@ pub fn ensure_file() -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let path = config_path();
     if !path.exists() {
-        std::fs::write(&path, TEMPLATE)?;
+        std::fs::write(&path, crate::tr!(TEMPLATE, TEMPLATE_EN))?;
     }
     Ok(path)
 }
@@ -122,14 +146,17 @@ pub fn load() -> Config {
     let text = match ensure_file().and_then(std::fs::read_to_string) {
         Ok(t) => t,
         Err(e) => {
-            cfg.error = Some(format!("설정 파일 읽기 실패: {e}"));
+            cfg.error = Some(crate::tr!(format!("설정 파일 읽기 실패: {e}"), format!("Failed to read the config file: {e}")));
             return cfg;
         }
     };
     let file: FileConfig = match toml::from_str(&text) {
         Ok(f) => f,
         Err(e) => {
-            cfg.error = Some(format!("설정 파일 형식 오류: {}", e.message()));
+            cfg.error = Some(crate::tr!(
+                format!("설정 파일 형식 오류: {}", e.message()),
+                format!("Config file format error: {}", e.message())
+            ));
             return cfg;
         }
     };
@@ -215,11 +242,32 @@ impl State {
             .to_string()
     }
 
+    /// 저장된 언어 설정(prefs.locale)을 지금 언어로
+    pub fn apply_locale(&self) {
+        crate::i18n::set(crate::i18n::resolve(&self.pref_str("locale", "system")));
+    }
+
     pub fn set_pref(&mut self, key: &str, value: serde_json::Value) {
         let prefs = self.0.entry("prefs").or_insert_with(|| serde_json::json!({}));
         if let Some(obj) = prefs.as_object_mut() {
             obj.insert(key.into(), value);
         }
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_templates_have_the_same_settings() {
+        for text in [TEMPLATE, TEMPLATE_EN] {
+            let f: FileConfig = toml::from_str(text).unwrap();
+            assert_eq!(f.alerts.tired_percent, Some(80.0));
+            assert_eq!(f.alerts.notify, Some(true));
+            assert_eq!(f.data.claude_dirs, Some(Vec::new()));
+            assert_eq!(f.data.providers, Some(vec!["claude".to_string(), "codex".to_string()]));
+        }
     }
 }
