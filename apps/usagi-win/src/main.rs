@@ -165,7 +165,6 @@ fn install_panic_log() {
 
 /// 디자인 확인용: 위젯을 어두운/밝은 작업 표시줄 배경에 그려 BMP로 저장
 fn widget_preview(path: &str) {
-    use usagi_core::animator::Pose;
     use usagi_core::engine::ProviderId;
     use widget::{Content, Row, Section};
     let row = |label: &str, ratio: f64| Row { key: label.into(), label: label.into(), value: usagi_core::texts::fmt_pct(ratio), ratio, left: false, percent: true, short: None };
@@ -178,7 +177,8 @@ fn widget_preview(path: &str) {
                     Section { id: ProviderId::Claude, key: "claude-1".into(), rows: vec![row("5시간", 0.15), row("주간", 0.58), row("Fable", 0.03)] },
                     Section { id: ProviderId::Codex, key: "codex-1".into(), rows: vec![row("주간", 0.07)] },
                 ],
-                rabbit: Some(Pose::gauges(0.15, 0.58)),
+                // 실제 위젯과 같게 (위젯에는 토끼를 그리지 않음. 토끼는 알림 영역 아이콘)
+                rabbit: None,
                 ink,
             };
             for level in [0u8, 1, 2] {
