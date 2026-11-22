@@ -1,0 +1,26 @@
+# Homebrew Cask (탭 저장소 <owner>/homebrew-usagi 의 Casks/usagi.rb)
+#   설치:  brew install --cask <owner>/usagi/usagi
+#   업데이트: brew upgrade --cask usagi
+# 릴리스 때 scripts/update-homebrew-tap.sh 가 버전·체크섬을 채워 탭에 올려요.
+cask "usagi" do
+  version "{{VERSION}}"
+  sha256 "{{SHA256}}"
+
+  url "https://github.com/{{REPO}}/releases/download/v#{version}/usAgI-mac-#{version}.zip"
+  name "usAgI"
+  desc "AI 구독 사용량(5시간·주간)을 메뉴 막대에 보여 주는 앱"
+  homepage "https://github.com/{{REPO}}"
+
+  depends_on macos: ">= :big_sur"
+
+  app "usAgI.app"
+
+  # 개발자 인증서 없이 배포하므로, 받은 앱의 격리 표시를 지워 "확인되지 않은 개발자" 경고 없이 열리게 함
+  postflight do
+    system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/usAgI.app"]
+  end
+
+  uninstall quit: "dev.usagi.usagi"
+
+  zap trash: "~/Library/Application Support/usAgI"
+end
