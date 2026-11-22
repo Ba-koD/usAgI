@@ -1,6 +1,7 @@
 //! usAgI for Windows — 작업 표시줄 위젯 + 트레이 토끼.
 //!
 //!   usagi.exe                               앱 실행 (이미 떠 있으면 설정 창을 엶)
+//!   usagi.exe --autostart                   로그인할 때 자동 실행 (이미 떠 있으면 조용히 끝냄)
 //!   usagi.exe statusline --account <id>     Claude Code 상태 표시줄 브리지 (stdin JSON → 사용량 기록)
 //!   usagi.exe --status                      현재 상태를 출력 (확인용)
 //!   usagi.exe --monitors                    모니터 목록 출력 (확인용)
@@ -8,6 +9,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod autostart;
 mod settings;
 mod toast;
 mod tray;
@@ -24,15 +26,12 @@ fn main() {
     install_panic_log();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some(usagi_settings::SETTINGS_ARG) => usagi_settings::main_window(),
         Some("statusline") => statusline(&args),
         Some("--widget-preview") => widget_preview(args.get(2).map(String::as_str).unwrap_or("widget-preview.bmp")),
         Some("--test-notify") => {
             // 알림 확인용: 설정의 "방해 금지 중에도 알림"을 따라 한 번 보냄
-            let icon = usagi_core::config::config_dir().join("usagi-icon.png");
-            let _ = std::fs::create_dir_all(usagi_core::config::config_dir());
-            if icon.exists() || toast::write_icon(&icon) {
-                toast::register(&icon);
-            }
+            toast::refresh_icon();
             unsafe { windows_sys::Win32::System::Ole::OleInitialize(std::ptr::null_mut()) };
             let urgent = usagi_core::config::State::load().pref_bool("urgent", true);
             match toast::show("사용량 알림", "알림 미리 보기 · Claude 5시간 한도의 80% 사용.", urgent, (std::ptr::null_mut(), 0)) {
@@ -66,8 +65,9 @@ fn main() {
             if let Some(pid) = args.get(2).and_then(|p| p.parse().ok()) {
                 updater::wait_for(pid);
             }
-            app::run();
+            app::run(false);
         }
+        Some(autostart::ARG) => app::run(true),
         Some("--check-update") => match updater::check() {
             Ok(Some(r)) => println!("새 버전 v{} (지금 v{}) · {}", r.version, usagi_core::VERSION, r.page),
             Ok(None) => println!("최신 버전 (v{}) · {}", usagi_core::VERSION, updater::REPO),
@@ -88,7 +88,7 @@ fn main() {
                 Err(e) => println!("{e}"),
             }
         }
-        _ => app::run(),
+        _ => app::run(false),
     }
 }
 
@@ -111,9 +111,12 @@ fn statusline(args: &[String]) {
 }
 
 fn run_chain(cmd: &str, input: &str) -> Option<String> {
-    // Claude Code는 Windows에서 Git Bash로 상태 표시줄을 실행하므로 bash 우선, 없으면 cmd
-    let attempts: [(&str, &[&str]); 2] = [("bash", &["-c"]), ("cmd", &["/C"])];
+    // Claude Code는 Windows에서 Git Bash로 상태 표시줄을 실행하므로 bash 우선, 없으면 cmd.
+    // 셸은 절대 경로로만 (이름만 주면 Windows가 이 exe의 폴더를 먼저 찾음)
+    let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into()).join("System32");
+    let attempts: [(Option<std::path::PathBuf>, &[&str]); 2] = [(git_bash(&system), &["-c"]), (Some(system.join("cmd.exe")), &["/C"])];
     for (shell, flag) in attempts {
+        let Some(shell) = shell else { continue };
         let child = Command::new(shell)
             .args(flag)
             .arg(cmd)
@@ -132,6 +135,24 @@ fn run_chain(cmd: &str, input: &str) -> Option<String> {
     None
 }
 
+/// Git Bash 찾기: Claude Code가 쓰는 설정(CLAUDE_CODE_GIT_BASH_PATH) → Git 기본 설치 위치 → PATH.
+/// System32의 bash.exe(WSL)와 이 exe 폴더는 건너뜀
+fn git_bash(system: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let own = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from));
+    let same = |a: &std::path::Path, b: &std::path::Path| a.to_string_lossy().trim_end_matches('\\').eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches('\\'));
+    let fixed = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").map(PathBuf::from).into_iter().chain(
+        ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"].into_iter().filter_map(|v| std::env::var_os(v)).map(|base| {
+            let base = PathBuf::from(base);
+            if base.to_string_lossy().to_lowercase().ends_with("local") { base.join(r"Programs\Git\bin\bash.exe") } else { base.join(r"Git\bin\bash.exe") }
+        }),
+    );
+    let in_path = std::env::var_os("PATH").into_iter().flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).filter(|dir| {
+        dir.is_absolute() && !same(dir, system) && !own.as_deref().is_some_and(|o| same(dir, o))
+    }).map(|dir| dir.join("bash.exe"));
+    fixed.chain(in_path).find(|p| p.is_absolute() && p.is_file())
+}
+
 fn install_panic_log() {
     std::panic::set_hook(Box::new(|info| {
         let dir = config::config_dir();
@@ -147,15 +168,15 @@ fn widget_preview(path: &str) {
     use usagi_core::animator::Pose;
     use usagi_core::engine::ProviderId;
     use widget::{Content, Row, Section};
-    let row = |label: &str, ratio: f64| Row { label: label.into(), value: usagi_core::texts::fmt_pct(ratio), ratio, left: false, percent: true, short: None };
+    let row = |label: &str, ratio: f64| Row { key: label.into(), label: label.into(), value: usagi_core::texts::fmt_pct(ratio), ratio, left: false, percent: true, short: None };
     let mut tiles = Vec::new();
     for (bg, ink) in [((32u8, 32u8, 32u8), win::INK_ON_DARK), ((238, 238, 238), win::INK_ON_LIGHT)] {
         for scale in [1.0f32, 1.5] {
             let content = Content {
                 time_mode: false,
                 sections: vec![
-                    Section { id: ProviderId::Claude, rows: vec![row("5시간", 0.15), row("주간", 0.58), row("Fable", 0.03)] },
-                    Section { id: ProviderId::Codex, rows: vec![row("주간", 0.07)] },
+                    Section { id: ProviderId::Claude, key: "claude-1".into(), rows: vec![row("5시간", 0.15), row("주간", 0.58), row("Fable", 0.03)] },
+                    Section { id: ProviderId::Codex, key: "codex-1".into(), rows: vec![row("주간", 0.07)] },
                 ],
                 rabbit: Some(Pose::gauges(0.15, 0.58)),
                 ink,
@@ -169,12 +190,12 @@ fn widget_preview(path: &str) {
     // 퍼센트 → 남은 시간 전환 장면들 (어두운 배경, 150%)
     {
         let rows = |v: [&str; 2]| vec![
-            Row { label: "5시간".into(), value: v[0].into(), ratio: 0.15, left: false, percent: false, short: Some("2h13m".into()) },
-            Row { label: "주간".into(), value: v[1].into(), ratio: 0.58, left: false, percent: false, short: Some("6d23h".into()) },
+            Row { key: "5시간".into(), label: "5시간".into(), value: v[0].into(), ratio: 0.15, left: false, percent: false, short: Some("2h13m".into()) },
+            Row { key: "주간".into(), label: "주간".into(), value: v[1].into(), ratio: 0.58, left: false, percent: false, short: Some("6d23h".into()) },
         ];
         let content = Content {
             time_mode: true,
-            sections: vec![Section { id: ProviderId::Claude, rows: rows(["2시간 13분", "6일 23시간"]) }],
+            sections: vec![Section { id: ProviderId::Claude, key: "claude-1".into(), rows: rows(["2시간 13분", "6일 23시간"]) }],
             rabbit: None,
             ink: win::INK_ON_DARK,
         };
@@ -187,6 +208,26 @@ fn widget_preview(path: &str) {
         for t in [0.0f32, 0.15, 0.3, 0.45, 0.6, 0.8, 1.0] {
             let img = widget::preview_switch(&content, 1.5, 72, 0, Some((&from, t)));
             tiles.push((img, (32, 32, 32)));
+        }
+    }
+    // 막대 길이 설정: 가장 짧게(0) · 기본 · 중간 · 최대, 각각 남은 시간 / 퍼센트 (어두운 배경, 100%)
+    {
+        let time = |v: &str, ratio: f64| Row { key: "5시간".into(), label: "5시간".into(), value: v.into(), ratio, left: false, percent: false, short: None };
+        for bar in [None, Some(0.0f32), Some(160.0), Some(240.0)] {
+            for time_mode in [true, false] {
+                let rows = if time_mode {
+                    vec![time("23시간 59분", 0.15), Row { key: "주간".into(), label: "주간".into(), ..time("6일 23시간", 0.58) }]
+                } else {
+                    vec![row("5시간", 0.15), row("주간", 0.58)]
+                };
+                let content = Content {
+                    time_mode,
+                    sections: vec![Section { id: ProviderId::Claude, key: "claude-1".into(), rows }],
+                    rabbit: None,
+                    ink: win::INK_ON_DARK,
+                };
+                tiles.push((widget::preview_bar(&content, 1.0, 48, 0, None, bar), (32, 32, 32)));
+            }
         }
     }
     let w = tiles.iter().map(|(i, _)| i.w).max().unwrap_or(1);

@@ -116,11 +116,6 @@ pub fn taskbar_is_light() -> bool {
     reg_dword(PERSONALIZE, "SystemUsesLightTheme") == Some(1)
 }
 
-/// 앱 모드가 밝은지 (설정 창)
-pub fn apps_are_light() -> bool {
-    reg_dword(PERSONALIZE, "AppsUseLightTheme") != Some(0)
-}
-
 pub fn theme_ink() -> Rgb {
     if taskbar_is_light() {
         INK_ON_LIGHT
@@ -497,7 +492,7 @@ fn edid_names() -> HashMap<String, String> {
                     || tgt.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED
                     || tgt.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED;
                 if internal {
-                    name = "내장 디스플레이".into();
+                    name = usagi_core::tr!("내장 디스플레이", "Built-in display").into();
                 }
             }
             if !name.trim().is_empty() {

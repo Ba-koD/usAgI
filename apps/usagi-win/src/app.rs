@@ -1,7 +1,7 @@
 //! usAgI Windows 앱: 숨은 호스트 창(타이머·트레이 콜백) + 작업 표시줄 위젯(모니터별) + 설정 창.
 //!
 //! 모든 창이 하나의 WndProc을 쓰고, 상태는 GUI 스레드의 `APP`에 있습니다.
-//! 메뉴·폴더 선택·웹뷰 생성처럼 메시지 루프를 도는 호출 중에는 APP이 빌려져 있으므로
+//! 메뉴처럼 메시지 루프를 도는 호출 중에는 APP이 빌려져 있으므로
 //! 그 사이 들어온 메시지는 기본 처리로 넘어갑니다 (타이머/스냅숏은 곧 다시 옴).
 
 use crate::settings::{self, SettingsWindow, WM_IPC};
@@ -13,7 +13,6 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ptr::{null, null_mut};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 use usagi_core::animator::{Animator, Pose};
@@ -46,7 +45,6 @@ const TIMER_RETRY_ADD: usize = 13;
 const FRAME_MS: u32 = 66;
 const FAST_FRAME_MS: u32 = 15;
 
-const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 static HOST: AtomicIsize = AtomicIsize::new(0);
 static LATEST: Mutex<Option<Snapshot>> = Mutex::new(None);
@@ -67,7 +65,6 @@ fn post_update(host: isize, ev: UpdateEvent) {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
-    static INBOX: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
 }
 
 fn hash_of<T: Hash>(v: &T) -> u64 {
@@ -164,9 +161,11 @@ impl App {
             }
         }
         let (on, side) = (self.widget_on(), self.side());
+        let bar = self.ctl.state().pref_f64("barPx").map(|v| v as f32);
         for w in &mut self.widgets {
             w.enabled = on;
             w.side = side;
+            w.bar_px = bar;
             w.reposition();
         }
         // 위젯을 꺼 뒀으면 작업 표시줄 버튼 위치를 물어볼 필요가 없음
@@ -184,9 +183,10 @@ impl App {
     fn frame(&mut self) {
         let now = time::now();
         let pose = self.anim.frame(now);
-        let (ink, size) = (self.ink, self.icon_size);
-        let key = hash_of(&(pose, ink, size));
-        self.tray.set_icon(key, || (rabbit::render(&pose, size), size, ink));
+        // 알림 영역 토끼: 로고 색 설정을 따름 (자동이면 작업 표시줄 색). 위젯 글자는 아래 ink(작업 표시줄 색) 그대로
+        let (ink, size, tray_ink) = (self.ink, self.icon_size, self.logo_ink());
+        let key = hash_of(&(pose, tray_ink, size));
+        self.tray.set_icon(key, || (rabbit::render(&pose, size), size, tray_ink));
         if !self.tray.is_added() {
             self.schedule_retry();
         }
@@ -217,15 +217,18 @@ impl App {
                                 } else {
                                     texts::meter_value(m, self.mode(), now)
                                 };
-                                // "Fable 주간" → "Fable" (위젯 라벨 칸이 좁음)
-                                let label = m.label.strip_suffix(" 주간").unwrap_or(&m.label).to_string();
+                                // "Fable 주간" → "Fable" (위젯 라벨 칸이 좁음). 나머지는 언어에 맞춘 화면 이름 (m.label은 저장 키 그대로 key로)
+                                let label = match m.label.strip_suffix(" 주간") {
+                                    Some(model) => model.to_string(),
+                                    None => texts::meter_label(&m.label),
+                                };
                                 let short = (!percent && self.mode() == ValueMode::Remaining)
                                     .then(|| m.resets_at.filter(|&r| m.exact && r > now).map(|r| texts::fmt_hm_short(r - now)))
                                     .flatten();
-                                Row { label, value, ratio: if m.exact { m.ratio } else { 0.0 }, left, percent, short }
+                                Row { key: m.label.clone(), label, value, ratio: if m.exact { m.ratio } else { 0.0 }, left, percent, short }
                             })
                             .collect();
-                        Section { id: p.id, rows }
+                        Section { id: p.id, key: p.account_id.clone(), rows }
                     })
                     .filter(|s| !s.rows.is_empty()) // 그래프를 모두 끈 계정은 위젯에서 빠짐
                     .collect()
@@ -274,17 +277,27 @@ impl App {
                 Effect::Push => push = true,
                 Effect::Redraw => self.redraw(),
                 Effect::PlatformPref(key) => {
-                    if matches!(key.as_str(), "widget" | "side" | "monitor") {
+                    if matches!(key.as_str(), "widget" | "side" | "monitor" | "barPx") {
                         self.sync_widgets();
+                    }
+                    if key == "logo" {
+                        // 알림 영역 토끼·풍선·알림 아이콘을 바로 새 색으로 (다음 틱을 기다리지 않음)
+                        crate::toast::refresh_icon();
+                        self.tray.set_balloon_icon(&rabbit::render(&Pose::default(), 64), 64, self.logo_ink());
+                        self.frame();
+                    }
+                    if key == "locale" {
+                        // 트레이 메뉴는 열 때마다 새로 만들고, 위젯은 뒤따르는 Redraw로 다시 그림. 툴팁만 여기서 바꿈
+                        self.tray.set_tip(&texts::tooltip(self.ctl.snap.as_ref()));
                     }
                 }
                 Effect::Open(target) => shell_open(&target),
                 Effect::OpenText(path) => shell_open(&path.to_string_lossy()),
                 Effect::OpenNotifySettings => shell_open("ms-settings:notifications"),
                 Effect::Notify(title, body) => self.notify(&title, &body),
-                Effect::SetAutostart(on) => set_autostart(on),
+                Effect::SetAutostart(on) => crate::autostart::set(on),
                 Effect::CloseSettings => {
-                    self.settings = None; // 웹뷰 해제 → 메모리 반납
+                    self.settings = None;
                     queue.extend(self.ctl.settings_closed());
                 }
                 Effect::Quit => {
@@ -323,13 +336,23 @@ impl App {
         }
     }
 
+    /// 로고 색 설정: 흰색 / 검은색 / 자동(작업 표시줄 색)
+    fn logo_ink(&self) -> win::Rgb {
+        match self.ctl.state().pref_str("logo", "auto").as_str() {
+            "white" => win::INK_ON_DARK,
+            "ink" => win::INK_ON_LIGHT,
+            _ => self.ink,
+        }
+    }
+
     fn recheck_display(&mut self) {
         let (ink, size) = (win::theme_ink(), win::small_icon_size());
         if ink != self.ink || size != self.icon_size {
             self.ink = ink;
             self.icon_size = size;
             self.tray.clear_cache();
-            self.tray.set_balloon_icon(&rabbit::render(&Pose::default(), 64), 64, ink);
+            self.tray.set_balloon_icon(&rabbit::render(&Pose::default(), 64), 64, self.logo_ink());
+            crate::toast::refresh_icon(); // 라이트·다크 모드가 바뀌면 알림 아이콘 색도
         }
         self.sync_widgets();
         crate::uia::poke();
@@ -354,20 +377,15 @@ impl App {
             s.focus();
             return;
         }
-        match SettingsWindow::open(self.host, INBOX.with(|i| i.clone())) {
+        match settings::open(self.host) {
             Ok(s) => {
                 self.settings = Some(s);
                 self.ctl.settings_opened();
             }
             Err(e) => unsafe {
-                MessageBoxW(self.host, wide(&e).as_ptr(), wide("usAgI").as_ptr(), MB_ICONWARNING);
+                MessageBoxW(self.host, wide(&e.to_string()).as_ptr(), wide("usAgI").as_ptr(), MB_ICONWARNING);
             },
         }
-    }
-
-    /// 창의 닫기 단추 (화면의 닫기 명령과 같음)
-    fn close_settings(&mut self) {
-        self.run(vec![Effect::CloseSettings]);
     }
 
     /// Windows에서 읽는 값: 시작 시 실행, 중요 알림 허용, 모니터 목록
@@ -376,15 +394,21 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, m)| {
+                let (n, w, h) = (i + 1, m.rect.right - m.rect.left, m.rect.bottom - m.rect.top);
+                let label = usagi_core::tr!(
+                    format!("모니터 {n} · {} · {w}×{h}{}", m.name, if m.primary { " (주 모니터)" } else { "" }),
+                    format!("Monitor {n} · {} · {w}×{h}{}", m.name, if m.primary { " (primary)" } else { "" })
+                );
                 json!({
                     "id": m.device,
-                    "label": format!("모니터 {} · {} · {}×{}{}", i + 1, m.name, m.rect.right - m.rect.left, m.rect.bottom - m.rect.top,
-                        if m.primary { " (주 모니터)" } else { "" }),
+                    "label": label,
                 })
             })
             .collect();
         HostInfo {
-            autostart: autostart_enabled(),
+            taskbar_light: Some(win::taskbar_is_light()),
+            bar_range: Some(crate::widget::bar_range()).map(|(a, b, c)| (a.round() as f64, b.round() as f64, c.round() as f64)),
+            autostart: crate::autostart::enabled(),
             urgent_supported: crate::toast::urgent_supported(),
             urgent_allowed: crate::toast::urgent_allowed(),
             monitors,
@@ -393,14 +417,21 @@ impl App {
 
     fn push_settings(&self) {
         if let Some(s) = &self.settings {
-            s.push(&self.ctl.settings_state(&self.host_info()).to_string());
+            s.push(self.ctl.settings_state(&self.host_info()).to_string());
         }
     }
 
     // -------------------------------------------------------------- 트레이 메뉴
 
+    /// 누를 때마다 새로 만듦 (언어를 바꿔도 다음에 열 때 바로 반영)
     fn tray_menu(&mut self) {
-        let items = [(1u32, "설정 열기"), (4, "작업 표시줄 위젯 표시"), (2, "지금 새로고침"), (0, ""), (3, "usAgI 종료")];
+        let items = [
+            (1u32, usagi_core::tr!("설정 열기", "Open settings")),
+            (4, usagi_core::tr!("작업 표시줄 위젯 표시", "Show taskbar widget")),
+            (2, usagi_core::tr!("지금 새로고침", "Refresh now")),
+            (0, ""),
+            (3, usagi_core::tr!("usAgI 종료", "Quit usAgI")),
+        ];
         let widget_on = self.widget_on();
         let cmd = unsafe {
             let menu = CreatePopupMenu();
@@ -452,32 +483,6 @@ impl App {
                 _ => None,
             };
         }
-        if self.settings.as_ref().is_some_and(|s| s.hwnd == hwnd) {
-            return match msg {
-                WM_SIZE => {
-                    if let Some(s) = &self.settings {
-                        s.resize();
-                    }
-                    None
-                }
-                WM_GETMINMAXINFO => {
-                    let mmi = unsafe { &mut *(lp as *mut MINMAXINFO) };
-                    let s = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) } as i32;
-                    mmi.ptMinTrackSize = POINT { x: 480 * s / 96, y: 440 * s / 96 };
-                    Some(0)
-                }
-                WM_CLOSE => {
-                    self.close_settings();
-                    Some(0)
-                }
-                WM_ACTIVATE if (wp & 0xFFFF) != 0 => {
-                    // Windows 설정에서 돌아오면 허용 상태 등을 바로 다시 보여 줌
-                    self.push_settings();
-                    None
-                }
-                _ => None,
-            };
-        }
         if hwnd != self.host {
             return None;
         }
@@ -526,7 +531,7 @@ impl App {
                 Some(0)
             }
             WM_IPC => {
-                while let Some(m) = INBOX.with(|i| i.borrow_mut().pop_front()) {
+                while let Some(m) = self.settings.as_ref().and_then(SettingsWindow::next_command) {
                     let fx = self.ctl.handle_ipc(&m);
                     self.run(fx);
                 }
@@ -653,30 +658,19 @@ fn shell_open(path: &str) {
     }
 }
 
-fn autostart_enabled() -> bool {
-    win::reg_string(RUN_KEY, "usAgI").is_some()
-}
-
-fn set_autostart(on: bool) {
-    if on {
-        if let Ok(exe) = std::env::current_exe() {
-            win::reg_set_string(RUN_KEY, "usAgI", &format!("\"{}\"", exe.display()));
-        }
-    } else {
-        win::reg_delete(RUN_KEY, "usAgI");
-    }
-}
-
 // ------------------------------------------------------------------ 시작
 
-pub fn run() {
+/// `from_autostart`: 로그인할 때 자동 실행으로 시작됨 (이미 떠 있으면 설정 창을 열지 않고 끝냄)
+pub fn run(from_autostart: bool) {
     unsafe {
-        // 중복 실행이면 이미 떠 있는 usAgI의 설정 창을 엶
+        // 중복 실행: 직접 실행했으면 이미 떠 있는 usAgI의 설정 창을 엶, 자동 실행이면 조용히 끝냄
         CreateMutexW(null(), 0, wide("Local\\usAgI-app").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let host = FindWindowW(wide(HOST_CLASS).as_ptr(), null());
-            if !host.is_null() {
-                PostMessageW(host, WM_SHOW_SETTINGS, 0, 0);
+            if !from_autostart {
+                let host = FindWindowW(wide(HOST_CLASS).as_ptr(), null());
+                if !host.is_null() {
+                    PostMessageW(host, WM_SHOW_SETTINGS, 0, 0);
+                }
             }
             return;
         }
@@ -686,7 +680,6 @@ pub fn run() {
 
     register_class(HOST_CLASS, 0);
     register_class(WIDGET_CLASS, CS_DBLCLKS);
-    register_class(settings::CLASS, CS_HREDRAW | CS_VREDRAW);
 
     let host = unsafe {
         // 방송 메시지(TaskbarCreated 등)를 받으려면 메시지 전용 창이 아닌 최상위 창이어야 함
@@ -706,11 +699,7 @@ pub fn run() {
 
     // Windows 알림용 앱 이름·아이콘 등록 (설정 > 알림 목록에 usAgI로 보임)
     {
-        let icon = config::config_dir().join("usagi-icon.png");
-        let _ = std::fs::create_dir_all(config::config_dir());
-        if icon.exists() || crate::toast::write_icon(&icon) {
-            crate::toast::register(&icon);
-        }
+        crate::toast::refresh_icon();
         // 설치형일 때만 시작 메뉴 바로 가기 (포터블은 흔적을 남기지 않음)
         if !config::is_portable() {
             if let Ok(exe) = std::env::current_exe() {
@@ -743,10 +732,11 @@ pub fn run() {
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     APP.with(|cell| {
         if let Some(app) = cell.borrow_mut().as_mut() {
-            app.tray.set_tip("usAgI · 불러오는 중…");
+            app.tray.set_tip(usagi_core::tr!("usAgI · 불러오는 중…", "usAgI · Loading…"));
             app.sync_widgets();
             app.frame();
             crate::updater::cleanup(); // 업데이트 뒤 남은 예전 exe
+            crate::autostart::refresh(); // 자동 실행이 켜져 있으면 지금 위치로 로그온 작업을 맞춤 (예전 Run 등록은 옮김)
             let fx = app.ctl.startup();
             app.run(fx);
         }

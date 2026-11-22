@@ -29,7 +29,9 @@ pub fn register(icon_png: &Path) {
     let key = format!(r"Software\Classes\AppUserModelId\{AUMID}");
     win::reg_set_string(&key, "DisplayName", "usAgI");
     win::reg_set_string(&key, "IconUri", &icon_png.to_string_lossy());
-    win::reg_set_string(&key, "IconBackgroundColor", "FF141414");
+    // 알림 설정 목록의 아이콘 바탕: 토끼 색과 반대로
+    let back = if icon_png.file_name().is_some_and(|n| n == LIGHT_ICON) { "FFF3F3F3" } else { "FF141414" };
+    win::reg_set_string(&key, "IconBackgroundColor", back);
     unsafe { SetCurrentProcessExplicitAppUserModelID(wide(AUMID).as_ptr()) };
 }
 
@@ -82,8 +84,28 @@ pub fn show(title: &str, body: &str, urgent: bool, open_settings: (HWND, u32)) -
 }
 
 /// 알림에 쓸 앱 아이콘 PNG (exe 아이콘과 같은 그림)
-pub fn write_icon(path: &Path) -> bool {
-    usagi_core::rabbit::app_icon(96)
+const LIGHT_ICON: &str = "usagi-logo-light.png";
+
+/// 알림 아이콘을 쓰고 등록. 로고 색 설정이 자동이면 알림 창 색(Windows 모드)에 맞춤: 다크면 흰 토끼, 라이트면 진한 토끼.
+/// 색마다 파일을 따로 둬서 Windows가 예전 그림을 계속 쓰지 않게 함.
+pub fn refresh_icon() {
+    let dir = usagi_core::config::config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::remove_file(dir.join("usagi-icon.png")); // 예전 사각형 아이콘
+    let light = match usagi_core::config::State::load().pref_str("logo", "auto").as_str() {
+        "ink" => true,
+        "white" => false,
+        _ => win::taskbar_is_light(),
+    };
+    let path = dir.join(if light { LIGHT_ICON } else { "usagi-logo.png" });
+    if write_icon(&path, light) || path.exists() {
+        register(&path);
+    }
+}
+
+pub fn write_icon(path: &Path, light: bool) -> bool {
+    use usagi_core::rabbit::{app_icon_colored, ICON_INK, ICON_WHITE};
+    app_icon_colored(96, if light { ICON_INK } else { ICON_WHITE })
         .and_then(|pm| pm.encode_png().ok())
         .is_some_and(|bytes| std::fs::write(path, bytes).is_ok())
 }
@@ -107,7 +129,7 @@ pub fn ensure_shortcut(exe: &Path) -> windows::core::Result<()> {
         if let Some(d) = exe.parent() {
             link.SetWorkingDirectory(&HSTRING::from(d.as_os_str()))?;
         }
-        link.SetDescription(&HSTRING::from("usAgI — AI 구독 사용량 표시"))?;
+        link.SetDescription(&HSTRING::from(usagi_core::tr!("usAgI — AI 구독 사용량 표시", "usAgI — AI subscription usage")))?;
         let store: IPropertyStore = link.cast()?;
         store.SetValue(&PKEY_AppUserModel_ID, &PROPVARIANT::from(AUMID))?;
         store.Commit()?;

@@ -25,14 +25,43 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 // 논리 크기 (96 DPI 기준 px)
 const PAD: f32 = 6.0;
 const RABBIT_W: f32 = 30.0;
-const SECTION_W: f32 = 237.0;
 /// 칸 안에서 막대가 시작하는 위치 (로고·라벨 뒤)
 const BAR_X: f32 = 72.0;
+/// 막대 길이 설정의 최댓값 (논리 px). 최솟값은 가장 긴 남은 시간 글자 너비
+const BAR_MAX: f32 = 240.0;
+/// 예전 고정 배치에서 막대 + 값 글자에 쓰던 너비 (칸 207 - 라벨 칸 42 - 간격 11 - 끝 2)
+const OLD_BAR_SPAN: f32 = 152.0;
+
+/// 막대 길이 기본값: 예전 고정 배치와 같은 길이 (가장 긴 시간 글자보다는 짧지 않게)
+fn default_bar(widest: f32) -> f32 {
+    (OLD_BAR_SPAN - widest).max(widest)
+}
+
+/// 설정 창에 보일 막대 길이 범위 (논리 px): (최소 = 가장 긴 값 글자, 기본 = 예전 고정 길이, 최대). 언어별로 한 번만 잼
+pub fn bar_range() -> (f32, f32, f32) {
+    static CACHE: std::sync::Mutex<Option<(&'static str, (f32, f32, f32))>> = std::sync::Mutex::new(None);
+    let lang = usagi_core::i18n::lang().code();
+    if let Some((l, r)) = *CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
+        if l == lang {
+            return r;
+        }
+    }
+    let widest = Widget::new(std::ptr::null_mut(), std::ptr::null_mut(), true).widest_value(1.0);
+    let range = (widest, default_bar(widest), BAR_MAX.max(widest));
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((lang, range));
+    range
+}
+/// 라벨 글자와 막대 사이 최소 간격 (라벨이 BAR_X보다 길 때만 막대가 뒤로 밀림)
+const LABEL_GAP: f32 = 8.0;
+
+/// 값 칸 너비를 정하는 가장 긴 글자들 (남은 시간 "n시간 n분" / "n일 n시간", 퍼센트). 언어마다 글자가 달라 그때 만듦
+fn widest_values() -> [String; 3] {
+    [texts::fmt_hm(23.0 * 3600.0 + 59.0 * 60.0), texts::fmt_hm(6.0 * 86400.0 + 23.0 * 3600.0), "100%".into()]
+}
 /// 막대와 값 글자 사이
 const VALUE_GAP: f32 = 11.0;
 /// 칸 = 로고 + 열(두 줄씩). 세 번째 줄(예: Fable)부터는 같은 칸 안의 다음 열로
 const LOGO_COL: f32 = 30.0;
-const COL_W: f32 = SECTION_W - LOGO_COL;
 const COL_GAP: f32 = 18.0;
 /// 좁은 모양(막대 없음): 로고 → 라벨 → 값. 간격은 넓은 모양과 같은 느낌으로
 const COMPACT_LOGO: f32 = 25.0; // 로고 16 + 간격 9
@@ -53,7 +82,8 @@ enum Fit {
     Short,
 }
 
-/// 아주 좁을 때의 짧은 라벨: 5시간 → 5h, 주간 → 7d, 모델별 주간(Fable) → F7d
+/// 아주 좁을 때의 짧은 라벨: 5시간 → 5h, 주간 → 7d, 모델별 주간(Fable 주간) → F7d.
+/// 화면 이름이 아니라 저장된 그래프 이름(`Row::key`)으로 고름
 fn short_label(label: &str) -> String {
     match label {
         "5시간" => "5h".into(),
@@ -62,11 +92,11 @@ fn short_label(label: &str) -> String {
     }
 }
 
-/// 한 칸의 너비 (논리 px). 좁은 모양은 글자 너비(라벨 칸 lab, 값 칸 val)에 맞춤
-fn section_width(rows: usize, fit: Fit, lab: f32, val: f32) -> f32 {
+/// 한 칸의 너비 (논리 px). 넓은 모양은 열 너비(col_w), 좁은 모양은 글자 너비(라벨 칸 lab, 값 칸 val)에 맞춤
+fn section_width(rows: usize, fit: Fit, lab: f32, val: f32, col_w: f32) -> f32 {
     let c = columns(rows) as f32;
     match fit {
-        Fit::Full => LOGO_COL + c * COL_W + (c - 1.0) * COL_GAP,
+        Fit::Full => LOGO_COL + c * col_w + (c - 1.0) * COL_GAP,
         _ => COMPACT_LOGO + c * (lab + COMPACT_GAP + val) + (c - 1.0) * COMPACT_COL_GAP,
     }
 }
@@ -83,6 +113,9 @@ pub enum Side {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
+    /// 저장된 그래프 이름 ("5시간", "주간", "Fable 주간"). 막대 값 기억·전환 애니메이션·짧은 라벨의 열쇠라 언어와 무관
+    pub key: String,
+    /// 화면에 보이는 라벨 (언어에 맞춘 이름)
     pub label: String,
     /// 표시할 값 ("15%", "2시간 13분", "–")
     pub value: String,
@@ -109,6 +142,8 @@ impl Row {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Section {
     pub id: ProviderId,
+    /// 계정 id (막대가 이어서 움직이도록 값을 기억하는 열쇠. 순서를 바꿔도 같은 계정이면 그 자리에서 이어짐)
+    pub key: String,
     pub rows: Vec<Row>,
 }
 
@@ -123,7 +158,7 @@ pub struct Content {
 
 /// 퍼센트 ↔ 남은 시간 전환 애니메이션
 struct Switch {
-    /// 전환 직전에 보이던 값 ((칸 번호, 라벨) → 값)
+    /// 전환 직전에 보이던 값 ((칸 번호, 그래프 key) → 값)
     from: HashMap<(usize, String), String>,
     start: std::time::Instant,
 }
@@ -174,6 +209,12 @@ pub struct Widget {
     label_cols: (f32, f32),
     /// 아주 좁은 모양의 값 칸 너비 (짧은 값 기준)
     short_col: f32,
+    /// 막대 길이 설정 (0..1, 0 = 가장 긴 남은 시간 글자만큼)
+    pub bar_px: Option<f32>,
+    /// 넓은 모양의 한 열 너비 (논리 px) = 라벨 + 막대 + 간격 + 가장 긴 값. 모드를 바꿔도 위젯 너비는 그대로
+    col_w: f32,
+    /// 가장 긴 값 글자 너비 캐시 (배율, 영어인지, 너비)
+    widest: (f32, bool, f32),
 }
 
 fn hash_of<T: Hash>(v: &T) -> u64 {
@@ -205,7 +246,33 @@ impl Widget {
             value_col: None,
             label_cols: (32.0, 18.0),
             short_col: 30.0,
+            bar_px: None,
+            col_w: 207.0,
+            widest: (0.0, false, 0.0),
         }
+    }
+
+    /// 가장 긴 값 글자 너비 (논리 px, 배율·언어별로 한 번만 잼)
+    fn widest_value(&mut self, scale: f32) -> f32 {
+        let en = usagi_core::i18n::is_en();
+        if self.widest.0 != scale || self.widest.1 != en {
+            let samples = widest_values();
+            let w = self.measure_col(samples.iter().map(String::as_str), scale).ceil();
+            self.widest = (scale, en, w);
+        }
+        self.widest.2
+    }
+
+    /// 넓은 모양에서 로고 뒤 라벨 칸 (막대 시작까지). 보통 BAR_X, 라벨이 길면(영어 "Weekly" 등) 그만큼 늘어남
+    fn label_span(&self) -> f32 {
+        (BAR_X - LOGO_COL).max(self.label_cols.0 + LABEL_GAP)
+    }
+
+    /// 넓은 모양 한 열 너비. 남은 시간 표시일 때 막대 = 설정 길이(px), 없으면 예전 고정 길이. 가장 긴 시간 글자보다 짧아지지 않음
+    fn full_col_width(&mut self, scale: f32) -> f32 {
+        let widest = self.widest_value(scale);
+        let bar = self.bar_px.unwrap_or_else(|| default_bar(widest)).clamp(widest, BAR_MAX.max(widest));
+        self.label_span() + bar + VALUE_GAP + widest + 2.0
     }
 
     /// 움직이는 중이면 true (그동안 앱이 틱을 촘촘하게)
@@ -222,7 +289,7 @@ impl Widget {
         let n = content.sections.len() as f32;
         let val = if fit == Fit::Short { self.short_col } else { self.value_col.unwrap_or(32.0) as f32 };
         let lab = if fit == Fit::Short { self.label_cols.1 } else { self.label_cols.0 };
-        let secs: f32 = content.sections.iter().map(|s| section_width(s.rows.len(), fit, lab, val)).sum();
+        let secs: f32 = content.sections.iter().map(|s| section_width(s.rows.len(), fit, lab, val, self.col_w)).sum();
         let rabbit = if content.rabbit.is_some() { RABBIT_W } else { 0.0 };
         let divider = if fit == Fit::Full { DIVIDER_W } else { COMPACT_DIVIDER };
         PAD * 2.0 + rabbit + secs + (n - 1.0).max(0.0) * divider
@@ -234,7 +301,7 @@ impl Widget {
         let (mut long, mut short) = (0.0f32, 0.0f32);
         for r in content.sections.iter().flat_map(|s| &s.rows) {
             long = long.max(self.text.measure(&r.label, spec).0 as f32 / scale);
-            short = short.max(self.text.measure(&short_label(&r.label), spec).0 as f32 / scale);
+            short = short.max(self.text.measure(&short_label(&r.key), spec).0 as f32 / scale);
         }
         (long.ceil(), short.ceil())
     }
@@ -247,9 +314,9 @@ impl Widget {
         self.last_tick = Some(now);
         let k = 1.0 - (-dt / EASE_TAU).exp();
         let mut easing = false;
-        for (i, sec) in content.sections.iter_mut().enumerate() {
+        for sec in content.sections.iter_mut() {
             for row in &mut sec.rows {
-                let key = format!("{i}:{:?}:{}", sec.id, row.label);
+                let key = format!("{}:{}", sec.key, row.key);
                 let cur = self.eased.get(&key).copied().unwrap_or(0.0);
                 let target = row.ratio;
                 let next = if (target - cur).abs() < 0.004 { target } else { cur + (target - cur) * k };
@@ -272,8 +339,9 @@ impl Widget {
         self.value_col = Some(col);
         self.label_cols = self.measure_labels(&content, scale);
         self.short_col = self.measure_col(content.sections.iter().flat_map(|s| s.rows.iter().map(|r| r.shown(true))), scale);
-        // 좁은 모양은 글자 너비에 맞추므로, 너비가 바뀌면 창 크기도 다시
-        let resize = self.place.is_some_and(|p| p.fit != Fit::Full && (self.width_for(&content, p.fit) * p.scale).round() as i32 != p.w);
+        self.col_w = self.full_col_width(scale);
+        // 좁은 모양은 글자 너비에, 넓은 모양은 막대 길이 설정에 맞추므로 너비가 바뀌면 창 크기도 다시
+        let resize = self.place.is_some_and(|p| (self.width_for(&content, p.fit) * p.scale).round() as i32 != p.w);
         self.easing = easing;
         // 퍼센트 ↔ 남은 시간: 바뀌기 직전 값을 기억해 두고 겹쳐 그림
         let short_now = self.place.is_some_and(|p| p.fit == Fit::Short);
@@ -282,7 +350,7 @@ impl Widget {
                 .sections
                 .iter()
                 .enumerate()
-                .flat_map(|(i, s)| s.rows.iter().map(move |r| ((i, r.label.clone()), r.shown(short_now).to_string())))
+                .flat_map(|(i, s)| s.rows.iter().map(move |r| ((i, r.key.clone()), r.shown(short_now).to_string())))
                 .collect();
             self.switch = Some(Switch { from, start: now });
         }
@@ -497,7 +565,10 @@ impl Widget {
                 }
             }
         };
-        let bar_len = (SECTION_W - 2.0 - BAR_X - col - VALUE_GAP).max(24.0);
+        // 막대 = 열 너비 - 라벨 - 간격 - 지금 값 글자. 남은 시간 표시에서 설정 길이, 퍼센트 표시에서는 그보다 김
+        let col_w = self.col_w;
+        let label_span = self.label_span();
+        let bar_len = (col_w - label_span - VALUE_GAP - col - 2.0).max(24.0);
         let (from, t) = (tr.map(|x| x.0), tr.map(|x| x.1));
         let mut img = Image::new(place.w as u32, place.h as u32);
         // 알파 1: 눈에는 안 보이지만 마우스는 받도록
@@ -535,17 +606,17 @@ impl Widget {
                     let cx = x + COMPACT_LOGO + ci as f32 * (lab_w + COMPACT_GAP + vcol + COMPACT_COL_GAP);
                     let right = px(cx + lab_w + COMPACT_GAP + vcol);
                     for (y, row) in ys.iter().zip(chunk) {
-                        let text = if short { short_label(&row.label) } else { row.label.clone() };
+                        let text = if short { short_label(&row.key) } else { row.label.clone() };
                         self.text.draw(&mut img, px(cx), *y, &text, label, content.ink, 235, Align::Left);
-                        let old = from.and_then(|f| f.get(&(i, row.label.clone())));
+                        let old = from.and_then(|f| f.get(&(i, row.key.clone())));
                         let shown = row.shown(short).to_string();
                         self.draw_value(&mut img, right, *y, &shown, old, t, value, content.ink, slide);
                     }
                     continue;
                 }
-                let cx = x + LOGO_COL + ci as f32 * (COL_W + COL_GAP);
-                let (bar_x, bar_w, bar_h) = (px(cx + BAR_X - LOGO_COL), px(bar_len), px(5.0).max(4));
-                let right = px(cx + COL_W - 2.0);
+                let cx = x + LOGO_COL + ci as f32 * (col_w + COL_GAP);
+                let (bar_x, bar_w, bar_h) = (px(cx + label_span), px(bar_len), px(5.0).max(4));
+                let right = px(cx + col_w - 2.0);
             for (y, row) in ys.iter().zip(chunk) {
                 let (lab, val, ratio) = (&row.label, &row.value, &row.ratio);
                 self.text.draw(&mut img, px(cx), *y, lab, label, content.ink, 235, Align::Left);
@@ -558,12 +629,12 @@ impl Widget {
                     let fill = bar_mask(bar_w as u32, bar_h as u32, fill_w);
                     img.blend_mask(bar_x, y - bar_h / 2, &fill, bar_w as u32, bar_h as u32, BAR_COLORS[texts::level(*ratio) as usize], 255);
                 }
-                let old = from.and_then(|f| f.get(&(i, row.label.clone())));
+                let old = from.and_then(|f| f.get(&(i, row.key.clone())));
                 self.draw_value(&mut img, right, *y, val, old, t, value, content.ink, slide);
             }
             }
             let (lab_w, vcol) = if place.fit == Fit::Short { (self.label_cols.1, self.short_col) } else { (self.label_cols.0, col) };
-            x += section_width(sec.rows.len(), place.fit, lab_w, vcol);
+            x += section_width(sec.rows.len(), place.fit, lab_w, vcol, col_w);
         }
         img
     }
@@ -572,12 +643,20 @@ impl Widget {
 /// 디자인 확인용: 창 없이 위젯 이미지를 그림
 /// level: 0 넓음(막대), 1 좁음(라벨+값), 2 아주 좁음(짧은 라벨+값)
 pub fn preview(content: &Content, scale: f32, height: i32, level: u8) -> Image {
-    preview_switch(content, scale, height, level, None)
+    preview_bar(content, scale, height, level, None, None)
 }
 
-/// 디자인 확인용: 퍼센트 ↔ 남은 시간 전환의 한 장면 (from: (칸, 라벨) → 이전 값, t: 0..1)
 pub fn preview_switch(content: &Content, scale: f32, height: i32, level: u8, tr: Option<(&HashMap<(usize, String), String>, f32)>) -> Image {
+    preview_bar(content, scale, height, level, tr, None)
+}
+
+/// 디자인 확인용: 퍼센트 ↔ 남은 시간 전환의 한 장면 (from: (칸, 그래프 key) → 이전 값, t: 0..1)
+/// 막대 길이 설정(bar)을 정해서 그리기
+pub fn preview_bar(content: &Content, scale: f32, height: i32, level: u8, tr: Option<(&HashMap<(usize, String), String>, f32)>, bar_px: Option<f32>) -> Image {
     let mut w = Widget::new(std::ptr::null_mut(), std::ptr::null_mut(), true);
+    w.bar_px = bar_px;
+    w.label_cols = w.measure_labels(content, scale); // 열 너비가 라벨 칸을 따르므로 먼저
+    w.col_w = w.full_col_width(scale);
     let fit = match level {
         0 => Fit::Full,
         1 => Fit::Compact,
@@ -587,7 +666,6 @@ pub fn preview_switch(content: &Content, scale: f32, height: i32, level: u8, tr:
     if tr.is_none() {
         w.value_col = Some(col as f64);
     }
-    w.label_cols = w.measure_labels(content, scale);
     w.short_col = w.measure_col(content.sections.iter().flat_map(|s| s.rows.iter().map(|r| r.shown(true))), scale);
     let width = (w.width_for(content, fit) * scale).round() as i32;
     let place = Place { x: 0, y: 0, w: width, h: height, scale, fit };
