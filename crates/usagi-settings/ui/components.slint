@@ -143,6 +143,8 @@ export component LeadInput inherits HorizontalLayout {
 
 // 그래프 알림 하나: 종류(0 사용량 %, 1 리셋 몇 분 전), 저장된 값, 켜짐, 보일 글자
 export struct AlertItem { kind: int, value: int, on: bool, text: string }
+// 변경 내용의 한 줄: 0 제목, 1 목록 항목, 2 문단. level은 목록 들여쓰기 단계
+export struct NoteLine { kind: int, level: int, text: string }
 export struct Meter {
     key: string, label: string, percent: int, level: int, exact: bool, detail: string, reset: string,
     left: bool, own-basis: bool, widget: bool, alert-on: bool,
@@ -256,6 +258,28 @@ export component Group inherits VerticalLayout {
     spacing: 10px;
     if root.title != "": Section { text: root.title; opacity: root.appear * root.dim-level; }
     Panel { inset-y: 14px; gap: 12px; dim: root.dim; @children }
+}
+
+// 변경 내용 (마크다운을 나눈 줄): 제목은 크게, 목록은 점과 함께 들여 씀.
+// 줄마다 글자 너비를 직접 정해 높이를 구함 (긴 항목이 여러 줄로 넘어가도 줄 높이가 따라오게)
+export component Notes inherits VerticalLayout {
+    in property <[NoteLine]> lines;
+    spacing: 6px;
+    for line[i] in root.lines: Rectangle {
+        private property <length> indent: line.kind == 1 ? line.level * 16px + 16px : 0px;
+        private property <length> lead: line.kind == 0 && i > 0 ? 10px : 0px;
+        height: body.height + self.lead;
+        if line.kind == 1: Text {
+            x: parent.indent - 16px; y: parent.lead; width: 16px;
+            text: "•"; color: Theme.faint; font-size: Theme.size-small; accessible-role: none;
+        }
+        body := Text {
+            x: parent.indent; y: parent.lead; width: parent.width - parent.indent; height: self.preferred-height;
+            text: line.text; wrap: word-wrap;
+            color: line.kind == 0 ? Theme.ink : Theme.sub;
+            font-size: line.kind == 0 ? Theme.size-row : Theme.size-small;
+        }
+    }
 }
 
 // 알림 띠 (오류 등): 나타날 때 서서히

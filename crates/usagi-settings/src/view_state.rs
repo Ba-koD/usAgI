@@ -1,4 +1,4 @@
-use super::{Account, AlertItem, LoginInfo, Meter, Preferences, SettingsView, UpdateInfo};
+use super::{Account, AlertItem, LoginInfo, Meter, NoteLine, Preferences, SettingsView, UpdateInfo};
 use serde_json::Value;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use usagi_core::tr;
@@ -202,6 +202,23 @@ fn account(v: &Value, previous: Option<Account>) -> Account {
     }
 }
 
+/// 마크다운(변경 내용) → 화면 줄
+fn note_lines(markdown: &str) -> Vec<NoteLine> {
+    use usagi_core::changelog::{lines, Kind};
+    lines(markdown)
+        .into_iter()
+        .map(|l| NoteLine {
+            kind: match l.kind {
+                Kind::Heading => 0,
+                Kind::Bullet => 1,
+                Kind::Text => 2,
+            },
+            level: l.level as i32,
+            text: l.text.into(),
+        })
+        .collect()
+}
+
 fn update(v: &Value) -> UpdateInfo {
     let latest = text(v, "latest");
     let status = text(v, "status");
@@ -229,7 +246,6 @@ fn update(v: &Value) -> UpdateInfo {
     };
     UpdateInfo {
         status: description.into(),
-        notes: text(v, "notes").into(),
         install: install.into(),
         managed,
         busy: matches!(status, "checking" | "downloading"),
@@ -364,6 +380,13 @@ pub fn apply(view: &SettingsView, state: &Value) {
         }
     }
     view.set_update(update(&state["update"]));
+    view.set_update_notes(rows(view.get_update_notes(), note_lines(text(&state["update"], "notes"))));
+    // 이 버전의 변경 내용 (빌드에 들어 있는 CHANGELOG). 한 번만 채움
+    if view.get_version_notes().row_count() == 0 {
+        if let Some(section) = usagi_core::changelog::section(usagi_core::VERSION) {
+            view.set_version_notes(ModelRc::new(VecModel::from(note_lines(section))));
+        }
+    }
     view.set_error(text(state, "error").into());
     view.set_windows(text(state, "platform") == "windows");
     view.set_version(text(state, "version").into());

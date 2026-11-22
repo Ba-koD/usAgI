@@ -8,577 +8,592 @@ msgctxt "SettingsView"
 msgid "usAgI 설정"
 msgstr "usAgI Settings"
 
-#: ui/settings.slint:55 ui/settings.slint:123
+#: ui/settings.slint:63 ui/settings.slint:131
 msgctxt "SettingsView"
 msgid "사용량"
 msgstr "Usage"
 
-#: ui/settings.slint:55
+#: ui/settings.slint:63
 msgctxt "SettingsView"
 msgid "위젯"
 msgstr "Widget"
 
-#: ui/settings.slint:55
+#: ui/settings.slint:63
 msgctxt "SettingsView"
 msgid "메뉴 막대"
 msgstr "Menu bar"
 
-#: ui/settings.slint:55
+#: ui/settings.slint:63
 msgctxt "SettingsView"
 msgid "알림"
 msgstr "Alerts"
 
-#: ui/settings.slint:55
+#: ui/settings.slint:63
 msgctxt "SettingsView"
 msgid "일반"
 msgstr "General"
 
-#: ui/settings.slint:55
+#: ui/settings.slint:63
 msgctxt "SettingsView"
 msgid "정보"
 msgstr "About"
 
-#: ui/settings.slint:56
+#: ui/settings.slint:64
 msgctxt "SettingsView"
 msgid "작업 표시줄에 사용량을 항상 표시"
 msgstr "Usage always visible on the taskbar"
 
-#: ui/settings.slint:56
+#: ui/settings.slint:64
 msgctxt "SettingsView"
 msgid "메뉴 막대에 사용량을 항상 표시"
 msgstr "Usage always visible in the menu bar"
 
-#: ui/settings.slint:57
+#: ui/settings.slint:65
 msgctxt "SettingsView"
 msgid "사용량이 설정한 기준에 도달하면 {} 알림 표시"
 msgstr "Shows a {} notification when a graph reaches the level you set"
 
-#: ui/settings.slint:123
+#: ui/settings.slint:131
 msgctxt "SettingsView"
 msgid "남은 양"
 msgstr "Remaining"
 
-#: ui/settings.slint:125 ui/settings.slint:125
+#: ui/settings.slint:133 ui/settings.slint:133
 msgctxt "SettingsView"
 msgid "새로고침"
 msgstr "Refresh"
 
-#: ui/settings.slint:126 ui/settings.slint:126
+#: ui/settings.slint:134 ui/settings.slint:134
 msgctxt "SettingsView"
 msgid "알림 테스트"
 msgstr "Test alert"
 
-#: ui/settings.slint:128 ui/settings.slint:296 ui/settings.slint:412
+#: ui/settings.slint:136 ui/settings.slint:304 ui/settings.slint:428
 msgctxt "SettingsView"
 msgid "초기화"
 msgstr "Reset"
 
-#: ui/settings.slint:128 ui/settings.slint:130
+#: ui/settings.slint:136 ui/settings.slint:138
 msgctxt "SettingsView"
 msgid "{} 설정 초기화"
 msgstr "Reset {} settings"
 
-#: ui/settings.slint:131
+#: ui/settings.slint:139
 msgctxt "SettingsView"
 msgid "위젯 표시, 위치, 표시 값, 막대 길이를 기본값으로 되돌림"
 msgstr "Widget visibility, position, shown value and bar length go back to defaults"
 
-#: ui/settings.slint:131
+#: ui/settings.slint:139
 msgctxt "SettingsView"
 msgid "표시 값을 기본값으로 되돌림"
 msgstr "The shown value goes back to its default"
 
-#: ui/settings.slint:131
+#: ui/settings.slint:139
 msgctxt "SettingsView"
 msgid "알림 켜기·끄기, 리필권 알림, 그래프별 알림 기준을 기본값으로 되돌림. 계정·로그인은 유지"
 msgstr "Alert switches, refill alerts and per-graph alerts go back to defaults. Accounts and logins stay"
 
-#: ui/settings.slint:131
+#: ui/settings.slint:139
 msgctxt "SettingsView"
 msgid "화면 테마, 언어, 로고 색, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지"
 msgstr "Theme, language, logo color and refresh interval go back to defaults. Launch at startup and accounts stay"
 
-#: ui/settings.slint:131
+#: ui/settings.slint:139
 msgctxt "SettingsView"
 msgid "화면 테마, 언어, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지"
 msgstr "Theme, language and refresh interval go back to defaults. Launch at login and accounts stay"
 
-#: ui/settings.slint:153
+#: ui/settings.slint:161
 msgctxt "SettingsView"
 msgid "ChatGPT · Codex 계정 연결"
 msgstr "Connect ChatGPT · Codex account"
 
-#: ui/settings.slint:153
+#: ui/settings.slint:161
 msgctxt "SettingsView"
 msgid "Claude 계정 연결"
 msgstr "Connect Claude account"
 
-#: ui/settings.slint:154
+#: ui/settings.slint:162
 msgctxt "SettingsView"
 msgid "공식 로그인 진행 중"
 msgstr "Official login in progress"
 
-#: ui/settings.slint:157
+#: ui/settings.slint:165
 msgctxt "SettingsView"
 msgid "브라우저 열기"
 msgstr "Open browser"
 
-#: ui/settings.slint:158
+#: ui/settings.slint:166
 msgctxt "SettingsView"
 msgid "다시 시도"
 msgstr "Retry"
 
-#: ui/settings.slint:159 ui/settings.slint:321
+#: ui/settings.slint:167 ui/settings.slint:321 ui/settings.slint:337
 msgctxt "SettingsView"
 msgid "닫기"
 msgstr "Close"
 
-#: ui/settings.slint:159 ui/settings.slint:411
+#: ui/settings.slint:167 ui/settings.slint:427
 msgctxt "SettingsView"
 msgid "취소"
 msgstr "Cancel"
 
-#: ui/settings.slint:164
+#: ui/settings.slint:172
 msgctxt "SettingsView"
 msgid "인증 코드"
 msgstr "Authentication code"
 
-#: ui/settings.slint:167
+#: ui/settings.slint:175
 msgctxt "SettingsView"
 msgid "코드 보내기"
 msgstr "Send code"
 
-#: ui/settings.slint:177
+#: ui/settings.slint:185
 msgctxt "SettingsView"
 msgid "연결된 계정 없음"
 msgstr "No accounts connected"
 
-#: ui/settings.slint:178
+#: ui/settings.slint:186
 msgctxt "SettingsView"
 msgid "Claude Code·Codex CLI로 로그인한 계정의 사용량 표시. CLI가 없으면 공식 설치 프로그램으로 자동 설치"
 msgstr "Shows usage for accounts signed in with Claude Code or Codex CLI. Installs the CLI with the official installer if missing"
 
-#: ui/settings.slint:186
+#: ui/settings.slint:194
 msgctxt "SettingsView"
 msgid "알림 받기"
 msgstr "Enable alerts"
 
-#: ui/settings.slint:186
+#: ui/settings.slint:194
 msgctxt "SettingsView"
 msgid "끄면 그래프별 알림도 모두 꺼짐"
 msgstr "Turning this off also stops per-graph alerts"
 
-#: ui/settings.slint:188
+#: ui/settings.slint:196
 msgctxt "SettingsView"
 msgid "한도 도달·리셋 알림"
 msgstr "Limit and reset alerts"
 
-#: ui/settings.slint:188
+#: ui/settings.slint:196
 msgctxt "SettingsView"
 msgid "Claude 한도에 도달했을 때와 한도가 리셋됐을 때 알림"
 msgstr "Alert when a Claude limit is reached or resets"
 
-#: ui/settings.slint:190
+#: ui/settings.slint:198
 msgctxt "SettingsView"
 msgid "로그인 만료 알림"
 msgstr "Login expiry alerts"
 
-#: ui/settings.slint:190
+#: ui/settings.slint:198
 msgctxt "SettingsView"
 msgid "로그인이 만료되어 다시 로그인해야 할 때 알림"
 msgstr "Alert when an account needs to log in again"
 
-#: ui/settings.slint:193 ui/settings.slint:194
+#: ui/settings.slint:201 ui/settings.slint:202
 msgctxt "SettingsView"
 msgid "리필권 만료 알림"
 msgstr "Refill expiry alerts"
 
-#: ui/settings.slint:193
+#: ui/settings.slint:201
 msgctxt "SettingsView"
 msgid "리필권이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경"
 msgstr "Alerts once before refills expire. Each account can be set separately below"
 
-#: ui/settings.slint:198
+#: ui/settings.slint:206
 msgctxt "SettingsView"
 msgid "알림 시점"
 msgstr "Alert timing"
 
-#: ui/settings.slint:198
+#: ui/settings.slint:206
 msgctxt "SettingsView"
 msgid "리필권 만료 얼마 전에 알릴지 설정"
 msgstr "How long before refills expire to alert"
 
-#: ui/settings.slint:204
+#: ui/settings.slint:212
 msgctxt "SettingsView"
 msgid "방해 금지 중에도 알림"
 msgstr "Alert even in Do not disturb"
 
-#: ui/settings.slint:206
+#: ui/settings.slint:214
 msgctxt "SettingsView"
 msgid "Windows 알림 설정"
 msgstr "Windows notification settings"
 
-#: ui/settings.slint:207
+#: ui/settings.slint:215
 msgctxt "SettingsView"
 msgid "Windows 설정 열기"
 msgstr "Open Windows settings"
 
-#: ui/settings.slint:211
+#: ui/settings.slint:219
 msgctxt "SettingsView"
 msgid "그래프별 알림"
 msgstr "Per-graph alerts"
 
-#: ui/settings.slint:221
+#: ui/settings.slint:229
 msgctxt "SettingsView"
 msgid "작업 표시줄 위젯 표시"
 msgstr "Show taskbar widget"
 
-#: ui/settings.slint:224
+#: ui/settings.slint:232
 msgctxt "SettingsView"
 msgid "위치"
 msgstr "Position"
 
-#: ui/settings.slint:225
+#: ui/settings.slint:233
 msgctxt "SettingsView"
 msgid "모니터"
 msgstr "Monitor"
 
-#: ui/settings.slint:225
+#: ui/settings.slint:233
 msgctxt "SettingsView"
 msgid "선택한 모니터가 연결되어 있지 않으면 주 모니터에 표시"
 msgstr "Shown on the primary monitor if the selected one is not connected"
 
-#: ui/settings.slint:227
+#: ui/settings.slint:235
 msgctxt "SettingsView"
 msgid "위젯을 표시할 모니터"
 msgstr "Monitor for the widget"
 
-#: ui/settings.slint:233
+#: ui/settings.slint:241
 msgctxt "SettingsView"
 msgid "작업 표시줄 내 위치"
 msgstr "Position on the taskbar"
 
-#: ui/settings.slint:234
+#: ui/settings.slint:242
 msgctxt "SettingsView"
 msgid "왼쪽"
 msgstr "Left"
 
-#: ui/settings.slint:234
+#: ui/settings.slint:242
 msgctxt "SettingsView"
 msgid "오른쪽"
 msgstr "Right"
 
-#: ui/settings.slint:238
+#: ui/settings.slint:246
 msgctxt "SettingsView"
 msgid "모양"
 msgstr "Appearance"
 
-#: ui/settings.slint:239
+#: ui/settings.slint:247
 msgctxt "SettingsView"
 msgid "표시 값"
 msgstr "Shown value"
 
-#: ui/settings.slint:239
+#: ui/settings.slint:247
 msgctxt "SettingsView"
 msgid "위젯을 우클릭해도 전환 가능"
 msgstr "Can also be switched by right-clicking the widget"
 
-#: ui/settings.slint:239
+#: ui/settings.slint:247
 msgctxt "SettingsView"
 msgid "메뉴 막대 메뉴에서도 변경 가능"
 msgstr "Can also be changed from the menu bar menu"
 
-#: ui/settings.slint:240
+#: ui/settings.slint:248
 msgctxt "SettingsView"
 msgid "퍼센트"
 msgstr "Percent"
 
-#: ui/settings.slint:240
+#: ui/settings.slint:248
 msgctxt "SettingsView"
 msgid "남은 시간"
 msgstr "Time left"
 
-#: ui/settings.slint:243
+#: ui/settings.slint:251
 msgctxt "SettingsView"
 msgid "막대 길이"
 msgstr "Bar length"
 
-#: ui/settings.slint:243
+#: ui/settings.slint:251
 msgctxt "SettingsView"
 msgid "남은 시간을 표시할 때의 막대 길이 · 기본 {}px"
 msgstr "Length when showing time left · default {}px"
 
-#: ui/settings.slint:251
+#: ui/settings.slint:259
 msgctxt "SettingsView"
 msgid "화면"
 msgstr "Display"
 
-#: ui/settings.slint:252
+#: ui/settings.slint:260
 msgctxt "SettingsView"
 msgid "화면 테마"
 msgstr "Theme"
 
-#: ui/settings.slint:252
+#: ui/settings.slint:260
 msgctxt "SettingsView"
 msgid "시스템을 선택하면 OS의 라이트·다크 설정을 따름"
 msgstr "System follows the OS light or dark setting"
 
-#: ui/settings.slint:253 ui/settings.slint:258
+#: ui/settings.slint:261 ui/settings.slint:266
 msgctxt "SettingsView"
 msgid "시스템"
 msgstr "System"
 
-#: ui/settings.slint:253
+#: ui/settings.slint:261
 msgctxt "SettingsView"
 msgid "라이트"
 msgstr "Light"
 
-#: ui/settings.slint:253
+#: ui/settings.slint:261
 msgctxt "SettingsView"
 msgid "다크"
 msgstr "Dark"
 
-#: ui/settings.slint:257
+#: ui/settings.slint:265
 msgctxt "SettingsView"
 msgid "언어"
 msgstr "Language"
 
-#: ui/settings.slint:257
+#: ui/settings.slint:265
 msgctxt "SettingsView"
 msgid "시스템을 선택하면 OS 언어를 따름"
 msgstr "System follows the OS language"
 
-#: ui/settings.slint:262
+#: ui/settings.slint:270
 msgctxt "SettingsView"
 msgid "로고 색"
 msgstr "Logo color"
 
-#: ui/settings.slint:262
+#: ui/settings.slint:270
 msgctxt "SettingsView"
 msgid "작업 표시줄, 제목 표시줄, 알림에 표시되는 토끼 로고의 색. 자동을 선택하면 라이트·다크 모드를 따름"
 msgstr "The rabbit on the taskbar button, title bar and notifications. Auto follows light or dark mode"
 
-#: ui/settings.slint:263
+#: ui/settings.slint:271
 msgctxt "SettingsView"
 msgid "자동"
 msgstr "Auto"
 
-#: ui/settings.slint:263
+#: ui/settings.slint:271
 msgctxt "SettingsView"
 msgid "흰색"
 msgstr "White"
 
-#: ui/settings.slint:263
+#: ui/settings.slint:271
 msgctxt "SettingsView"
 msgid "검은색"
 msgstr "Black"
 
-#: ui/settings.slint:268
+#: ui/settings.slint:276
 msgctxt "SettingsView"
 msgid "동작"
 msgstr "Behavior"
 
-#: ui/settings.slint:270 ui/settings.slint:274
+#: ui/settings.slint:278 ui/settings.slint:282
 msgctxt "SettingsView"
 msgid "갱신 주기"
 msgstr "Refresh interval"
 
-#: ui/settings.slint:270
+#: ui/settings.slint:278
 msgctxt "SettingsView"
 msgid "사용량을 다시 확인하는 간격"
 msgstr "How often usage is checked"
 
-#: ui/settings.slint:271 ui/settings.slint:275
+#: ui/settings.slint:279 ui/settings.slint:283
 msgctxt "SettingsView"
 msgid "1분"
 msgstr "1 min"
 
-#: ui/settings.slint:271 ui/settings.slint:275
+#: ui/settings.slint:279 ui/settings.slint:283
 msgctxt "SettingsView"
 msgid "3분"
 msgstr "3 min"
 
-#: ui/settings.slint:271 ui/settings.slint:275
+#: ui/settings.slint:279 ui/settings.slint:283
 msgctxt "SettingsView"
 msgid "5분"
 msgstr "5 min"
 
-#: ui/settings.slint:271 ui/settings.slint:275
+#: ui/settings.slint:279 ui/settings.slint:283
 msgctxt "SettingsView"
 msgid "10분"
 msgstr "10 min"
 
-#: ui/settings.slint:271 ui/settings.slint:275
+#: ui/settings.slint:279 ui/settings.slint:283
 msgctxt "SettingsView"
 msgid "15분"
 msgstr "15 min"
 
-#: ui/settings.slint:281
+#: ui/settings.slint:289
 msgctxt "SettingsView"
 msgid "1분·3분은 요청이 잦아 요청 제한에 걸릴 수 있음"
 msgstr "Checking every 1 or 3 minutes may hit request limits"
 
-#: ui/settings.slint:285
+#: ui/settings.slint:293
 msgctxt "SettingsView"
 msgid "Windows 시작 시 실행"
 msgstr "Start with Windows"
 
-#: ui/settings.slint:285
+#: ui/settings.slint:293
 msgctxt "SettingsView"
 msgid "로그인 시 실행"
 msgstr "Open at login"
 
-#: ui/settings.slint:288
+#: ui/settings.slint:296
 msgctxt "SettingsView"
 msgid "데이터"
 msgstr "Data"
 
-#: ui/settings.slint:289
+#: ui/settings.slint:297
 msgctxt "SettingsView"
 msgid "설정 폴더"
 msgstr "Settings folder"
 
-#: ui/settings.slint:289
+#: ui/settings.slint:297
 msgctxt "SettingsView"
 msgid "포터블 · {}"
 msgstr "Portable · {}"
 
-#: ui/settings.slint:290 ui/settings.slint:293 ui/settings.slint:312
+#: ui/settings.slint:298 ui/settings.slint:301 ui/settings.slint:328
 msgctxt "SettingsView"
 msgid "열기"
 msgstr "Open"
 
-#: ui/settings.slint:290
+#: ui/settings.slint:298
 msgctxt "SettingsView"
 msgid "설정 폴더 열기"
 msgstr "Open settings folder"
 
-#: ui/settings.slint:292
+#: ui/settings.slint:300
 msgctxt "SettingsView"
 msgid "고급 설정 파일"
 msgstr "Advanced settings file"
 
-#: ui/settings.slint:292
+#: ui/settings.slint:300
 msgctxt "SettingsView"
 msgid "표시할 공급자, 추가 로그 폴더 등"
 msgstr "Providers to show, extra log folders and more"
 
-#: ui/settings.slint:293
+#: ui/settings.slint:301
 msgctxt "SettingsView"
 msgid "고급 설정 파일 열기"
 msgstr "Open advanced settings file"
 
-#: ui/settings.slint:295 ui/settings.slint:297
+#: ui/settings.slint:303 ui/settings.slint:305
 msgctxt "SettingsView"
 msgid "모든 설정 초기화"
 msgstr "Reset all settings"
 
-#: ui/settings.slint:295 ui/settings.slint:297
+#: ui/settings.slint:303 ui/settings.slint:305
 msgctxt "SettingsView"
 msgid "계정·로그인만 남기고 모든 설정과 알림 기준을 기본값으로 되돌림"
 msgstr "Keeps accounts and logins; resets other settings and per-graph alerts to defaults"
 
-#: ui/settings.slint:300 ui/settings.slint:302 ui/settings.slint:412
+#: ui/settings.slint:308 ui/settings.slint:310 ui/settings.slint:428
 msgctxt "SettingsView"
 msgid "종료"
 msgstr "Quit"
 
-#: ui/settings.slint:301
+#: ui/settings.slint:309
 msgctxt "SettingsView"
 msgid "usAgI 종료"
 msgstr "Quit usAgI"
 
-#: ui/settings.slint:301
+#: ui/settings.slint:309
 msgctxt "SettingsView"
 msgid "위젯과 알림 영역 아이콘 모두 닫기"
 msgstr "Closes both the widget and the notification area icon"
 
-#: ui/settings.slint:301
+#: ui/settings.slint:309
 msgctxt "SettingsView"
 msgid "메뉴 막대에서 usAgI 종료"
 msgstr "Removes usAgI from the menu bar"
 
-#: ui/settings.slint:302
+#: ui/settings.slint:310
 msgctxt "SettingsView"
 msgid "usAgI 종료 확인"
 msgstr "Quit usAgI?"
 
-#: ui/settings.slint:305
+#: ui/settings.slint:313
 msgctxt "SettingsView"
 msgid "업데이트"
 msgstr "Updates"
 
-#: ui/settings.slint:307
+#: ui/settings.slint:315
 msgctxt "SettingsView"
 msgid "업데이트 확인"
 msgstr "Check for updates"
 
-#: ui/settings.slint:309
+#: ui/settings.slint:317
 msgctxt "SettingsView"
 msgid "자동 업데이트"
 msgstr "Automatic updates"
 
-#: ui/settings.slint:309
+#: ui/settings.slint:317
 msgctxt "SettingsView"
 msgid "새 버전을 미리 받아 두고 설정 창을 닫으면 설치"
 msgstr "Installs a new version once the settings window is closed"
 
-#: ui/settings.slint:311
-msgctxt "SettingsView"
-msgid "릴리스 노트"
-msgstr "Release notes"
-
-#: ui/settings.slint:311
-msgctxt "SettingsView"
-msgid "GitHub 릴리스 페이지"
-msgstr "GitHub releases page"
-
-#: ui/settings.slint:312
-msgctxt "SettingsView"
-msgid "GitHub 릴리스 보기"
-msgstr "View GitHub releases"
-
-#: ui/settings.slint:314
+#: ui/settings.slint:320 ui/settings.slint:321
 msgctxt "SettingsView"
 msgid "변경 내용"
 msgstr "What's new"
 
-#: ui/settings.slint:316
+#: ui/settings.slint:320
+msgctxt "SettingsView"
+msgid "이 버전(v{})에서 바뀐 것"
+msgstr "What changed in this version (v{})"
+
+#: ui/settings.slint:321
+msgctxt "SettingsView"
+msgid "보기"
+msgstr "Show"
+
+#: ui/settings.slint:327
+msgctxt "SettingsView"
+msgid "릴리스 노트"
+msgstr "Release notes"
+
+#: ui/settings.slint:327
+msgctxt "SettingsView"
+msgid "GitHub 릴리스 페이지"
+msgstr "GitHub releases page"
+
+#: ui/settings.slint:328
+msgctxt "SettingsView"
+msgid "GitHub 릴리스 보기"
+msgstr "View GitHub releases"
+
+#: ui/settings.slint:330
+msgctxt "SettingsView"
+msgid "새 버전 변경 내용"
+msgstr "What's new in the update"
+
+#: ui/settings.slint:332
 msgctxt "SettingsView"
 msgid "글꼴"
 msgstr "Font"
 
-#: ui/settings.slint:321
+#: ui/settings.slint:337
 msgctxt "SettingsView"
 msgid "라이선스"
 msgstr "License"
 
-#: ui/settings.slint:330
+#: ui/settings.slint:346
 msgctxt "SettingsView"
 msgid "UI 라이브러리"
 msgstr "UI library"
 
-#: ui/settings.slint:375
+#: ui/settings.slint:391
 msgctxt "SettingsView"
 msgid "메뉴 접기"
 msgstr "Collapse menu"
 
-#: ui/settings.slint:375
+#: ui/settings.slint:391
 msgctxt "SettingsView"
 msgid "메뉴 펼치기"
 msgstr "Expand menu"
 
-#: ui/settings.slint:384
+#: ui/settings.slint:400
 msgctxt "SettingsView"
 msgid "설정"
 msgstr "Settings"
 
-#: ui/settings.slint:384
+#: ui/settings.slint:400
 msgctxt "SettingsView"
 msgid "기타"
 msgstr "More"
 
-#: ui/settings.slint:412
+#: ui/settings.slint:428
 msgctxt "SettingsView"
 msgid "삭제"
 msgstr "Delete"
@@ -608,367 +623,367 @@ msgctxt "LeadInput"
 msgid "분"
 msgstr "min"
 
-#: ui/components.slint:302 ui/components.slint:304
+#: ui/components.slint:324 ui/components.slint:326
 msgctxt "LeadTime"
 msgid "시간"
 msgstr "h"
 
-#: ui/components.slint:305
+#: ui/components.slint:327
 msgctxt "LeadTime"
 msgid "분"
 msgstr "min"
 
-#: ui/components.slint:307
+#: ui/components.slint:329
 msgctxt "LeadTime"
 msgid "분 전"
 msgstr "min before"
 
-#: ui/components.slint:331
+#: ui/components.slint:353
 msgctxt "AccountName"
 msgid "계정 이름"
 msgstr "Account name"
 
-#: ui/components.slint:355
+#: ui/components.slint:377
 msgctxt "Mark"
 msgid "{} 알림 기준"
 msgstr "{} alert threshold"
 
-#: ui/components.slint:422
+#: ui/components.slint:444
 msgctxt "AlertChip"
 msgid "알림 끄기"
 msgstr "Turn off alerts"
 
-#: ui/components.slint:422
+#: ui/components.slint:444
 msgctxt "AlertChip"
 msgid "알림 켜기"
 msgstr "Turn on alerts"
 
-#: ui/components.slint:426
+#: ui/components.slint:448
 msgctxt "AlertChip"
 msgid "{} 알림 편집"
 msgstr "Edit {} alert"
 
-#: ui/components.slint:436
+#: ui/components.slint:458
 msgctxt "AlertChip"
 msgid "{} 알림 삭제"
 msgstr "Delete {} alert"
 
-#: ui/components.slint:453
+#: ui/components.slint:475
 msgctxt "AlertChip"
 msgid "리셋 {}"
 msgstr "Reset {}"
 
-#: ui/components.slint:453
+#: ui/components.slint:475
 msgctxt "AlertChip"
 msgid "남은 양 {}%"
 msgstr "Left {}%"
 
-#: ui/components.slint:453
+#: ui/components.slint:475
 msgctxt "AlertChip"
 msgid "사용량 {}%"
 msgstr "Usage {}%"
 
-#: ui/components.slint:455
+#: ui/components.slint:477
 msgctxt "AlertChip"
 msgid "켜짐 · 기준 도달 시 알림"
 msgstr "On · alerts when reached"
 
-#: ui/components.slint:455
+#: ui/components.slint:477
 msgctxt "AlertChip"
 msgid "꺼짐 · 알림 없음"
 msgstr "Off · no alert"
 
-#: ui/components.slint:457
+#: ui/components.slint:479
 msgctxt "AlertChip"
 msgid "알림 켜기·끄기"
 msgstr "Alert on/off"
 
-#: ui/components.slint:461
+#: ui/components.slint:483
 msgctxt "AlertChip"
 msgid "알림 기준 퍼센트"
 msgstr "Alert threshold percent"
 
-#: ui/components.slint:462
+#: ui/components.slint:484
 msgctxt "AlertChip"
 msgid "% 남았을 때"
 msgstr "% left"
 
-#: ui/components.slint:462
+#: ui/components.slint:484
 msgctxt "AlertChip"
 msgid "% 사용했을 때"
 msgstr "% used"
 
-#: ui/components.slint:463
+#: ui/components.slint:485
 msgctxt "AlertChip"
 msgid "분 전"
 msgstr "min before"
 
-#: ui/components.slint:467
+#: ui/components.slint:489
 msgctxt "AlertChip"
 msgid "삭제"
 msgstr "Delete"
 
-#: ui/components.slint:470
+#: ui/components.slint:492
 msgctxt "AlertChip"
 msgid "취소"
 msgstr "Cancel"
 
-#: ui/components.slint:471
+#: ui/components.slint:493
 msgctxt "AlertChip"
 msgid "적용"
 msgstr "Apply"
 
-#: ui/components.slint:494
+#: ui/components.slint:516
 msgctxt "KindSwitch"
 msgid "사용량"
 msgstr "Usage"
 
-#: ui/components.slint:494
+#: ui/components.slint:516
 msgctxt "KindSwitch"
 msgid "리셋 전"
 msgstr "Before reset"
 
-#: ui/components.slint:534 ui/components.slint:542
+#: ui/components.slint:556 ui/components.slint:564
 msgctxt "AddAlert"
 msgid "알림 추가"
 msgstr "Add alert"
 
-#: ui/components.slint:551
+#: ui/components.slint:573
 msgctxt "AddAlert"
 msgid "{} 알림 추가"
 msgstr "Add {} alert"
 
-#: ui/components.slint:552
+#: ui/components.slint:574
 msgctxt "AddAlert"
 msgid "각 알림은 리셋 전까지 한 번만 표시"
 msgstr "Each alert is sent once per reset window"
 
-#: ui/components.slint:554
+#: ui/components.slint:576
 msgctxt "AddAlert"
 msgid "닫기"
 msgstr "Close"
 
-#: ui/components.slint:559
+#: ui/components.slint:581
 msgctxt "AddAlert"
 msgid "리셋 얼마 전에 알림을 받을지 선택"
 msgstr "Choose how long before the reset to be alerted"
 
-#: ui/components.slint:559
+#: ui/components.slint:581
 msgctxt "AddAlert"
 msgid "알림을 받을 남은 양 선택"
 msgstr "Choose the remaining level to be alerted at"
 
-#: ui/components.slint:559
+#: ui/components.slint:581
 msgctxt "AddAlert"
 msgid "알림을 받을 사용량 선택"
 msgstr "Choose the usage level to be alerted at"
 
-#: ui/components.slint:575
+#: ui/components.slint:597
 msgctxt "AddAlert"
 msgid "10분"
 msgstr "10 min"
 
-#: ui/components.slint:575
+#: ui/components.slint:597
 msgctxt "AddAlert"
 msgid "30분"
 msgstr "30m"
 
-#: ui/components.slint:575
+#: ui/components.slint:597
 msgctxt "AddAlert"
 msgid "1시간"
 msgstr "1h"
 
-#: ui/components.slint:575
+#: ui/components.slint:597
 msgctxt "AddAlert"
 msgid "3시간"
 msgstr "3h"
 
-#: ui/components.slint:584
+#: ui/components.slint:606
 msgctxt "AddAlert"
 msgid "새 알림 기준 퍼센트"
 msgstr "New alert threshold percent"
 
-#: ui/components.slint:587 ui/components.slint:593
+#: ui/components.slint:609 ui/components.slint:615
 msgctxt "AddAlert"
 msgid "추가"
 msgstr "Add"
 
-#: ui/components.slint:645
+#: ui/components.slint:667
 msgctxt "MeterCard"
 msgid "위젯"
 msgstr "Widget"
 
-#: ui/components.slint:650 ui/components.slint:713
+#: ui/components.slint:672 ui/components.slint:735
 msgctxt "MeterCard"
 msgid "남은 양"
 msgstr "Remaining"
 
-#: ui/components.slint:650 ui/components.slint:713
+#: ui/components.slint:672 ui/components.slint:735
 msgctxt "MeterCard"
 msgid "사용량"
 msgstr "Usage"
 
-#: ui/components.slint:660
+#: ui/components.slint:682
 msgctxt "MeterCard"
 msgid "% 남음"
 msgstr "% left"
 
-#: ui/components.slint:660
+#: ui/components.slint:682
 msgctxt "MeterCard"
 msgid "% 사용"
 msgstr "% used"
 
-#: ui/components.slint:696
+#: ui/components.slint:718
 msgctxt "MeterCard"
 msgid "이 그래프 알림 모두 끄기"
 msgstr "Turn off all alerts for this graph"
 
-#: ui/components.slint:696
+#: ui/components.slint:718
 msgctxt "MeterCard"
 msgid "이 그래프 알림 모두 켜기"
 msgstr "Turn on all alerts for this graph"
 
-#: ui/components.slint:713
+#: ui/components.slint:735
 msgctxt "MeterCard"
 msgid "전체 기준"
 msgstr "Default"
 
-#: ui/components.slint:761
+#: ui/components.slint:783
 msgctxt "AccountCard"
 msgid "끌어서 계정 순서 변경"
 msgstr "Drag to reorder accounts"
 
-#: ui/components.slint:765
+#: ui/components.slint:787
 msgctxt "AccountCard"
 msgid "Claude 사용량 페이지"
 msgstr "Claude usage page"
 
-#: ui/components.slint:765
+#: ui/components.slint:787
 msgctxt "AccountCard"
 msgid "ChatGPT 사용량 페이지"
 msgstr "ChatGPT usage page"
 
-#: ui/components.slint:802 ui/components.slint:803
+#: ui/components.slint:824 ui/components.slint:825
 msgctxt "AccountCard"
 msgid "사용량 페이지"
 msgstr "Usage page"
 
-#: ui/components.slint:807
+#: ui/components.slint:829
 msgctxt "AccountCard"
 msgid "위젯"
 msgstr "Widget"
 
-#: ui/components.slint:808
+#: ui/components.slint:830
 msgctxt "AccountCard"
 msgid "계정 위젯 표시"
 msgstr "Show account in widget"
 
-#: ui/components.slint:812
+#: ui/components.slint:834
 msgctxt "AccountCard"
 msgid "펼치기"
 msgstr "Expand"
 
-#: ui/components.slint:812
+#: ui/components.slint:834
 msgctxt "AccountCard"
 msgid "접기"
 msgstr "Collapse"
 
-#: ui/components.slint:816
+#: ui/components.slint:838
 msgctxt "AccountCard"
 msgid "사용량 정보 없음"
 msgstr "No usage data"
 
-#: ui/components.slint:819
+#: ui/components.slint:841
 msgctxt "AccountCard"
 msgid "리필권 만료 알림"
 msgstr "Refill expiry alerts"
 
-#: ui/components.slint:820
+#: ui/components.slint:842
 msgctxt "AccountCard"
 msgid "전체 설정과 동일"
 msgstr "Follows the general setting"
 
-#: ui/components.slint:820
+#: ui/components.slint:842
 msgctxt "AccountCard"
 msgid "이 계정은 알림 끔"
 msgstr "No alerts for this account"
 
-#: ui/components.slint:820
+#: ui/components.slint:842
 msgctxt "AccountCard"
 msgid "이 계정만 따로 설정"
 msgstr "Set for this account"
 
-#: ui/components.slint:821
+#: ui/components.slint:843
 msgctxt "AccountCard"
 msgid " · 현재 리필권 없음"
 msgstr " · No refills right now"
 
-#: ui/components.slint:822
+#: ui/components.slint:844
 msgctxt "AccountCard"
 msgid "기본값"
 msgstr "Default"
 
-#: ui/components.slint:822
+#: ui/components.slint:844
 msgctxt "AccountCard"
 msgid "켜기"
 msgstr "On"
 
-#: ui/components.slint:822
+#: ui/components.slint:844
 msgctxt "AccountCard"
 msgid "끄기"
 msgstr "Off"
 
-#: ui/components.slint:827
+#: ui/components.slint:849
 msgctxt "AccountCard"
 msgid "알림 시점"
 msgstr "Alert timing"
 
-#: ui/components.slint:827
+#: ui/components.slint:849
 msgctxt "AccountCard"
 msgid "이 계정의 리필권 만료 얼마 전에 알릴지 설정"
 msgstr "How long before this account's refills expire to alert"
 
-#: ui/components.slint:851
+#: ui/components.slint:873
 msgctxt "AccountCard"
 msgid "폴더"
 msgstr "Folder"
 
-#: ui/components.slint:853
+#: ui/components.slint:875
 msgctxt "AccountCard"
 msgid "지금 확인"
 msgstr "Check now"
 
-#: ui/components.slint:854
+#: ui/components.slint:876
 msgctxt "AccountCard"
 msgid "다시 로그인"
 msgstr "Log in again"
 
-#: ui/components.slint:854
+#: ui/components.slint:876
 msgctxt "AccountCard"
 msgid "로그인"
 msgstr "Log in"
 
-#: ui/components.slint:856
+#: ui/components.slint:878
 msgctxt "AccountCard"
 msgid "삭제"
 msgstr "Delete"
 
-#: ui/components.slint:856
+#: ui/components.slint:878
 msgctxt "AccountCard"
 msgid "{} 계정 삭제 확인"
 msgstr "Delete {} account?"
 
-#: ui/components.slint:895
+#: ui/components.slint:917
 msgctxt "AddAccount"
 msgid "계정 추가"
 msgstr "Add account"
 
-#: ui/components.slint:903
+#: ui/components.slint:925
 msgctxt "AddAccount"
 msgid "추가"
 msgstr "Add"
 
-#: ui/components.slint:916
+#: ui/components.slint:938
 msgctxt "AddAccount"
 msgid "CLI가 없으면 자동 설치"
 msgstr "Installs the CLI if missing"

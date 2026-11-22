@@ -1,9 +1,9 @@
 import { FocusOut, Theme, CenterItem, NavItem, UiButton, Segments, Toggle } from "style.slint";
 import { AboutSlint, Palette, ScrollView } from "std-widgets.slint";
-import { Account, AccountCard, Actions, AddAccount, Banner, Debug, Fold, Dropdown, Motion, LeadTime, BarLength, TextField, Caption, Group, Hint, Heading, Panel, PrefToggle, Rule, Section, SettingRow } from "components.slint";
+import { Account, AccountCard, Actions, AddAccount, Banner, Debug, Fold, NoteLine, Notes, Dropdown, Motion, LeadTime, BarLength, TextField, Caption, Group, Hint, Heading, Panel, PrefToggle, Rule, Section, SettingRow } from "components.slint";
 import "fonts/Pretendard-Medium.otf";
 import "fonts/Pretendard-SemiBold.otf";
-export { Account, Meter, AlertItem, Actions, Debug, Motion } from "components.slint";
+export { Account, Meter, AlertItem, NoteLine, Actions, Debug, Motion } from "components.slint";
 
 export struct Preferences {
     widget: bool, side: string, monitor-index: int, mode: string, theme: string, locale: string, logo: string, bar-px: int, bar-min: int, bar-max: int, bar-default: int, basis: string, refresh: int,
@@ -11,7 +11,7 @@ export struct Preferences {
     autostart: bool, auto-update: bool,
 }
 export struct UpdateInfo {
-    status: string, notes: string, install: string, busy: bool, managed: bool, failed: bool,
+    status: string, install: string, busy: bool, managed: bool, failed: bool,
 }
 export struct LoginInfo {
     id: string, provider: string, message: string, can-open: bool, accepts-code: bool, done: bool, failed: bool,
@@ -44,6 +44,9 @@ export component SettingsView inherits Window {
     in property <string> version;
     in property <string> folder;
     in property <string> font-license;
+    // 변경 내용: 이 버전(빌드에 들어 있는 CHANGELOG)과 받을 새 버전(릴리스 노트)
+    in property <[NoteLine]> version-notes;
+    in property <[NoteLine]> update-notes;
     in property <string> error;
     in property <bool> windows;
     in property <bool> portable;
@@ -52,6 +55,11 @@ export component SettingsView inherits Window {
     in-out property <length> debug-scroll;
     changed debug-scroll => { scroll.viewport-y = -root.debug-scroll; }
     private property <bool> show-font-license;
+    private property <bool> show-notes;
+    private property <float> notes-k: root.show-notes ? 1 : 0;
+    animate notes-k { duration: 280ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    private property <string> dbg: Debug.open;
+    changed dbg => { if root.dbg == "notes" { root.show-notes = true; } }
     private property <[string]> pages: [@tr("사용량"), root.windows ? @tr("위젯") : @tr("메뉴 막대"), @tr("알림"), @tr("일반"), @tr("정보")];
     private property <string> description: root.page == 1 ? (root.windows ? @tr("작업 표시줄에 사용량을 항상 표시") : @tr("메뉴 막대에 사용량을 항상 표시"))
         : root.page == 2 ? @tr("사용량이 설정한 기준에 도달하면 {} 알림 표시", root.windows ? "Windows" : "macOS")
@@ -307,11 +315,19 @@ export component SettingsView inherits Window {
                                 UiButton { text: @tr("업데이트 확인"); enabled: !root.update.busy; clicked => { Actions.command("checkUpdate"); } } }
                             if !root.update.managed: Rule {}
                             if !root.update.managed: PrefToggle { title: @tr("자동 업데이트"); subtitle: @tr("새 버전을 미리 받아 두고 설정 창을 닫으면 설치"); key: "autoUpdate"; checked: root.prefs.auto-update; }
+                            if root.version-notes.length > 0: Rule {}
+                            if root.version-notes.length > 0: VerticalLayout {
+                                SettingRow { title: @tr("변경 내용"); subtitle: @tr("이 버전(v{})에서 바뀐 것", root.version);
+                                    UiButton { text: root.show-notes ? @tr("닫기") : @tr("보기"); label: @tr("변경 내용");
+                                        clicked => { root.show-notes = !root.show-notes; } }
+                                }
+                                Fold { k: root.notes-k; gap: 14px; Notes { lines: root.version-notes; } }
+                            }
                             Rule {}
                             SettingRow { title: @tr("릴리스 노트"); subtitle: @tr("GitHub 릴리스 페이지");
                                 UiButton { text: @tr("열기"); label: @tr("GitHub 릴리스 보기"); clicked => { Actions.command("openRelease"); } } }
                         }
-                        if root.page == 4 && root.update.notes != "": Group { title: @tr("변경 내용"); Caption { text: root.update.notes; } }
+                        if root.page == 4 && root.update-notes.length > 0: Group { title: @tr("새 버전 변경 내용"); Notes { lines: root.update-notes; } }
                         if root.page == 4: Group {
                             title: @tr("글꼴");
                             VerticalLayout {
