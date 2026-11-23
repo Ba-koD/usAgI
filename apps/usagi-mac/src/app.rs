@@ -214,7 +214,7 @@ impl App {
                     }
                 }
                 // 위젯 위치·모니터·중요 알림은 Windows 전용
-                Effect::PlatformPref(_) => {}
+                Effect::PlatformPref(_) | Effect::WidgetBarLength => {}
                 Effect::Open(target) => open(&target),
                 Effect::OpenText(path) => {
                     let _ = Command::new("/usr/bin/open").arg("-t").arg(path).spawn();

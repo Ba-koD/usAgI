@@ -6233,7 +6233,7 @@ dependencies = [
 
 [[package]]
 name = "usagi-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "jiff",
  "memchr",
@@ -6250,7 +6250,7 @@ dependencies = [
 
 [[package]]
 name = "usagi-mac"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "block2 0.6.2",
  "objc2 0.6.5",
@@ -6268,7 +6268,7 @@ dependencies = [
 
 [[package]]
 name = "usagi-settings"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde_json",
  "slint",
@@ -6279,7 +6279,7 @@ dependencies = [
 
 [[package]]
 name = "usagi-sign"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "minisign",
  "usagi-core",
@@ -6287,7 +6287,7 @@ dependencies = [
 
 [[package]]
 name = "usagi-win"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "embed-resource",
  "serde_json",

@@ -33,6 +33,7 @@ fn wire_actions(view: &SettingsView) {
     });
     actions.on_command(|cmd| send(json!({"cmd":cmd.as_str()})));
     actions.on_reset_page(|scope| send(json!({"cmd":"resetPrefs","scope":scope.as_str()})));
+    actions.on_widget_bar_preview(|px, active| send(json!({"cmd":"widgetBarLength","value":active.then_some(px)})));
     let weak = view.as_weak();
     actions.on_pref(move |key, value| {
         let key = key.as_str();
@@ -60,7 +61,8 @@ fn wire_actions(view: &SettingsView) {
     actions.on_account(move |cmd, id, value| {
         let (cmd, id, value) = (cmd.as_str(), id.as_str(), value.as_str());
         let message = match cmd {
-            "addNew" | "openUsage" => json!({"cmd":cmd,"provider":id}),
+            "addNew" => json!({"cmd":cmd,"provider":id,"preferExisting":value=="preferExisting"}),
+            "openUsage" => json!({"cmd":cmd,"provider":id}),
             "loginCode" => json!({"cmd":cmd,"code":value}),
             "label" => json!({"cmd":"account","id":id,"field":cmd,"value":value}),
             "show" => json!({"cmd":"account","id":id,"field":cmd,"value":value=="true"}),
@@ -145,6 +147,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                             w.set_minimized(false);
                             w.focus_window();
                         });
+                    } else if let Some(preview) = message.get("widgetPreviewOnly") {
+                        view_state::apply_widget_preview(&view, preview);
                     } else if message.is_object() {
                         // 언어: 영어면 번역 묶음, 한국어면 원문 ("")
                         let lang = if message["lang"] == "en" { usagi_core::i18n::Lang::En } else { usagi_core::i18n::Lang::Ko };

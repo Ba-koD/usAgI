@@ -1043,6 +1043,16 @@ msgctxt "AddAccount"
 msgid "추가"
 msgstr "Add"
 
+#: ui/components.slint
+msgctxt "AddAccount"
+msgid "새 로그인"
+msgstr "New sign-in"
+
+#: ui/components.slint
+msgctxt "AddAccount"
+msgid "기존 로그인 우선"
+msgstr "Prefer existing"
+
 #: ui/components.slint:991
 msgctxt "AddAccount"
 msgid "CLI가 없으면 설치 안내"

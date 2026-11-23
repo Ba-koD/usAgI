@@ -212,8 +212,8 @@ export component SettingsView inherits Window {
                             Hint { text: @tr("기존 로그인을 확인하고, CLI가 필요하면 설치 안내 표시"); horizontal-alignment: center; }
                             Rectangle { height: 6px; }
                             HorizontalLayout { alignment: center; spacing: Theme.gap-s;
-                                UiButton { text: "Claude"; icon: @image-url("icons/claude.svg"); icon-colored: true; icon-color: #d97757; clicked => { Actions.account("addNew", "claude", ""); } }
-                                UiButton { text: "ChatGPT · Codex"; icon: @image-url("icons/codex.svg"); icon-colored: true; icon-color: Theme.ink; clicked => { Actions.account("addNew", "codex", ""); } }
+                                UiButton { text: "Claude"; icon: @image-url("icons/claude.svg"); icon-colored: true; icon-color: #d97757; clicked => { Actions.account("addNew", "claude", "preferExisting"); } }
+                                UiButton { text: "ChatGPT · Codex"; icon: @image-url("icons/codex.svg"); icon-colored: true; icon-color: Theme.ink; clicked => { Actions.account("addNew", "codex", "preferExisting"); } }
                             }
                         }
                         if root.page == 2: Group {
@@ -292,6 +292,7 @@ export component SettingsView inherits Window {
                                     SettingRow { title: @tr("막대 길이"); subtitle: @tr("남은 시간 모드에서 적용 · 기본 {}px", root.prefs.bar-default);
                                         BarLength {
                                             value: root.prefs.bar-px; minimum: root.prefs.bar-min; maximum: root.prefs.bar-max; small: root.small;
+                                            preview(v, active) => { Actions.widget-bar-preview(v, active); }
                                             commit(v) => { Actions.pref("barPx", "" + v); }
                                         }
                                     }

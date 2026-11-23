@@ -73,6 +73,7 @@ export component RangeSlider inherits Rectangle {
     in property <float> minimum;
     in property <float> maximum: 100;
     in property <string> label;
+    out property <bool> dragging: drag.pressed;
     callback moved(float);
     callback released(float);
     height: 24px;
@@ -92,7 +93,7 @@ export component RangeSlider inherits Rectangle {
         border-radius: root.knob / 2; background: #ffffff; border-width: 1px; border-color: Theme.line2;
         drop-shadow-blur: 4px; drop-shadow-offset-y: 1px; drop-shadow-color: #00000040;
     }
-    TouchArea {
+    drag := TouchArea {
         mouse-cursor: pointer;
         moved => { if self.pressed { root.set-from(self.mouse-x); } }
         changed pressed => { if self.pressed { root.set-from(self.mouse-x); } else { root.released(root.value); } }
@@ -122,14 +123,30 @@ export component BarLength inherits HorizontalLayout {
     in property <int> minimum;
     in property <int> maximum;
     in property <bool> small;
+    callback preview(int, bool);
     callback commit(int);
+    private property <int> last-preview: root.value;
     spacing: 8px;
-    changed value => { slider.value = root.value; px.value = root.value; }
+    changed value => { slider.value = root.value; px.value = root.value; root.last-preview = root.value; }
+    // 같은 픽셀은 다시 보내지 않고, 길이를 끄는 동안에만 최대 한 프레임에 한 번 보냄.
+    Timer { interval: 20ms; running: slider.dragging;
+        triggered => {
+            if px.value != root.last-preview {
+                root.last-preview = px.value;
+                root.preview(px.value, true);
+            }
+        }
+    }
     CenterItem { slider := RangeSlider {
         width: root.small ? 110px : 170px; minimum: root.minimum; maximum: root.maximum; value: root.value;
         label: @tr("위젯 막대 길이");
         moved(v) => { px.value = round(v); }
-        released(v) => { px.value = round(v); if round(v) != root.value { root.commit(round(v)); } }
+        released(v) => {
+            px.value = round(v);
+            root.last-preview = root.value;
+            if px.value != root.value { root.commit(px.value); }
+            else { root.preview(px.value, false); }
+        }
     } }
     CenterItem { px := Stepper {
         minimum: root.minimum; maximum: root.maximum; value: root.value; field-width: 44px; label: @tr("위젯 막대 길이");
@@ -202,6 +219,7 @@ export global Actions {
     // 계정별 리필권 만료 알림 (계정 id, default|on|off, 만료 몇 분 전)
     callback refill(string, string, int);
     callback pref(string, string);
+    callback widget-bar-preview(int, bool);
     pure callback drag-payload(string) -> data-transfer;
     pure callback dragged-account(data-transfer) -> string;
     pure callback has-threshold([int], int) -> bool;
@@ -1089,26 +1107,30 @@ export component Dropdown inherits ClickTarget {
 // 계정 추가 단추와 공급자 고르기 메뉴
 export component AddAccount inherits ClickTarget {
     private property <string> dbg: Debug.open;
+    private property <int> sign-in-mode;
+    private property <string> add-mode: root.sign-in-mode == 1 ? "preferExisting" : "";
     changed dbg => { if root.dbg == "providers" { providers.show(); } }
     label: @tr("계정 추가");
     height: 28px; border-radius: 14px; border-width: 1px;
     border-color: root.focused ? Theme.accent : Theme.line; background: root.hovered ? Theme.track : Theme.selected;
     opacity: root.enabled ? 1 : 0.45;
     animate background { duration: 120ms; }
-    clicked => { providers.show(); }
+    clicked => { root.sign-in-mode = 0; providers.show(); }
     HorizontalLayout { padding-left: 9px; padding-right: 12px; spacing: 5px;
         CenterItem { Image { width: 14px; height: 14px; source: @image-url("icons/plus.svg"); colorize: Theme.ink; } }
         Text { text: @tr("추가"); font-size: Theme.size-small; vertical-alignment: center; color: Theme.ink; accessible-role: none; }
     }
     providers := PopupWindow {
-        close-policy: close-on-click-outside; y: parent.height + 6px; width: 240px; height: provider-content.preferred-height;
+        close-policy: close-on-click-outside; y: parent.height + 6px; width: 252px; height: provider-content.preferred-height;
         PopupFrame {
             dismiss => { providers.close(); }
             provider-content := VerticalLayout { padding: 6px; spacing: 2px;
+                Segments { options: [@tr("새 로그인"), @tr("기존 로그인 우선")]; index: root.sign-in-mode;
+                    selected(i) => { root.sign-in-mode = i; } }
                 UiButton { text: "Claude"; icon: @image-url("icons/claude.svg"); icon-colored: true; icon-color: #d97757; ghost: true; border-width: 0px; start: true;
-                    clicked => { Actions.account("addNew", "claude", ""); providers.close(); } }
+                    clicked => { Actions.account("addNew", "claude", root.add-mode); providers.close(); } }
                 UiButton { text: "ChatGPT · Codex"; icon: @image-url("icons/codex.svg"); icon-colored: true; icon-color: Theme.ink; ghost: true; border-width: 0px; start: true;
-                    clicked => { Actions.account("addNew", "codex", ""); providers.close(); } }
+                    clicked => { Actions.account("addNew", "codex", root.add-mode); providers.close(); } }
                 Rectangle { height: 5px; }
                 Rule {}
                 Rectangle { height: provider-hint.preferred-height + 12px;

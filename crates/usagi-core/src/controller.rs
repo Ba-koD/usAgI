@@ -40,6 +40,8 @@ pub enum Effect {
     Push,
     /// 위젯·메뉴 막대 다시 그리기 (표시 설정·계정이 바뀜)
     Redraw,
+    /// 저장 전 막대 길이로 Windows 위젯과 설정 미리 보기 갱신
+    WidgetBarLength,
     /// 플랫폼 전용 표시 설정이 바뀜 (값은 이미 저장됨): "widget", "side", "monitor", "urgent"
     PlatformPref(String),
     /// https 주소나 폴더를 기본 앱으로 열기
@@ -126,6 +128,7 @@ pub struct Controller {
     next_update_check: f64,
     settings_open: bool,
     widget_preview_open: bool,
+    widget_bar_draft: Option<f64>,
 }
 
 impl Controller {
@@ -155,6 +158,7 @@ impl Controller {
             next_update_check: time::now() + UPDATE_FIRST_SECS,
             settings_open: false,
             widget_preview_open: false,
+            widget_bar_draft: None,
         }
     }
 
@@ -306,11 +310,23 @@ impl Controller {
         self.widget_preview_open
     }
 
+    pub fn widget_bar_px(&self) -> Option<f64> {
+        self.widget_bar_draft.or_else(|| self.state().pref_f64("barPx"))
+    }
+
+    fn preview_widget_bar_length(&mut self, value: Option<f64>) -> Vec<Effect> {
+        let previous = self.widget_bar_px();
+        self.widget_bar_draft = value;
+        if previous == self.widget_bar_px() { Vec::new() } else { vec![Effect::WidgetBarLength] }
+    }
+
     /// 설정 창을 닫음 → 받아 둔 업데이트가 있으면 이제 적용
     pub fn settings_closed(&mut self) -> Vec<Effect> {
         self.settings_open = false;
         self.widget_preview_open = false;
-        self.apply_staged_when_ready(false).into_iter().collect()
+        let mut effects = self.preview_widget_bar_length(None);
+        effects.extend(self.apply_staged_when_ready(false));
+        effects
     }
 
     /// 모든 계정 다시 확인 (메뉴의 "지금 새로고침")
@@ -422,7 +438,23 @@ impl Controller {
         let cmd = msg.get("cmd").and_then(|c| c.as_str()).unwrap_or("").to_string();
         if cmd == "widgetPreview" {
             self.widget_preview_open = msg["visible"].as_bool().unwrap_or(false);
-            return vec![Effect::Push];
+            let mut effects = if self.widget_preview_open { Vec::new() } else { self.preview_widget_bar_length(None) };
+            effects.push(Effect::Push);
+            return effects;
+        }
+        if cmd == "widgetBarLength" {
+            if self.platform.name == "windows" && self.widget_preview_open {
+                match msg.get("value") {
+                    Some(Value::Null) => return self.preview_widget_bar_length(None),
+                    Some(value) => {
+                        if let Some(px) = bar_pixels(value) {
+                            return self.preview_widget_bar_length(Some(px));
+                        }
+                    }
+                    None => {}
+                }
+            }
+            return Vec::new();
         }
         let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let provider = msg.get("provider").and_then(|p| p.as_str()).unwrap_or("").to_string();
@@ -471,11 +503,14 @@ impl Controller {
                 self.save_settings(previous);
             }
             "login" => self.login_account(&id),
-            "addNew" => match provider.as_str() {
-                "claude" => self.connect("claude", None),
-                "codex" => self.connect("codex", None),
-                _ => {}
-            },
+            "addNew" => {
+                let prefer_existing = msg["preferExisting"].as_bool().unwrap_or(false);
+                match provider.as_str() {
+                    "claude" => self.connect("claude", None, prefer_existing),
+                    "codex" => self.connect("codex", None, prefer_existing),
+                    _ => {}
+                }
+            }
             "openInstall" => {
                 match self.install_help.as_deref() {
                     Some("claude") => fx.push(Effect::Open("https://code.claude.com/docs/en/setup#install-claude-code".into())),
@@ -593,11 +628,12 @@ impl Controller {
 
     /// 설정 하나 바꾸기 (값 확인 후 저장)
     pub fn set_pref(&mut self, key: &str, value: Value) -> Vec<Effect> {
+        let had_bar_draft = key == "barPx" && self.widget_bar_draft.take().is_some();
         let previous = self.notices.state.clone();
         let effects = self.set_pref_inner(key, value);
         if self.notices.state.0 != previous.0 {
             if !self.save_settings(previous) {
-                return vec![Effect::Push];
+                return if had_bar_draft { vec![Effect::WidgetBarLength, Effect::Push] } else { vec![Effect::Push] };
             }
             if matches!(key, "refresh" | "poll") {
                 self.engine.refresh();
@@ -624,8 +660,8 @@ impl Controller {
             }
             // 위젯 막대 길이 (논리 px, 남은 시간 표시일 때의 길이). "default"·null이면 기본(예전 고정 길이)으로
             "barPx" => {
-                match value.as_f64().filter(|v| v.is_finite()) {
-                    Some(v) => st.set_pref(key, json!(v.round().clamp(1.0, 400.0))),
+                match bar_pixels(&value) {
+                    Some(v) => st.set_pref(key, json!(v)),
                     None => {
                         if let Some(p) = st.0.get_mut("prefs").and_then(|p| p.as_object_mut()) {
                             p.remove(key);
@@ -753,12 +789,12 @@ impl Controller {
         }
     }
 
-    fn connect(&mut self, provider: &'static str, id: Option<String>) {
+    fn connect(&mut self, provider: &'static str, id: Option<String>, prefer_existing: bool) {
         self.cancel_connection();
         if self.pending_new.as_ref().is_some_and(|a| Some(a.id.as_str()) != id.as_deref()) {
             self.drop_unfinished_new();
         }
-        match Connection::start(provider, id, &accounts::load(&self.notices.state)) {
+        match Connection::start(provider, id, &accounts::load(&self.notices.state), prefer_existing) {
             Ok(connection) => self.connecting = Some(connection),
             Err(e) => self.set_error(crate::tr!(format!("계정 연결 준비 실패: {e}"), format!("Failed to prepare the account connection: {e}"))),
         }
@@ -888,8 +924,8 @@ impl Controller {
     pub fn login_account(&mut self, id: &str) {
         if let Some(acc) = accounts::load(&self.notices.state).into_iter().chain(self.pending_new.clone()).find(|a| a.id == id) {
             match acc.provider.as_str() {
-                "claude" => self.connect("claude", Some(id.into())),
-                "codex" => self.connect("codex", Some(id.into())),
+                "claude" => self.connect("claude", Some(id.into()), false),
+                "codex" => self.connect("codex", Some(id.into()), false),
                 _ => {}
             }
         }
@@ -1158,6 +1194,7 @@ impl Controller {
         st.0.remove("alerts");
         st.0.remove("refill_rules");
         if !self.save_settings(previous) { return vec![Effect::Push]; }
+        self.widget_bar_draft = None;
         crate::i18n::set(crate::i18n::resolve("system"));
         self.engine.refresh();
         // 위젯(표시·위치·모니터·막대), 로고 색, 언어를 플랫폼이 다시 맞춤
@@ -1194,7 +1231,10 @@ impl Controller {
         }
         if !self.save_settings(previous) { return vec![Effect::Push]; }
         let mut fx = match scope {
-            "widget" => vec![Effect::PlatformPref("widget".into())],
+            "widget" => {
+                self.widget_bar_draft = None;
+                vec![Effect::PlatformPref("widget".into())]
+            }
             "alerts" => vec![Effect::PlatformPref("urgent".into())],
             _ => {
                 crate::i18n::set(crate::i18n::resolve("system"));
@@ -1307,6 +1347,10 @@ impl Controller {
         self.update.error = Some(e);
         vec![Effect::Push]
     }
+}
+
+fn bar_pixels(value: &Value) -> Option<f64> {
+    value.as_f64().filter(|v| v.is_finite()).map(|v| v.round().clamp(1.0, 400.0))
 }
 
 fn account_save_error(error: &std::io::Error) -> String {
@@ -1743,6 +1787,27 @@ mod tests {
     }
 
     #[test]
+    fn bar_length_drag_applies_before_commit_and_clears_when_settings_close() {
+        let mut c = ctl("windows", None);
+        c.settings_opened();
+        ipc(&mut c, json!({"cmd":"widgetPreview","visible":true}));
+        let drag = json!({"cmd":"widgetBarLength","value":140});
+        assert_eq!(ipc(&mut c, drag.clone()), vec![Effect::WidgetBarLength]);
+        assert_eq!(c.widget_bar_px(), Some(140.0));
+        assert_eq!(c.state().pref_f64("barPx"), None);
+        assert!(ipc(&mut c, drag).is_empty());
+
+        ipc(&mut c, json!({"cmd":"pref","key":"barPx","value":160}));
+        assert_eq!(c.widget_bar_px(), Some(160.0));
+        assert_eq!(c.state().pref_f64("barPx"), Some(160.0));
+        ipc(&mut c, json!({"cmd":"widgetBarLength","value":200}));
+        assert_eq!(c.widget_bar_px(), Some(200.0));
+        assert_eq!(c.settings_closed(), vec![Effect::WidgetBarLength]);
+        assert_eq!(c.widget_bar_px(), Some(160.0));
+        assert!(ipc(&mut c, json!({"cmd":"widgetBarLength","value":220})).is_empty());
+    }
+
+    #[test]
     fn logo_color_can_be_fixed() {
         let mut c = ctl("windows", None);
         let host = HostInfo::default();
@@ -1777,6 +1842,82 @@ mod tests {
         ipc(&mut c, json!({"cmd":"addNew","provider":"other"}));
         assert!(!c.busy());
         assert!(accounts::load(c.state()).is_empty());
+    }
+
+    #[test]
+    fn new_sign_in_uses_a_separate_profile_even_with_a_valid_default_login() {
+        const FIXTURE: &str = "USAGI_TEST_NEW_ACCOUNT_CLI";
+        if let Some(program) = std::env::var_os(FIXTURE) {
+            login::remember_program("codex", PathBuf::from(program));
+            let default = accounts::default_codex_dir().unwrap();
+            let mut c = ctl("test", None);
+            let wait_for_accounts = |c: &mut Controller, count| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                loop {
+                    c.tick();
+                    let accounts = accounts::load(c.state());
+                    if accounts.len() == count {
+                        return accounts;
+                    }
+                    assert!(
+                        c.error().is_none() && std::time::Instant::now() < deadline,
+                        "connection error: {:?}, login: {}",
+                        c.error(),
+                        c.settings_state(&HostInfo::default())["login"],
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            };
+
+            ipc(&mut c, json!({"cmd":"addNew","provider":"codex"}));
+            let added = wait_for_accounts(&mut c, 1);
+            assert!(accounts::is_managed(&added[0]));
+            let new_login = login::file_status("codex", &added[0].path()).unwrap();
+            assert_eq!(new_login.organization_id.as_deref(), Some("new-account"));
+
+            ipc(&mut c, json!({"cmd":"addNew","provider":"codex","preferExisting":true}));
+            let added = wait_for_accounts(&mut c, 2);
+            assert!(login::same_dir(&added[1].path(), Some(default)));
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let default = fixture.path().join("default");
+        std::fs::create_dir(&default).unwrap();
+        let new_auth = fixture.path().join("new-account.json");
+        let claims = format!(r#"{{"exp":{:.0}}}"#, time::now() + 3600.0);
+        let payload = crate::b64::encode(claims.as_bytes());
+        let token = format!("header.{}.signature", payload.trim_end_matches('='));
+        for (auth, workspace) in [(default.join("auth.json"), "old-account"), (new_auth.clone(), "new-account")] {
+            std::fs::write(auth, json!({"auth_mode":"chatgpt","tokens":{"access_token":token,"account_id":workspace}}).to_string()).unwrap();
+        }
+        #[cfg(windows)]
+        let (filename, script) = ("codex.cmd", concat!(
+            "@echo off\r\n",
+            "if \"%1\"==\"--version\" (echo codex-cli fixture& exit /b 0)\r\n",
+            "if \"%1\"==\"login\" copy /y \"%USAGI_TEST_NEW_ACCOUNT_AUTH%\" \"%CODEX_HOME%\\auth.json\" >nul\r\n",
+        ));
+        #[cfg(unix)]
+        let (filename, script) = ("codex", concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = --version ]; then echo 'codex-cli fixture'; exit 0; fi\n",
+            "[ \"$1\" = login ] && cp \"$USAGI_TEST_NEW_ACCOUNT_AUTH\" \"$CODEX_HOME/auth.json\"\n",
+        ));
+        let program = fixture.path().join(filename);
+        std::fs::write(&program, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "controller::tests::new_sign_in_uses_a_separate_profile_even_with_a_valid_default_login", "--nocapture"])
+            .env(FIXTURE, program)
+            .env("CODEX_HOME", default)
+            .env("USAGI_TEST_NEW_ACCOUNT_AUTH", new_auth)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
     }
 
     #[test]

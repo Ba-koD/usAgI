@@ -376,7 +376,9 @@ impl Widget {
         self.label_cols = self.measure_labels(&content, scale);
         self.note_w = self.measure_notes(&content, scale);
         self.short_col = self.measure_col(content.sections.iter().flat_map(|s| s.rows.iter().map(|r| r.shown(true))), scale);
-        self.col_w = self.full_col_width(scale);
+        let full_width = self.full_col_width(scale);
+        let full_width_changed = full_width != self.col_w;
+        self.col_w = full_width;
         // 좁은 모양은 글자 너비에, 넓은 모양은 막대 길이 설정에 맞추므로 너비가 바뀌면 창 크기도 다시
         let resize = self.place.is_some_and(|p| (self.width_for(&content, p.fit) * p.scale).round() as i32 != p.w);
         self.easing = easing;
@@ -400,7 +402,7 @@ impl Widget {
                 || c.sections.iter().zip(&content.sections).any(|(a, b)| columns(a.rows.len()) != columns(b.rows.len()) || a.note != b.note)
         });
         self.content = Some(content);
-        if structure_changed || resize {
+        if structure_changed || resize || full_width_changed {
             self.reposition();
         } else {
             self.paint();

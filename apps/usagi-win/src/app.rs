@@ -162,7 +162,7 @@ impl App {
             }
         }
         let (on, side) = (self.widget_on(), self.side());
-        let bar = self.ctl.state().pref_f64("barPx").map(|v| v as f32);
+        let bar = self.ctl.widget_bar_px().map(|v| v as f32);
         let bars = self.ctl.state().pref_bool("bars", true);
         for w in &mut self.widgets {
             w.enabled = on;
@@ -178,6 +178,13 @@ impl App {
     fn reposition_widgets(&mut self) {
         for w in &mut self.widgets {
             w.reposition();
+        }
+    }
+
+    fn sync_bar_length(&mut self) {
+        let bar = self.ctl.widget_bar_px().map(|v| v as f32);
+        for widget in &mut self.widgets {
+            widget.bar_px = bar;
         }
     }
 
@@ -241,7 +248,7 @@ impl App {
             return None;
         }
         let bars = self.ctl.state().pref_bool("bars", true);
-        let bar_px = self.ctl.state().pref_f64("barPx").map(|v| v as f32);
+        let bar_px = self.ctl.widget_bar_px().map(|v| v as f32);
         let scale = win::taskbar_dpi() as f32 / 96.0;
         let light = win::taskbar_is_light();
         let content = Content { sections, rabbit: None, ink: self.ink, time_mode: self.mode() == ValueMode::Remaining };
@@ -317,8 +324,19 @@ impl App {
             match e {
                 Effect::Push => push = true,
                 Effect::Redraw => self.redraw(),
+                Effect::WidgetBarLength => {
+                    self.sync_bar_length();
+                    self.redraw();
+                    if let Some(settings) = &self.settings {
+                        if let Some(preview) = self.widget_preview().filter(|p| !p["keep"].as_bool().unwrap_or(false)) {
+                            settings.push(json!({ "widgetPreviewOnly": preview }).to_string());
+                        }
+                    }
+                }
                 Effect::PlatformPref(key) => {
-                    if matches!(key.as_str(), "widget" | "side" | "monitor" | "barPx" | "bars") {
+                    if key == "barPx" {
+                        self.sync_bar_length();
+                    } else if matches!(key.as_str(), "widget" | "side" | "monitor" | "bars") {
                         self.sync_widgets();
                     }
                     if key == "logo" {

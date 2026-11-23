@@ -417,8 +417,26 @@ pub fn apply(view: &SettingsView, state: &Value) {
             }
         }
     }
-    // 위젯 미리 보기 (Windows 호스트가 그려 보낸 그림). {keep}이면 그대로 두고, 없으면 비움
-    match &state["widgetPreview"] {
+    apply_widget_preview(view, &state["widgetPreview"]);
+    view.set_update(update(&state["update"]));
+    view.set_update_notes(rows(view.get_update_notes(), note_lines(text(&state["update"], "notes"))));
+    // 이 버전의 변경 내용 (빌드에 들어 있는 CHANGELOG). 한 번만 채움
+    if view.get_version_notes().row_count() == 0 {
+        if let Some(section) = usagi_core::changelog::section(usagi_core::VERSION) {
+            view.set_version_notes(ModelRc::new(VecModel::from(note_lines(section))));
+        }
+    }
+    view.set_error(text(state, "error").into());
+    view.set_install_help(text(state, "installHelp").into());
+    view.set_windows(text(state, "platform") == "windows");
+    view.set_version(text(state, "version").into());
+    view.set_folder(text(state, "dataDir").into());
+    view.set_portable(flag(state, "portable"));
+}
+
+/// Windows 호스트가 그려 보낸 위젯 그림. {keep}이면 그대로 두고, 없으면 비움.
+pub fn apply_widget_preview(view: &SettingsView, preview: &Value) {
+    match preview {
         Value::Object(p) if p.contains_key("rgba") => {
             let (w, h) = (p["w"].as_u64().unwrap_or(0) as u32, p["h"].as_u64().unwrap_or(0) as u32);
             let scale = p["scale"].as_f64().filter(|s| *s > 0.0).unwrap_or(1.0) as f32;
@@ -441,18 +459,4 @@ pub fn apply(view: &SettingsView, state: &Value) {
             }
         }
     }
-    view.set_update(update(&state["update"]));
-    view.set_update_notes(rows(view.get_update_notes(), note_lines(text(&state["update"], "notes"))));
-    // 이 버전의 변경 내용 (빌드에 들어 있는 CHANGELOG). 한 번만 채움
-    if view.get_version_notes().row_count() == 0 {
-        if let Some(section) = usagi_core::changelog::section(usagi_core::VERSION) {
-            view.set_version_notes(ModelRc::new(VecModel::from(note_lines(section))));
-        }
-    }
-    view.set_error(text(state, "error").into());
-    view.set_install_help(text(state, "installHelp").into());
-    view.set_windows(text(state, "platform") == "windows");
-    view.set_version(text(state, "version").into());
-    view.set_folder(text(state, "dataDir").into());
-    view.set_portable(flag(state, "portable"));
 }

@@ -47,11 +47,12 @@ impl Connection {
         provider: &'static str,
         account_id: Option<String>,
         existing: &[accounts::Account],
+        prefer_existing: bool,
     ) -> std::io::Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, result) = mpsc::channel();
         let worker_cancel = cancel.clone();
-        let default_profile = if account_id.is_none() {
+        let default_profile = if prefer_existing && account_id.is_none() {
             match provider {
                 "claude" => accounts::default_claude_dir(),
                 _ => accounts::default_codex_dir(),
