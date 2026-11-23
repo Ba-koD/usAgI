@@ -1,9 +1,9 @@
 //! 설정 화면에 보낼 계정 정보와, 플랫폼에 상관없는 설정 변경.
 //! Windows·macOS 앱이 같이 써서 화면에 보이는 값이 같음.
 
-use crate::accounts::{self, Account, Link};
+use crate::accounts::{self, Account};
 use crate::config::State;
-use crate::engine::{alert_key, alert_set, lead_in_range, pct_in_range, AlertSet, Snapshot};
+use crate::engine::{alert_key, alert_set, lead_in_range, pct_in_range, reset_lead_max, AlertSet, Snapshot};
 use crate::login::LoginSession;
 use crate::{codex, texts};
 use serde_json::{json, Value};
@@ -62,15 +62,6 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
                         }) }
                 })
             });
-            let (link, note) = if a.is_claude() {
-                match accounts::link_state(a) {
-                    Link::Linked => ("linked", String::new()),
-                    Link::NotLinked => ("not_linked", String::new()),
-                    Link::Missing(e) => ("missing", e),
-                }
-            } else {
-                ("n/a", String::new())
-            };
             let login = json!({
                 "state": match login_info.and_then(|l| l.logged_in) { Some(true) => "in", Some(false) => "out", None => "unknown" },
                 "email": login_info.and_then(|l| l.email.clone()),
@@ -156,7 +147,6 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
                 })),
                 "managed": accounts::is_managed(a),
                 "name": view.map(|v| v.name.clone()).unwrap_or_else(|| if a.is_claude() { "Claude".into() } else { "Codex".into() }),
-                "link": link, "linkNote": note,
                 "exact": view.is_some_and(|v| v.meters.iter().any(|m| m.exact)),
                 "note": view.and_then(|v| v.note.clone()),
                 "forecast": view.and_then(|v| v.forecast.clone()),
@@ -203,11 +193,11 @@ impl AlertKind {
         }
     }
 
-    /// 받는 값 범위: 1~99% / 리셋 1분~7일 전
-    fn valid(self, v: f64) -> bool {
+    /// 받는 값 범위: 1~99% / 리셋 1분~해당 그래프 주기 전
+    fn valid(self, v: f64, key: &str) -> bool {
         match self {
             Self::Pct => pct_in_range(v),
-            Self::Reset => lead_in_range(v),
+            Self::Reset => lead_in_range(v, reset_lead_max(key)),
         }
     }
 
@@ -258,7 +248,7 @@ pub fn apply_meter_ipc(state: &mut State, cmd: &str, msg: &Value) -> bool {
             let Some(kind) = AlertKind::of(msg) else { return true };
             let mut set = alert_set(state, &key);
             let old = msg.get("old").and_then(|v| v.as_f64());
-            let new = msg.get("new").and_then(|v| v.as_f64()).map(f64::round).filter(|&v| kind.valid(v));
+            let new = msg.get("new").and_then(|v| v.as_f64()).map(f64::round).filter(|&v| kind.valid(v, &key));
             let (en, off) = kind.lists(&mut set);
             // 이미 있는 값(켜짐·꺼짐 어느 쪽이든)으로는 추가·바꾸기 안 함
             let new = new.filter(|v| !en.contains(v) && !off.contains(v));

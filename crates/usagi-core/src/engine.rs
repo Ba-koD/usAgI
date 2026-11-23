@@ -290,8 +290,20 @@ pub fn alert_key(account_id: &str, label: &str) -> String {
     format!("{account_id}:{label}")
 }
 
-/// 리셋 임박 알림 시점 범위 (리셋 1분 ~ 7일 전)
-pub const MAX_RESET_LEAD_MIN: f64 = 7.0 * 24.0 * 60.0;
+/// 리셋 임박 알림 시점의 전체 상한 (7일)
+pub const MAX_RESET_LEAD_MIN: u32 = 7 * 24 * 60;
+
+/// 저장 키의 라벨은 번역 전의 그래프 주기 (5시간, 주간, Fable 주간 등).
+pub fn reset_lead_max(key: &str) -> u32 {
+    let label = key.split_once(':').map_or("", |(_, label)| label);
+    [("분", 1), ("시간", 60), ("일", 1440)]
+        .into_iter()
+        .find_map(|(unit, scale)| {
+            let count = label.strip_suffix(unit)?.parse::<u32>().ok()?;
+            Some(count.saturating_mul(scale).min(MAX_RESET_LEAD_MIN))
+        })
+        .unwrap_or(MAX_RESET_LEAD_MIN)
+}
 
 /// 사용량 기준 범위 (%)
 pub fn pct_in_range(v: f64) -> bool {
@@ -299,8 +311,8 @@ pub fn pct_in_range(v: f64) -> bool {
 }
 
 /// 리셋 임박 시점 범위 (리셋 몇 분 전)
-pub fn lead_in_range(v: f64) -> bool {
-    (1.0..=MAX_RESET_LEAD_MIN).contains(&v)
+pub fn lead_in_range(v: f64, maximum: u32) -> bool {
+    (1.0..=f64::from(maximum)).contains(&v)
 }
 
 /// 그래프 하나의 알림 설정.
@@ -321,7 +333,7 @@ pub struct AlertSet {
 }
 
 /// 알림 목록 하나: 숫자 배열 (예전 형식 "at": 80처럼 숫자 하나도 읽음), 범위 밖 값은 버리고 정렬·중복 제거
-fn alert_list(rule: Option<&serde_json::Value>, field: &str, ok: fn(f64) -> bool) -> Vec<f64> {
+fn alert_list(rule: Option<&serde_json::Value>, field: &str, ok: impl Fn(f64) -> bool) -> Vec<f64> {
     let mut v: Vec<f64> = match rule.and_then(|r| r.get(field)) {
         Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_f64()).collect(),
         Some(v) => v.as_f64().into_iter().collect(),
@@ -337,11 +349,13 @@ fn alert_list(rule: Option<&serde_json::Value>, field: &str, ok: fn(f64) -> bool
 /// 켜 둔 목록과 꺼 둔 목록에 같은 값이 있으면 켜 둔 쪽으로 봄.
 pub fn alert_set(state: &State, key: &str) -> AlertSet {
     let rule = state.0.get("alerts").and_then(|a| a.get(key));
+    let lead_max = reset_lead_max(key);
+    let valid_lead = |v| lead_in_range(v, lead_max);
     let at = alert_list(rule, "at", pct_in_range);
-    let before = alert_list(rule, "before", lead_in_range);
+    let before = alert_list(rule, "before", valid_lead);
     let mut at_off = alert_list(rule, "at_off", pct_in_range);
     at_off.retain(|v| !at.contains(v));
-    let mut before_off = alert_list(rule, "before_off", lead_in_range);
+    let mut before_off = alert_list(rule, "before_off", valid_lead);
     before_off.retain(|v| !before.contains(v));
     AlertSet {
         on: rule.and_then(|r| r.get("on")).and_then(|v| v.as_bool()).unwrap_or(true),
@@ -1277,7 +1291,7 @@ mod tests {
     #[test]
     fn reset_soon_fires_once_per_window_with_the_smallest_lead() {
         let mut n = Notices { state: State::default() };
-        n.state.0.insert("alerts".into(), serde_json::json!({ "claude-1:5시간": { "before": [10, 30, 60] } }));
+        n.state.0.insert("alerts".into(), serde_json::json!({ "claude-1:5시간": { "before": [10, 30, 60, 360] } }));
         let cfg = Config::default();
         let reset = time::now() + 3.0 * HOUR;
         let at = |left_min: f64| reset_snap(reset - left_min * 60.0, reset, 0.3);

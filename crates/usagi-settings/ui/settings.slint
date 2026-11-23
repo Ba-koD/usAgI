@@ -60,7 +60,7 @@ export component SettingsView inherits Window {
     in property <bool> portable;
     in-out property <int> page;
     callback preview-visibility(bool);
-    changed page => { root.preview-visibility(root.page == 1); }
+    changed page => { scroll.viewport-y = 0px; root.preview-visibility(root.page == 1); }
     // 개발용 화면 캡처: 내용을 이만큼 내린 상태로
     in-out property <length> debug-scroll;
     changed debug-scroll => { scroll.viewport-y = -root.debug-scroll; }
@@ -136,39 +136,45 @@ export component SettingsView inherits Window {
         spacing: 0px;
         Rectangle { width: root.sidebar-space; }
         VerticalLayout {
-            padding-top: 28px; spacing: Theme.gap-l;
-            // 페이지 제목 줄 (스크롤되지 않음)
-            VerticalLayout {
-                padding-left: root.gutter; padding-right: root.gutter; spacing: 6px;
-                HorizontalLayout { spacing: Theme.gap-m; height: 40px;
-                    Heading { text: root.pages[root.page]; horizontal-stretch: 0; }
-                    if root.page == 0: CenterItem { AddAccount { enabled: root.login.id == "" || root.login.done; } }
-                    Rectangle { horizontal-stretch: 1; }
-                    if root.page == 0: CenterItem { Segments { options: [@tr("사용량"), @tr("남은 양")]; index: root.prefs.basis == "left" ? 1 : 0;
-                        selected(i) => { Actions.pref("basis", i == 1 ? "left" : "used"); } } }
-                    if root.page == 0: CenterItem { UiButton { text: root.small ? "" : @tr("새로고침"); icon: @image-url("icons/refresh.svg"); label: @tr("새로고침"); clicked => { Actions.command("refresh"); } } }
-                    if root.page == 2: CenterItem { UiButton { text: root.small ? "" : @tr("알림 테스트"); icon: @image-url("icons/alerts.svg"); label: @tr("알림 테스트"); clicked => { Actions.command("testNotify"); } } }
-                    if root.page >= 1 && root.page <= 3: CenterItem { UiButton {
-                        text: root.small ? "" : @tr("초기화"); icon: @image-url("icons/reset.svg"); danger: true; label: @tr("{} 설정 초기화", root.pages[root.page]);
-                        clicked => {
-                            Actions.ask("resetPage", root.page == 1 ? "widget" : root.page == 2 ? "alerts" : "general", @tr("{} 설정 초기화", root.pages[root.page]),
-                                root.page == 1 ? (root.windows ? @tr("위젯 표시, 위치, 표시 값, 막대 길이를 기본값으로 되돌림") : @tr("표시 값을 기본값으로 되돌림")) : root.page == 2 ? @tr("알림 켜기·끄기, 리필권 알림, 그래프별 알림 기준을 기본값으로 되돌림. 계정·로그인은 유지") : (root.windows ? @tr("화면 테마, 언어, 로고 색, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지") : @tr("화면 테마, 언어, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지")));
-                        }
-                    } }
+            spacing: 0px;
+            // 고정 헤더와 스크롤 본문의 경계가 계속 보이도록 배경과 구분선을 둠
+            Rectangle {
+                background: Theme.side; height: page-header.preferred-height + 1px;
+                page-header := VerticalLayout {
+                    x: 0; y: 0; width: parent.width; height: self.preferred-height;
+                    padding-left: root.gutter; padding-right: root.gutter;
+                    padding-top: Theme.gap-m; padding-bottom: Theme.gap-m; spacing: 6px;
+                    HorizontalLayout { spacing: Theme.gap-m; height: 40px;
+                        Heading { text: root.pages[root.page]; horizontal-stretch: 0; }
+                        if root.page == 0: CenterItem { AddAccount { enabled: root.login.id == "" || root.login.done; } }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.page == 0: CenterItem { Segments { options: [@tr("사용량"), @tr("남은 양")]; index: root.prefs.basis == "left" ? 1 : 0;
+                            selected(i) => { Actions.pref("basis", i == 1 ? "left" : "used"); } } }
+                        if root.page == 0: CenterItem { UiButton { text: root.small ? "" : @tr("새로고침"); icon: @image-url("icons/refresh.svg"); label: @tr("새로고침"); clicked => { Actions.command("refresh"); } } }
+                        if root.page == 2: CenterItem { UiButton { text: root.small ? "" : @tr("알림 테스트"); icon: @image-url("icons/alerts.svg"); label: @tr("알림 테스트"); clicked => { Actions.command("testNotify"); } } }
+                        if root.page >= 1 && root.page <= 3: CenterItem { UiButton {
+                            text: root.small ? "" : @tr("초기화"); icon: @image-url("icons/reset.svg"); danger: true; label: @tr("{} 설정 초기화", root.pages[root.page]);
+                            clicked => {
+                                Actions.ask("resetPage", root.page == 1 ? "widget" : root.page == 2 ? "alerts" : "general", @tr("{} 설정 초기화", root.pages[root.page]),
+                                    root.page == 1 ? (root.windows ? @tr("위젯 표시, 위치, 표시 값, 막대 길이를 기본값으로 되돌림") : @tr("표시 값을 기본값으로 되돌림")) : root.page == 2 ? @tr("알림 켜기·끄기, 리필권 알림, 그래프별 알림 기준을 기본값으로 되돌림. 계정·로그인은 유지") : (root.windows ? @tr("화면 테마, 언어, 로고 색, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지") : @tr("화면 테마, 언어, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지")));
+                            }
+                        } }
+                    }
+                    if root.description != "": Hint { text: root.description; }
+                    if root.error != "": Banner { text: root.error; }
+                    if root.install-help != "": HorizontalLayout {
+                        alignment: start;
+                        UiButton { text: @tr("공식 설치 안내"); clicked => { Actions.command("openInstall"); } }
+                    }
                 }
-                if root.description != "": Hint { text: root.description; }
-                if root.error != "": Banner { text: root.error; }
-                if root.install-help != "": HorizontalLayout {
-                    alignment: start;
-                    UiButton { text: @tr("공식 설치 안내"); clicked => { Actions.command("openInstall"); } }
-                }
+                Rule { width: parent.width; y: parent.height - self.height; }
             }
             scroll := ScrollView {
                 vertical-stretch: 1;
                 viewport-width: self.visible-width;
                 // 여백을 스크롤 안쪽에 두어 스크롤 막대가 카드와 겹치지 않음
                 HorizontalLayout {
-                    padding-left: root.gutter; padding-right: root.gutter; padding-top: 2px; padding-bottom: 32px;
+                    padding-left: root.gutter; padding-right: root.gutter; padding-top: Theme.gap-l; padding-bottom: 32px;
                     VerticalLayout {
                         spacing: root.page == 0 ? Theme.gap-l : Theme.gap-xl; alignment: start;
                         if root.page == 0 && root.login.id != "": Panel {
@@ -258,7 +264,7 @@ export component SettingsView inherits Window {
                         }
                         if root.page == 1 && root.windows: Group {
                             title: @tr("위치"); dim: !root.prefs.widget;
-                            SettingRow { title: @tr("모니터"); subtitle: @tr("선택한 모니터가 연결되어 있지 않으면 주 모니터에 표시");
+                            SettingRow { title: @tr("모니터"); subtitle: @tr("선택한 모니터가 없으면 주 모니터에 표시");
                                 Dropdown {
                                     width: root.small ? 170px : 220px; label: @tr("위젯을 표시할 모니터");
                                     popup-width: min(420px, root.pane-width - 2 * root.gutter - 2 * Theme.pad);
@@ -283,7 +289,7 @@ export component SettingsView inherits Window {
                                 if root.windows: Fold { k: root.bars-k; gap: 12px;
                                     Rule {}
                                     Rectangle { height: 12px; }
-                                    SettingRow { title: @tr("막대 길이"); subtitle: @tr("남은 시간을 표시할 때의 막대 길이 · 기본 {}px", root.prefs.bar-default);
+                                    SettingRow { title: @tr("막대 길이"); subtitle: @tr("남은 시간 모드에서 적용 · 기본 {}px", root.prefs.bar-default);
                                         BarLength {
                                             value: root.prefs.bar-px; minimum: root.prefs.bar-min; maximum: root.prefs.bar-max; small: root.small;
                                             commit(v) => { Actions.pref("barPx", "" + v); }
@@ -419,7 +425,6 @@ export component SettingsView inherits Window {
         opacity: root.sidebar-backdrop;
         TouchArea {
             clicked => { root.sidebar-flipped = false; }
-            changed has-hover => { if self.has-hover && root.narrow && root.sidebar-flipped { root.sidebar-flipped = false; } }
         }
     }
     Rectangle {
@@ -427,10 +432,10 @@ export component SettingsView inherits Window {
         clip: true; background: Theme.side;
         Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
         VerticalLayout {
-            padding: 10px; padding-top: 22px; spacing: 2px;
+            padding: 10px; padding-top: Theme.gap-m; spacing: 2px;
             // 앱 이름 + 접기 단추. 접으면 이름은 사라지고 단추가 아이콘 줄 가운데로 옮겨 감
             Rectangle {
-                height: 52px;
+                height: 40px;
                 Image {
                     x: 8px; y: (parent.height - self.height) / 2; width: 28px; height: 28px;
                     opacity: root.sidebar-label-opacity;
@@ -463,6 +468,7 @@ export component SettingsView inherits Window {
                     label-opacity: root.sidebar-label-opacity;
                     clicked => {
                         root.page = i;
+                        if root.narrow { root.sidebar-flipped = false; }
                     }
                 }
             }
@@ -474,8 +480,8 @@ export component SettingsView inherits Window {
         TouchArea {}
         Panel {
             x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-            width: min(380px, parent.width - 32px);
-            inset: Theme.gap-xl; gap: Theme.gap-xl;
+            width: min(420px, parent.width - 32px);
+            inset: Theme.gap-xl; gap: Theme.gap-l;
             VerticalLayout { spacing: 6px;
                 Section { text: Actions.confirm-text; }
                 if Actions.confirm-detail != "": Hint { text: Actions.confirm-detail; }
@@ -485,9 +491,8 @@ export component SettingsView inherits Window {
                 UiButton { text: @tr("취소"); ghost: true; clicked => { Actions.confirm-cmd = ""; } }
                 UiButton { text: Actions.confirm-cmd == "quit" ? @tr("종료")
                     : Actions.confirm-cmd == "resetSettings" || Actions.confirm-cmd == "resetPage" ? @tr("초기화")
-                    : Actions.confirm-cmd == "remove" ? @tr("계정 제거")
-                    : Actions.confirm-cmd == "linkStatusline" ? @tr("연결") : @tr("삭제");
-                    danger: Actions.confirm-cmd != "linkStatusline" && Actions.confirm-cmd != "remove"; clicked => {
+                    : @tr("삭제");
+                    danger: true; clicked => {
                     if Actions.confirm-cmd == "quit" || Actions.confirm-cmd == "resetSettings" { Actions.command(Actions.confirm-cmd); }
                     else if Actions.confirm-cmd == "resetPage" { Actions.reset-page(Actions.confirm-id); }
                     else { Actions.account(Actions.confirm-cmd, Actions.confirm-id, ""); }

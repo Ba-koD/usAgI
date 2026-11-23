@@ -295,7 +295,7 @@ msgstr "Monitor"
 
 #: ui/settings.slint:254
 msgctxt "SettingsView"
-msgid "선택한 모니터가 연결되어 있지 않으면 주 모니터에 표시"
+msgid "선택한 모니터가 없으면 주 모니터에 표시"
 msgstr "Shown on the primary monitor if the selected one is not connected"
 
 #: ui/settings.slint:256
@@ -365,7 +365,7 @@ msgstr "Bar length"
 
 #: ui/settings.slint:278
 msgctxt "SettingsView"
-msgid "남은 시간을 표시할 때의 막대 길이 · 기본 {}px"
+msgid "남은 시간 모드에서 적용 · 기본 {}px"
 msgstr "Length when showing time left · default {}px"
 
 #: ui/settings.slint:288
@@ -688,16 +688,6 @@ msgctxt "WidgetPreview"
 msgid "위젯에 표시할 사용량 없음"
 msgstr "No usage to show in the widget"
 
-#: ui/components.slint:374 ui/components.slint:376
-msgctxt "LeadTime"
-msgid "시간"
-msgstr "h"
-
-#: ui/components.slint:377
-msgctxt "LeadTime"
-msgid "분"
-msgstr "min"
-
 #: ui/components.slint:379
 msgctxt "LeadTime"
 msgid "분 전"
@@ -783,6 +773,11 @@ msgctxt "AlertChip"
 msgid "분 전"
 msgstr "min before"
 
+#: ui/components.slint
+msgctxt "AlertChip"
+msgid "리셋 전 최대 {}"
+msgstr "Up to {} before reset"
+
 #: ui/components.slint:539
 msgctxt "AlertChip"
 msgid "삭제"
@@ -830,8 +825,8 @@ msgstr "Close"
 
 #: ui/components.slint:631
 msgctxt "AddAlert"
-msgid "리셋 얼마 전에 알림을 받을지 선택"
-msgstr "Choose how long before the reset to be alerted"
+msgid "리셋 전 최대 {}"
+msgstr "Up to {} before reset"
 
 #: ui/components.slint:631
 msgctxt "AddAlert"
@@ -1058,65 +1053,30 @@ msgctxt "SettingsView"
 msgid "공식 설치 안내"
 msgstr "Official setup instructions"
 
-#: ui/settings.slint:466
-msgctxt "SettingsView"
-msgid "계정 제거"
-msgstr "Remove account"
-
-#: ui/settings.slint:467
-msgctxt "SettingsView"
-msgid "연결"
-msgstr "Connect"
-
 #: ui/components.slint:940
 msgctxt "AccountCard"
-msgid "계정 제거"
-msgstr "Remove account"
+msgid "삭제"
+msgstr "Delete"
 
 #: ui/components.slint:941
 msgctxt "AccountCard"
-msgid "{} 계정 제거"
-msgstr "Remove {}?"
+msgid "{} 계정 삭제"
+msgstr "Delete account {}"
 
 #: ui/components.slint:942
 msgctxt "AccountCard"
-msgid "usAgI에서 계정과 저장된 사용량을 제거. 공급자 로그인과 로컬 기록은 유지."
-msgstr "Removes the account and cached usage from usAgI. Keeps your provider sign-in and local history."
+msgid "{} 계정을 삭제할까요?"
+msgstr "Delete account {}?"
 
-#: ui/components.slint:943
+#: ui/components.slint
 msgctxt "AccountCard"
-msgid "프로필·기록 삭제"
-msgstr "Delete profile and history"
+msgid "usAgI의 사용량과 계정 설정을 삭제합니다.\n전용 프로필의 로그인 파일과 대화 기록도 지웁니다."
+msgstr "Deletes usage and account settings from usAgI.\nAlso deletes sign-in files and conversations in its dedicated profile."
 
-#: ui/components.slint:944
+#: ui/components.slint
 msgctxt "AccountCard"
-msgid "{} 프로필·로컬 기록 삭제"
-msgstr "Delete the profile and local history for {}?"
-
-#: ui/components.slint:945
-msgctxt "AccountCard"
-msgid "usAgI 전용 폴더의 로그인 파일, 대화 기록, 설정을 영구 삭제."
-msgstr "Permanently deletes sign-in files, conversation history, and settings in the usAgI profile folder."
-
-#: ui/components.slint:949
-msgctxt "AccountCard"
-msgid "실시간 연결 끄기"
-msgstr "Turn off live updates"
-
-#: ui/components.slint:949
-msgctxt "AccountCard"
-msgid "실시간 연결 켜기"
-msgstr "Turn on live updates"
-
-#: ui/components.slint:952
-msgctxt "AccountCard"
-msgid "Claude 실시간 연결"
-msgstr "Claude live updates"
-
-#: ui/components.slint:953
-msgctxt "AccountCard"
-msgid "Claude Code 상태 표시줄로 사용량을 갱신. 실시간 연결을 끄거나 계정을 제거하면 기존 설정 복원."
-msgstr "Updates usage through the Claude Code status line. Turning off live updates or removing the account restores the previous settings."
+msgid "usAgI의 사용량과 계정 설정을 삭제합니다.\n공급자 로그인과 대화 기록은 유지합니다."
+msgstr "Deletes usage and account settings from usAgI.\nYour provider sign-in and conversations are kept."
 
 #: ui/settings.slint:345
 msgctxt "SettingsView"

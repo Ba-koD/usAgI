@@ -202,7 +202,7 @@ impl Controller {
     /// 앱이 뜬 직후: 설정 파일 오류, 방금 업데이트했으면 알림
     pub fn startup(&mut self) -> Vec<Effect> {
         let mut fx = Vec::new();
-        self.ensure_links();
+        self.ensure_links(None);
         if accounts::has_unread_accounts(&self.notices.state) {
             self.set_error(crate::tr!(
                 "일부 계정 정보 읽기 실패 · 기존 데이터 보관",
@@ -521,15 +521,12 @@ impl Controller {
                 });
                 fx.push(Effect::Redraw);
             }
-            "remove" | "removeProfile" => {
-                self.remove_account(&id, cmd == "removeProfile", accounts::save);
+            "remove" => {
+                self.remove_account(&id, accounts::save);
                 fx.push(Effect::Redraw);
             }
             "removeInactiveProfile" => self.remove_inactive_profile(&id),
             "restoreInactiveProfile" => self.restore_inactive_profile(&id),
-            "linkStatusline" | "unlinkStatusline" => {
-                self.change_statusline(&id, cmd == "linkStatusline");
-            }
             "reorder" => {
                 // 끌어서 바꾼 계정 순서 (위젯·메뉴 막대·알림 화면도 이 순서)
                 let ids: Vec<String> = msg
@@ -732,51 +729,27 @@ impl Controller {
         }
     }
 
-    fn change_statusline(&mut self, id: &str, enable: bool) {
-        let mut list = accounts::load(&self.notices.state);
-        let Some(index) = list.iter().position(|a| a.id == id && a.is_claude()) else { return };
-        let account = &mut list[index];
-        let was_linked = accounts::link_state(account) == Link::Linked;
-        let change = if enable {
-            std::env::current_exe().and_then(|exe| accounts::link(account, &exe)).map(|()| None)
-        } else {
-            accounts::unlink_with_backup(account)
-        };
-        let backup = match change {
-            Ok(backup) => backup,
-            Err(error) => { self.set_error(error.to_string()); return; }
-        };
-        if self.store_accounts(&list) {
-            self.engine.refresh();
-            return;
-        }
-        let account = &mut list[index];
-        let rollback = if let Some(backup) = backup {
-            backup.rollback(account)
-        } else if enable && !was_linked {
-            accounts::unlink(account)
-        } else { Ok(()) };
-        if let Err(error) = rollback {
-            let prior = self.last_error.as_deref().unwrap_or_default();
-            self.set_error(format!("{prior} · {error}"));
-        }
-    }
-
-    /// 명시적으로 켠 Claude 실시간 연결의 명령만 갱신.
-    fn ensure_links(&mut self) {
+    /// 가능한 Claude 계정을 연결하고, 앱이나 프로필이 바뀌면 브리지 명령을 갱신.
+    fn ensure_links(&mut self, target: Option<&str>) {
         let Ok(exe) = std::env::current_exe() else { return };
         let mut list = accounts::load(&self.notices.state);
-        let mut changed = false;
-        for a in list.iter_mut() {
-            if accounts::needs_link(a, &exe) {
-                let before = a.chain.clone();
-                if accounts::link(a, &exe).is_ok() {
-                    changed |= a.chain != before;
-                }
+        let mut updated = Vec::new();
+        for (index, a) in list.iter_mut().enumerate() {
+            if target.is_some_and(|id| a.id != id) || !accounts::needs_link(a, &exe) {
+                continue;
+            }
+            let before = (a.chain.clone(), a.statusline_original.clone());
+            if accounts::link(a, &exe).is_ok() && (a.chain.as_ref(), a.statusline_original.as_ref()) != (before.0.as_ref(), before.1.as_ref()) {
+                updated.push(index);
             }
         }
-        if changed {
-            self.store_accounts(&list);
+        if !updated.is_empty() && !self.store_accounts(&list) {
+            for index in updated {
+                if let Err(error) = accounts::unlink(&mut list[index]) {
+                    let prior = self.last_error.as_deref().unwrap_or_default();
+                    self.set_error(format!("{prior} · {error}"));
+                }
+            }
         }
     }
 
@@ -850,6 +823,7 @@ impl Controller {
                 if archived_id.is_some() {
                     accounts::unmark_profile(&profile);
                 }
+                self.ensure_links(Some(&id));
                 self.reload_inactive_profiles();
                 self.engine.check_logins();
                 self.engine.refresh();
@@ -976,7 +950,7 @@ impl Controller {
             self.next_recheck = now + LOGIN_RECHECK_SECS;
         }
         if linked {
-            self.ensure_links(); // 로그인 과정에서 CLI가 settings.json을 새로 썼을 수 있음
+            self.ensure_links(Some(&view.account_id)); // 로그인 과정에서 CLI가 settings.json을 새로 썼을 수 있음
         }
         if let Some(t) = self.login_finished_at {
             if view.done == Some(true) && now - t > LOGIN_DONE_SHOW_SECS {
@@ -1094,16 +1068,21 @@ impl Controller {
         ));
     }
 
-    fn remove_account(&mut self, id: &str, delete_profile: bool, persist: impl FnOnce(&mut State, &[Account]) -> std::io::Result<()>) {
+    fn remove_account(&mut self, id: &str, persist: impl FnOnce(&mut State, &[Account]) -> std::io::Result<()>) {
         let mut list = accounts::load(&self.notices.state);
         let Some(index) = list.iter().position(|a| a.id == id) else { return };
         let mut a = list.remove(index);
-        if delete_profile {
-            if let Err(e) = accounts::validate_managed_profile(&a.path()) {
-                self.set_error(crate::tr!(format!("프로필 삭제 경로 확인 실패 ({e})"), format!("Could not verify the profile deletion path ({e})")));
-                return;
+        let profile = a.path();
+        let delete_profile = if accounts::is_managed(&a) && !list.iter().any(|other| login::same_dir(&profile, Some(other.path()))) {
+            match accounts::validate_managed_profile(&profile) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    self.set_error(crate::tr!(format!("프로필 삭제 경로 확인 실패 ({e})"), format!("Could not verify the profile deletion path ({e})")));
+                    return;
+                }
             }
-        }
+        } else { false };
         if self.connecting.as_ref().is_some_and(|c| c.account_id.as_deref() == Some(id)) {
             self.connecting = None;
         }
@@ -1406,6 +1385,24 @@ mod tests {
     }
 
     #[test]
+    fn reset_alert_add_and_edit_respect_the_graph_window() {
+        let mut c = ctl("windows", None);
+        for (key, limit) in [
+            ("claude-1:5시간", 300),
+            ("claude-1:Fable 주간", 10080),
+            ("codex-1:90분", 90),
+            ("codex-1:3시간", 180),
+            ("codex-1:2일", 2880),
+        ] {
+            ipc(&mut c, json!({"cmd":"threshold","key":key,"kind":"reset","op":"add","new":limit + 1}));
+            assert!(c.state().0.get("alerts").and_then(|rules| rules.get(key)).is_none(), "{key}");
+            ipc(&mut c, json!({"cmd":"threshold","key":key,"kind":"reset","op":"add","new":limit}));
+            ipc(&mut c, json!({"cmd":"threshold","key":key,"kind":"reset","op":"replace","old":limit,"new":limit + 1}));
+            assert_eq!(c.state().0["alerts"][key]["before"], json!([f64::from(limit)]), "{key}");
+        }
+    }
+
+    #[test]
     fn alert_items_move_between_on_and_off_lists() {
         let mut c = ctl("windows", None);
         let key = "claude-1:주간";
@@ -1510,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_live_updates_are_opt_in_and_disconnect_preserves_the_profile() {
+    fn claude_live_updates_connect_automatically_and_removal_preserves_the_profile() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let original = json!({"model":"opus","statusLine":{"type":"command","command":"mine.sh","padding":7}});
@@ -1523,20 +1520,25 @@ mod tests {
         list[0].dir = dir.path().to_string_lossy().into();
         accounts::save(&mut c.notices.state, &list).unwrap();
         c.startup();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original.to_string());
-        ipc(&mut c, json!({"cmd": "linkStatusline", "id": "claude-9"}));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("statusline --account claude-9"), "{text}");
-        ipc(&mut c, json!({"cmd": "unlinkStatusline", "id": "claude-9"}));
+        assert_eq!(accounts::load(c.state())[0].chain.as_deref(), Some("mine.sh"));
+        c.startup();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(read(), original);
-        ipc(&mut c, json!({"cmd": "removeProfile", "id": "claude-9"}));
-        assert!(accounts::load(c.state()).iter().any(|a| a.id == "claude-9"));
-        ipc(&mut c, json!({"cmd": "linkStatusline", "id": "claude-9"}));
         ipc(&mut c, json!({"cmd": "remove", "id": "claude-9"}));
         assert_eq!(read(), original);
         assert_eq!(std::fs::read_to_string(&local_history).unwrap(), "keep");
         assert!(!accounts::load(c.state()).iter().any(|a| a.id == "claude-9"));
+    }
+
+    fn wait_for_cleanup(c: &mut Controller) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !c.deleted_profiles.is_empty() && std::time::Instant::now() < end {
+            c.poll_profile_deletions();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(c.deleted_profiles.is_empty());
     }
 
     #[test]
@@ -1552,14 +1554,6 @@ mod tests {
         c.settings_opened();
         let listed = |c: &Controller, acc: &Account| c.settings_state(&HostInfo::default())["inactiveProfiles"]
             .as_array().unwrap().iter().any(|name| name.as_str() == Some(&acc.id));
-        let wait_for_cleanup = |c: &mut Controller| {
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !c.deleted_profiles.is_empty() && std::time::Instant::now() < end {
-                c.poll_profile_deletions();
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            assert!(c.deleted_profiles.is_empty());
-        };
         assert!(!listed(&c, &pending));
         assert!(listed(&c, &saved));
         assert!(accounts::profile_is_marked(&pending.path()));
@@ -1595,14 +1589,17 @@ mod tests {
         let linked = std::fs::read_to_string(&settings).unwrap();
         accounts::save(&mut c.notices.state, std::slice::from_ref(&a)).unwrap();
 
-        c.remove_account(&a.id, true, |_, _| Err(std::io::ErrorKind::PermissionDenied.into()));
+        c.remove_account(&a.id, |_, _| Err(std::io::ErrorKind::PermissionDenied.into()));
         assert!(c.error().is_some());
         assert!(c.deleted_profiles.is_empty());
-        assert_eq!(accounts::load(c.state()), vec![a]);
+        assert_eq!(accounts::load(c.state()), vec![a.clone()]);
         assert_eq!(std::fs::read_to_string(dir.join("history.json")).unwrap(), "keep");
         assert_eq!(std::fs::read_to_string(settings).unwrap(), linked);
         assert!(!accounts::profile_is_marked(&dir));
-        accounts::delete_managed_profile(&dir).unwrap();
+        ipc(&mut c, json!({"cmd": "remove", "id": a.id}));
+        wait_for_cleanup(&mut c);
+        assert!(accounts::load(c.state()).is_empty());
+        assert!(!dir.exists());
     }
 
     #[test]

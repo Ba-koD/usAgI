@@ -36,6 +36,8 @@ fn rows<T: Clone + PartialEq + 'static>(current: ModelRc<T>, values: Vec<T>) -> 
 }
 
 fn meter(v: &Value, previous: Option<Meter>) -> Meter {
+    let key = text(v, "alertKey");
+    let reset_lead_max = usagi_core::engine::reset_lead_max(key);
     let left = flag(v, "left");
     let ratio = v["ratio"].as_f64().unwrap_or_default().clamp(0.0, 1.0);
     // 남은 시간과 리셋 시각은 따로 (좁은 그래프에서는 두 줄로)
@@ -76,7 +78,7 @@ fn meter(v: &Value, previous: Option<Meter>) -> Meter {
         None => Default::default(),
     };
     Meter {
-        key: text(v, "alertKey").into(),
+        key: key.into(),
         label: text(v, "label").into(),
         exact: flag(v, "exact"),
         spent: flag(v, "spent"),
@@ -88,6 +90,8 @@ fn meter(v: &Value, previous: Option<Meter>) -> Meter {
         widget: flag(v, "widget"),
         own_basis: flag(v, "hasOwnBasis"),
         alert_on: flag(v, "alertOn"),
+        reset_lead_max: reset_lead_max as i32,
+        reset_lead_label: usagi_core::texts::fmt_lead(f64::from(reset_lead_max)).into(),
         thresholds: rows(old_thresholds, thresholds),
         alerts: rows(old_alerts, items),
         taken_pct: rows(old_pct, taken_pct),
@@ -126,7 +130,6 @@ fn account(v: &Value, previous: Option<Account>) -> Account {
         if flag(login, "reconnectSoon") { "" } else { text(login, "ends") },
         text(login, "error"),
         if text(login, "fallback").is_empty() { "" } else { tr!("대체 로그인 폴더 사용 중", "Using a backup sign-in folder") },
-        text(v, "linkNote"),
         if flag(v, "dup") {
             tr!("다른 카드와 동일한 계정", "Same account as another card")
         } else {
@@ -214,7 +217,6 @@ fn account(v: &Value, previous: Option<Account>) -> Account {
         refresh_status: refresh_status.into(),
         refreshing: flag(probe, "running"),
         managed: flag(v, "managed"),
-        live_link: text(v, "link").into(),
         reconnect_soon: flag(login, "reconnectSoon"),
         sign_in_ends: text(login, "ends").into(),
         collapsed: flag(v, "collapsed"),

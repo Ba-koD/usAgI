@@ -1,7 +1,7 @@
 //! 계정 = 공급자별 로컬 프로필 폴더. 로그인 정보는 저장하지 않습니다.
 //!
 //! - Claude: Claude Code 설정 폴더 (기본 ~/.claude, CLAUDE_CONFIG_DIR로 다른 프로필 가능)
-//!   실시간 연결을 켜면 그 폴더의 settings.json에 usAgI 상태 표시줄 브리지를 넣습니다.
+//!   연결 가능한 계정은 그 폴더의 settings.json에 usAgI 상태 표시줄 브리지를 넣습니다.
 //!   원래 쓰던 상태 표시줄이 있으면 지우지 않고 이어서 실행(chain)하고, 연결 해제 시 되돌립니다.
 //! - Codex: Codex 홈 폴더 (기본 ~/.codex). 로그에 정확한 사용률이 있어 연결 과정이 필요 없습니다.
 
@@ -396,13 +396,16 @@ pub fn link_state(acc: &Account) -> Link {
     }
 }
 
-/// 이미 켜 둔 실시간 연결의 실행 파일 경로를 갱신해야 하는지.
+/// 아직 연결하지 않았거나 기존 브리지의 실행 명령을 갱신해야 하는지.
 pub fn needs_link(acc: &Account, exe: &Path) -> bool {
     if !acc.is_claude() || !acc.path().is_dir() || !linkable(exe) {
         return false;
     }
     match read_settings(&settings_path(acc)) {
-        Ok(map) => statusline_command(&map).is_some_and(|cmd| owns_statusline(cmd, acc) && cmd != bridge_command(exe, &acc.usage_key())),
+        Ok(map) => match statusline_command(&map) {
+            Some(cmd) if is_our_command(cmd) => owns_statusline(cmd, acc) && cmd != bridge_command(exe, &acc.usage_key()),
+            _ => true,
+        },
         Err(_) => false,
     }
 }
@@ -602,6 +605,8 @@ mod tests {
         // 이미 같은 명령이면 다시 걸 필요 없음, exe 위치가 바뀌면 다시 걸어야 함 (원래 상태 표시줄은 그대로 기억)
         let exe = Path::new(if cfg!(windows) { r"C:\Apps\usagi.exe" } else { "/Apps/usagi" });
         assert!(!needs_link(&acc, exe));
+        let other = Account { id: "claude-2".into(), ..acc.clone() };
+        assert!(!needs_link(&other, exe), "다른 계정의 브리지는 건드리지 않음");
         let moved = Path::new(if cfg!(windows) { r"D:\Tools\usagi.exe" } else { "/Tools/usagi" });
         assert!(needs_link(&acc, moved));
         link(&mut acc, moved).unwrap();
@@ -612,6 +617,7 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
         assert!(text.contains("~/.claude/mine.sh"));
         assert_eq!(link_state(&acc), Link::NotLinked);
+        assert!(needs_link(&acc, exe));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
