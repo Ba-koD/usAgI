@@ -419,7 +419,7 @@ export component SettingsView inherits Window {
     }
     Rectangle {
         visible: Actions.confirm-cmd == "" && root.sidebar-backdrop > 0.01;
-        // 사이드바 바깥만 덮음: 마우스가 사이드바를 벗어나 여기로 오면 닫힘
+        // 겹쳐 열린 사이드바 밖을 어둡게 표시하고 바깥 클릭으로도 닫음
         x: root.sidebar-width; width: parent.width - root.sidebar-width;
         background: #000;
         opacity: root.sidebar-backdrop;
@@ -431,50 +431,57 @@ export component SettingsView inherits Window {
         x: 0; y: 0; width: root.sidebar-width; height: 100%;
         clip: true; background: Theme.side;
         Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
-        VerticalLayout {
-            padding: 10px; padding-top: Theme.gap-m; spacing: 2px;
-            // 앱 이름 + 접기 단추. 접으면 이름은 사라지고 단추가 아이콘 줄 가운데로 옮겨 감
-            Rectangle {
-                height: 40px;
-                Image {
-                    x: 8px; y: (parent.height - self.height) / 2; width: 28px; height: 28px;
-                    opacity: root.sidebar-label-opacity;
-                    source: @image-url("icons/rabbit.svg"); colorize: Theme.ink;
-                }
-                VerticalLayout {
-                    x: 46px; y: 0; width: 110px; height: 100%; alignment: center; spacing: 1px;
-                    opacity: root.sidebar-label-opacity;
-                    Text { text: "usAgI"; color: Theme.ink; font-size: Theme.size-title; font-weight: 600; }
-                    Text { text: "v" + root.version; color: Theme.faint; font-size: Theme.size-tiny; }
-                }
-                UiButton {
-                    width: 34px; height: 34px; y: (parent.height - self.height) / 2;
-                    x: (parent.width - self.width) / 2 * (1 - root.sidebar-progress) + (parent.width - self.width) * root.sidebar-progress;
-                    ghost: true; border-width: self.focused ? 1px : 0px;
-                    label: root.sidebar-expanded ? @tr("메뉴 접기") : @tr("메뉴 펼치기");
-                    icon: @image-url("icons/sidebar.svg");
-                    clicked => { root.sidebar-flipped = !root.sidebar-flipped; }
-                }
+        TouchArea {
+            enabled: root.narrow;
+            // 단추와 빈 공간 사이를 움직여도 사이드바 안에 있는 것으로 봄
+            changed has-hover => {
+                if !self.has-hover && root.narrow && root.sidebar-flipped { root.sidebar-flipped = false; }
             }
-            Rectangle { height: Theme.gap-s; }
-            for name[i] in root.pages: VerticalLayout {
-                if i == 1 || i == 4: Rectangle {
-                    height: 12px + root.sidebar-progress * 22px;
-                    Text { x: 13px; y: 14px; opacity: root.sidebar-label-opacity; text: i == 1 ? @tr("설정") : @tr("기타");
-                        color: Theme.faint; font-size: Theme.size-tiny; }
-                }
-                NavItem {
-                    text: name; icon: root.icons[i]; active: root.page == i;
-                    label-opacity: root.sidebar-label-opacity;
-                    clicked => {
-                        root.page = i;
-                        if root.narrow { root.sidebar-flipped = false; }
+            pointer-event(e) => { if e.kind == PointerEventKind.down { FocusOut.release(); } }
+            VerticalLayout {
+                padding: 10px; padding-top: Theme.gap-m; spacing: 2px;
+                // 앱 이름 + 접기 단추. 접으면 이름은 사라지고 단추가 아이콘 줄 가운데로 옮겨 감
+                Rectangle {
+                    height: 40px;
+                    Image {
+                        x: 8px; y: (parent.height - self.height) / 2; width: 28px; height: 28px;
+                        opacity: root.sidebar-label-opacity;
+                        source: @image-url("icons/rabbit.svg"); colorize: Theme.ink;
+                    }
+                    VerticalLayout {
+                        x: 46px; y: 0; width: 110px; height: 100%; alignment: center; spacing: 1px;
+                        opacity: root.sidebar-label-opacity;
+                        Text { text: "usAgI"; color: Theme.ink; font-size: Theme.size-title; font-weight: 600; }
+                        Text { text: "v" + root.version; color: Theme.faint; font-size: Theme.size-tiny; }
+                    }
+                    UiButton {
+                        width: 34px; height: 34px; y: (parent.height - self.height) / 2;
+                        x: (parent.width - self.width) / 2 * (1 - root.sidebar-progress) + (parent.width - self.width) * root.sidebar-progress;
+                        ghost: true; border-width: self.focused ? 1px : 0px;
+                        label: root.sidebar-expanded ? @tr("메뉴 접기") : @tr("메뉴 펼치기");
+                        icon: @image-url("icons/sidebar.svg");
+                        clicked => { root.sidebar-flipped = !root.sidebar-flipped; }
                     }
                 }
+                Rectangle { height: Theme.gap-s; }
+                for name[i] in root.pages: VerticalLayout {
+                    if i == 1 || i == 4: Rectangle {
+                        height: 12px + root.sidebar-progress * 22px;
+                        Text { x: 13px; y: 14px; opacity: root.sidebar-label-opacity; text: i == 1 ? @tr("설정") : @tr("기타");
+                            color: Theme.faint; font-size: Theme.size-tiny; }
+                    }
+                    NavItem {
+                        text: name; icon: root.icons[i]; active: root.page == i;
+                        label-opacity: root.sidebar-label-opacity;
+                        clicked => { root.page = i; }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
             }
-            Rectangle { vertical-stretch: 1; }
         }
     }
+    // 시스템 제목 표시줄 아래에서 사이드바와 본문을 함께 구분
+    Rule { x: 0px; y: 0px; width: root.width; background: Theme.line2; }
     if Actions.confirm-cmd != "": Backdrop {
         background: #0007;
         TouchArea {}
