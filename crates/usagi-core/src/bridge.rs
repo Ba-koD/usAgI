@@ -38,20 +38,22 @@ pub struct BridgeFile {
     pub updated_at: f64,
     pub five_hour: Option<BridgeWindow>,
     pub seven_day: Option<BridgeWindow>,
-    /// 마지막으로 알았던 주간 리셋 시각. 주간 창은 계정마다 7일 주기로 고정이라
-    /// Claude Code가 리셋 뒤 창을 빼더라도 이 값으로 다음 리셋을 계산합니다.
+    /// The usage source omitted the all-model weekly quota, so its value is unknown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_unavailable: bool,
+    /// 마지막으로 공급자가 알려준 주간 리셋 시각.
     #[serde(default)]
     pub weekly_anchor: Option<f64>,
-    /// 모델별 주간 한도 (예: Fable). `/usage`에서만 옴
+    /// 모델별 주간 한도 (예: Fable). 직접 조회 또는 `/usage`에서 받음
     #[serde(default)]
     pub models: Vec<ModelWindow>,
     /// 지출 한도 (상태 표시줄 rate_limits.spend_limit, 지출 한도를 정한 환경에서만 옴)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<Spend>,
-    /// `/usage`의 추가 사용량·크레딧 줄 (형식이 공개되지 않아 글자 그대로)
+    /// 사용량 조회의 추가 사용량·크레딧 안내
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<String>,
-    /// `/usage`에서 온 기록인지 (저장하지 않음). 추가 사용량 줄은 `/usage`만 알려 줌
+    /// 사용량 조회에서 온 기록인지 (저장하지 않음). 상태 표시줄에는 추가 사용량 안내가 없음
     #[serde(skip)]
     pub from_usage: bool,
 }
@@ -105,21 +107,12 @@ pub struct ModelWindow {
 }
 
 impl BridgeFile {
-    /// 다음 주간 리셋: 지금 값이 살아 있으면 그것, 아니면 기억한 기준점에서 7일씩 넘김
+    /// Report only a reset timestamp supplied by the provider.
     pub fn weekly_reset(&self, now: f64) -> Option<f64> {
         self.seven_day
             .and_then(|w| w.live_reset(now))
-            .or_else(|| self.weekly_anchor.or(self.seven_day.and_then(|w| w.resets_at)).map(|a| roll_weekly(a, now)))
+            .or_else(|| self.weekly_anchor.filter(|&at| at > now))
     }
-}
-
-/// 지난 주간 리셋 시각을 7일씩 넘겨 지금 이후의 다음 리셋으로
-pub fn roll_weekly(anchor: f64, now: f64) -> f64 {
-    const WEEK: f64 = 7.0 * 86400.0;
-    if anchor > now {
-        return anchor;
-    }
-    anchor + ((now - anchor) / WEEK).floor() * WEEK + WEEK
 }
 
 /// 계정별 기록 파일
@@ -189,7 +182,7 @@ pub fn parse_statusline(input: &str, now: f64) -> (Option<BridgeFile>, String) {
 }
 
 /// 기록 저장 (임시 파일 → 이름 바꾸기). 주간 기준점이 비면 예전 값을 이어서 보관.
-pub fn save(account_id: &str, mut file: BridgeFile) {
+pub fn save(account_id: &str, mut file: BridgeFile) -> std::io::Result<()> {
     let old = read(account_id);
     if file.weekly_anchor.is_none() {
         file.weekly_anchor = old.as_ref().and_then(|o| o.weekly_anchor);
@@ -207,26 +200,22 @@ pub fn save(account_id: &str, mut file: BridgeFile) {
             .map(|o| o.models.into_iter().filter(|m| m.window.resets_at.is_none_or(|r| r > file.updated_at)).collect())
             .unwrap_or_default();
     }
-    let dir = config_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    if let Ok(text) = serde_json::to_string(&file) {
-        let tmp = dir.join(format!("claude-usage.{}.{}.tmp", std::process::id(), safe_id(account_id)));
-        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path(account_id)).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
+    crate::config::write_json(&path(account_id), &file)
 }
 
 /// `usagi statusline --account <id>` 진입점: stdin을 받아 파일에 쓰고 출력할 글자를 돌려줍니다.
 pub fn run_statusline(input: &str, account_id: &str) -> String {
     // Claude Code가 따로 띄우는 프로세스라 저장된 언어 설정을 여기서 읽음
-    crate::config::State::load().apply_locale();
+    let state = crate::config::State::load();
+    state.apply_locale();
     let now = time::now();
     let (file, line) = parse_statusline(input, now);
     if let Some(file) = file {
-        save(account_id, file);
+        if crate::accounts::load(&state).iter().any(|a| a.is_claude() && a.usage_key() == account_id) {
+            if let Err(error) = save(account_id, file) {
+                eprintln!("usAgI: {error}");
+            }
+        }
     }
     line
 }
@@ -274,12 +263,9 @@ mod tests {
     }
 
     #[test]
-    fn weekly_reset_rolls_forward() {
-        let week = 7.0 * 86400.0;
-        assert_eq!(roll_weekly(1000.0, 500.0), 1000.0);
-        assert_eq!(roll_weekly(1000.0, 1000.0 + 3.0 * 86400.0), 1000.0 + week);
-        assert_eq!(roll_weekly(1000.0, 1000.0 + week + 10.0), 1000.0 + 2.0 * week);
+    fn weekly_reset_waits_for_new_provider_timestamp() {
         let b = BridgeFile { updated_at: 0.0, weekly_anchor: Some(1000.0), ..Default::default() };
-        assert_eq!(b.weekly_reset(1000.0 + 10.0), Some(1000.0 + week));
+        assert_eq!(b.weekly_reset(999.0), Some(1000.0));
+        assert_eq!(b.weekly_reset(1010.0), None);
     }
 }

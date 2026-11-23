@@ -1,9 +1,9 @@
 //! macOS 메뉴 막대 앱.
 //!
 //! - 메뉴 막대: [로고] 5h 53%  7d 64%  │  [로고] 7d 92% (토끼 없이, 공급자 로고만)
-//! - 누르면: 설정 열기, 계정별 사용량·리셋까지 남은 시간, 로그인, 새로고침, 보기 바꾸기, 종료
+//! - 누르면: 설정 열기, 새로고침, 보기 바꾸기, 종료
 //! - 설정 창: Windows와 같은 Slint 화면, 화면 상태와 명령 처리도 Windows와 같은
-//!   usagi-core 컨트롤러. 이 파일은 메뉴 막대·창·알림·로그인할 때 실행·업데이트 적용만 맡아요.
+//!   usagi-core 컨트롤러. 이 파일은 메뉴 막대·창·알림·로그인할 때 실행·업데이트 적용만 맡음.
 
 use usagi_settings::SettingsWindow;
 use std::process::Command;
@@ -19,7 +19,7 @@ use usagi_core::config;
 use usagi_core::controller::{Controller, Effect, HostInfo, Platform};
 use usagi_core::engine::{alert_key, Engine, Meter, ProviderView, Snapshot};
 use usagi_core::update::Release;
-use usagi_core::{codex, texts, time, ui};
+use usagi_core::{b64, texts, time, ui};
 
 /// 로그인 진행을 보고 있을 때의 확인 간격
 const FRAME: Duration = Duration::from_millis(200);
@@ -31,6 +31,8 @@ pub enum UserEvent {
     Menu(MenuEvent),
     SettingsInput,
     Update(UpdateEvent),
+    /// 알림을 누름
+    OpenSettings,
 }
 
 pub enum UpdateEvent {
@@ -46,6 +48,8 @@ struct App {
     title_sig: String,
     menu_sig: String,
     settings: Option<SettingsWindow>,
+    /// 설정 창에 마지막으로 보낸 메뉴 막대 미리 보기 (같으면 다시 그리지 않음)
+    preview_sent: std::cell::Cell<u64>,
     /// 끝내야 함 (종료 명령, 업데이트 적용)
     exit: bool,
 }
@@ -79,6 +83,16 @@ fn fix_path() {
 }
 
 pub fn run() {
+    let dir = config::config_dir();
+    let lock = std::fs::create_dir_all(&dir).and_then(|()| {
+        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(dir.join("instance.lock"))
+    });
+    let Ok(instance) = lock else {
+        log("Could not open usAgI instance lock");
+        return;
+    };
+    if instance.try_lock().is_err() { return; }
     log(&format!("시작 v{}", usagi_core::VERSION));
     fix_path();
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
@@ -110,12 +124,18 @@ pub fn run() {
         title_sig: String::new(),
         menu_sig: String::new(),
         settings: None,
+        preview_sent: std::cell::Cell::new(0),
         exit: false,
     };
 
     event_loop.run(move |event, _, control_flow| {
+        let _instance = &instance;
         match event {
             Event::NewEvents(StartCause::Init) => {
+                let proxy = app.proxy.clone();
+                crate::notify::init(move || {
+                    let _ = proxy.send_event(UserEvent::OpenSettings);
+                });
                 app.create_tray();
                 let fx = app.ctl.startup();
                 app.run(fx);
@@ -135,7 +155,7 @@ pub fn run() {
             }
             Event::UserEvent(UserEvent::Menu(e)) => app.on_menu(e.id().0.as_str()),
             // 실행 중에 Finder·Launchpad에서 다시 열면 설정 창 (Windows에서 한 번 더 실행할 때와 같음)
-            Event::Reopen { .. } => app.open_settings(),
+            Event::Reopen { .. } | Event::UserEvent(UserEvent::OpenSettings) => app.open_settings(),
             Event::UserEvent(UserEvent::SettingsInput) => {
                 while let Some(raw) = app.settings.as_ref().and_then(SettingsWindow::next_command) {
                     let fx = app.ctl.handle_ipc(&raw);
@@ -256,31 +276,51 @@ impl App {
             return m.resets_at.filter(|&r| r > now).map(|r| texts::fmt_hm_short(r - now)).unwrap_or_else(|| "–".into());
         }
         let left = ui::meter_left(self.ctl.state(), &alert_key(acc, &m.label));
-        texts::fmt_pct(if left { (1.0 - m.ratio).max(0.0) } else { m.ratio })
+        texts::fmt_usage(m.ratio, left)
     }
 
-    fn refresh_ui(&mut self) {
-        let Some(snap) = &self.ctl.snap else { return };
-        let now = time::now();
+    /// 메뉴 막대 칸: [로고] 5h ▬▬ 53%  7d ▬▬ 64%  │  [로고] 7d ▬▬ 92% (사용량을 받기 전엔 빈 목록)
+    fn title_parts(&self, now: f64) -> Vec<crate::title::Part> {
+        let Some(snap) = &self.ctl.snap else { return Vec::new() };
         let state = self.ctl.state();
-        let accounts = accounts::load(state);
-
-        // ---- 메뉴 막대: [로고] 5h 53%  7d 64%  │  [로고] 7d 92%
+        let bars = state.pref_bool("bars", true);
         let mut parts = Vec::new();
-        for acc in accounts.iter().filter(|a| a.show) {
+        for acc in accounts::load(state).iter().filter(|a| a.show) {
             let Some(v) = view(snap, acc) else { continue };
-            let items: Vec<(String, String)> = v
+            // 로그아웃: 예전 값 대신 "로그인 필요"
+            if snap.logged_out(&acc.id) {
+                parts.push(crate::title::Part { provider: v.id, items: Vec::new(), note: Some(texts::login_needed().into()) });
+                continue;
+            }
+            let items: Vec<crate::title::Item> = v
                 .meters
                 .iter()
                 .filter(|m| ui::meter_in_widget(state, &alert_key(&acc.id, &m.label)))
-                .map(|m| (crate::title::short_label(&m.label), self.short_value(&acc.id, m, now)))
+                .map(|m| {
+                    let left = ui::meter_left(state, &alert_key(&acc.id, &m.label));
+                    // 남은 양 기준이면 줄어드는 막대 (색은 사용량 기준 그대로, Windows 위젯과 같음)
+                    let fill = if !m.exact { 0.0 } else if left { (1.0 - m.ratio).max(0.0) } else { m.ratio };
+                    crate::title::Item {
+                        label: crate::title::short_label(&m.label),
+                        bar: bars.then_some(crate::title::Bar { fill, level: texts::level(m.ratio) }),
+                        value: self.short_value(&acc.id, m, now),
+                    }
+                })
                 .collect();
             if !items.is_empty() {
-                parts.push(crate::title::Part { provider: v.id, items });
+                parts.push(crate::title::Part { provider: v.id, items, note: None });
             }
         }
+        parts
+    }
+
+    fn refresh_ui(&mut self) {
+        if self.ctl.snap.is_none() {
+            return;
+        }
+        let parts = self.title_parts(time::now());
         let dark = self.tray.as_ref().is_some_and(crate::title::is_dark);
-        let sig = parts.iter().map(|p| format!("{:?}{:?}", p.provider, p.items)).collect::<Vec<_>>().join("|") + if dark { "D" } else { "L" };
+        let sig = parts.iter().map(|p| format!("{:?}{:?}{:?}", p.provider, p.items, p.note)).collect::<Vec<_>>().join("|") + if dark { "D" } else { "L" };
         if sig != self.title_sig {
             if let Some(t) = &self.tray {
                 crate::title::apply(t, &parts);
@@ -288,85 +328,30 @@ impl App {
             // 진단: 메뉴 막대에 보인 글자 (바뀔 때만)
             let text = parts
                 .iter()
-                .map(|p| format!("[{}] {}", p.provider.name(), p.items.iter().map(|(l, v)| format!("{l} {v}")).collect::<Vec<_>>().join("  ")))
+                .map(|p| {
+                    let items = p.items.iter().map(|i| format!("{}{} {}", i.label, if i.bar.is_some() { " ▬" } else { "" }, i.value));
+                    format!("[{}] {}{}", p.provider.name(), items.collect::<Vec<_>>().join("  "), p.note.as_deref().unwrap_or(""))
+                })
                 .collect::<Vec<_>>()
                 .join(" │ ");
             log(&format!("메뉴 막대: {}", if text.is_empty() { "(사용량 없음)" } else { &text }));
             self.title_sig = sig;
         }
 
-        // ---- 메뉴: 계정별 자세히
-        let mut lines: Vec<(String, String, bool)> = Vec::new(); // (id, 글자, 누를 수 있음)
-        for acc in &accounts {
-            let login = snap.logins.get(&acc.id);
-            let v = view(snap, acc);
-            let email = v.and_then(|v| v.email.clone()).or_else(|| login.and_then(|l| l.email.clone()));
-            let name = if !acc.label.is_empty() {
-                acc.label.clone()
-            } else {
-                email.unwrap_or_else(|| if acc.is_claude() { "Claude".into() } else { "ChatGPT".into() })
-            };
-            let plan = if acc.is_claude() {
-                login.and_then(|l| l.plan.clone()).map(|p| p.trim_start_matches("Claude ").trim_end_matches(" account").to_string())
-            } else {
-                v.and_then(|v| v.plan.as_deref()).map(codex::plan_label).filter(|p| !p.is_empty())
-            };
-            let brand = if acc.is_claude() { "Claude" } else { "ChatGPT" };
-            let head = match plan {
-                Some(p) => format!("{brand} · {name} · {p}"),
-                None => format!("{brand} · {name}"),
-            };
-            lines.push((format!("head:{}", acc.id), head, false));
-            if login.and_then(|l| l.logged_in) == Some(false) {
-                lines.push((format!("login:{}", acc.id), usagi_core::tr!("    로그인 필요 — 눌러서 로그인", "    Login required — click to log in").into(), true));
-                continue;
-            }
-            match v {
-                Some(v) if !v.meters.is_empty() => {
-                    for m in &v.meters {
-                        let left = ui::meter_left(state, &alert_key(&acc.id, &m.label));
-                        let val = if m.exact {
-                            let pct = ((if left { 1.0 - m.ratio } else { m.ratio }) * 100.0).round().max(0.0);
-                            let word = if left { usagi_core::tr!("남음", "left") } else { usagi_core::tr!("사용", "used") };
-                            format!("{pct:.0}% {word}")
-                        } else {
-                            "–".into()
-                        };
-                        let reset = m
-                            .resets_at
-                            .filter(|&r| r > now && m.exact)
-                            .map(|r| {
-                                let (dur, at) = (texts::fmt_duration(r - now), texts::fmt_clock(r, now));
-                                usagi_core::tr!(format!(" · {dur} 뒤 리셋 ({at})"), format!(" · resets in {dur} ({at})"))
-                            })
-                            .unwrap_or_default();
-                        // 메뉴 id는 저장된 그래프 이름, 보이는 글자는 언어에 맞춘 이름
-                        lines.push((format!("m:{}:{}", acc.id, m.label), format!("    {}  {val}{reset}", texts::meter_label(&m.label)), false));
-                    }
-                }
-                _ => lines.push((format!("wait:{}", acc.id), usagi_core::tr!("    사용량 받는 중…", "    Fetching usage…").into(), false)),
-            }
-        }
+        // ---- 메뉴: 명령만 (사용량은 메뉴 막대와 설정 창에서 봄)
         let mode = if self.time_mode() {
             usagi_core::tr!("퍼센트로 보기", "Show percent")
         } else {
             usagi_core::tr!("남은 시간으로 보기", "Show remaining time")
         };
-        // 언어도 넣어 둠: 바뀌면 고정 항목(설정 열기·새로고침·종료)까지 새 언어로 다시 만듦
-        let sig = format!("{lines:?}{mode}{}", usagi_core::i18n::lang().code());
+        // 언어도 넣어 둠: 바뀌면 항목 글자를 새 언어로 다시 만듦
+        let sig = format!("{mode}{}", usagi_core::i18n::lang().code());
         if sig == self.menu_sig {
             return;
         }
         self.menu_sig = sig;
         let menu = Menu::new();
         let _ = menu.append(&MenuItem::with_id("settings", usagi_core::tr!("설정 열기…", "Open settings…"), true, None));
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        for (i, (id, text, enabled)) in lines.iter().enumerate() {
-            if id.starts_with("head:") && i > 0 {
-                let _ = menu.append(&PredefinedMenuItem::separator());
-            }
-            let _ = menu.append(&MenuItem::with_id(id.as_str(), text, *enabled, None));
-        }
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&MenuItem::with_id("refresh", usagi_core::tr!("지금 새로고침", "Refresh now"), true, None));
         let _ = menu.append(&MenuItem::with_id("mode", mode, true, None));
@@ -387,14 +372,7 @@ impl App {
                 let fx = self.ctl.toggle_mode();
                 self.run(fx);
             }
-            other => {
-                if let Some(acc_id) = other.strip_prefix("login:") {
-                    // 설정 창에서 공식 로그인 진행 상황을 보여 줌
-                    self.open_settings();
-                    self.ctl.login_account(acc_id);
-                    self.push_settings();
-                }
-            }
+            _ => {}
         }
     }
 
@@ -409,6 +387,7 @@ impl App {
         match SettingsWindow::open(move || { let _ = proxy.send_event(UserEvent::SettingsInput); }) {
             Ok(s) => {
                 self.settings = Some(s);
+                self.preview_sent.set(0);
                 self.ctl.settings_opened();
             }
             Err(e) => {
@@ -418,9 +397,29 @@ impl App {
         }
     }
 
-    /// macOS에서 읽는 값: 로그인할 때 실행 (위젯 모니터·중요 알림은 없음)
+    /// macOS에서 읽는 값: 로그인할 때 실행, 메뉴 막대 미리 보기 (위젯 모니터·중요 알림은 없음)
     fn host_info(&self) -> HostInfo {
-        HostInfo { autostart: autostart_enabled(), ..HostInfo::default() }
+        HostInfo { autostart: autostart_enabled(), widget_preview: self.menubar_preview(), ..HostInfo::default() }
+    }
+
+    /// 설정 창 미리 보기: 지금 메뉴 막대 글자를 그림으로 (바뀌지 않았으면 그대로 두라는 표시만)
+    fn menubar_preview(&self) -> Option<serde_json::Value> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        if !self.ctl.wants_widget_preview() {
+            self.preview_sent.set(0);
+            return None;
+        }
+        let parts = self.title_parts(time::now());
+        let dark = self.tray.as_ref().is_some_and(crate::title::is_dark);
+        let mut h = DefaultHasher::new();
+        (parts.iter().map(|p| format!("{:?}{:?}{:?}", p.provider, p.items, p.note)).collect::<Vec<_>>(), dark, usagi_core::i18n::lang().code()).hash(&mut h);
+        let key = h.finish() | 1;
+        if self.preview_sent.get() == key {
+            return Some(serde_json::json!({ "keep": true }));
+        }
+        let p = crate::title::preview(&parts, dark)?;
+        self.preview_sent.set(key);
+        Some(serde_json::json!({ "w": p.w, "h": p.h, "scale": p.scale, "light": !dark, "rgba": b64::encode(&p.rgba) }))
     }
 
     fn push_settings(&self) {
@@ -451,10 +450,13 @@ fn esc_applescript(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// macOS 알림 (알림 센터)
+/// macOS 알림 (알림 센터). 앱 자체 알림을 쓸 수 없을 때만 osascript
 pub fn notify(title: &str, msg: &str) {
     use std::io::Write;
     use std::process::Stdio;
+    if crate::notify::send(title, msg) {
+        return;
+    }
     let script = format!("display notification \"{}\" with title \"{}\"", esc_applescript(msg), esc_applescript(title));
     let child = Command::new("/usr/bin/osascript").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     if let Ok(mut child) = child {
@@ -464,6 +466,40 @@ pub fn notify(title: &str, msg: &str) {
         std::thread::spawn(move || {
             let _ = child.wait();
         });
+    }
+}
+
+/// 디자인 확인용: 예시 값으로 메뉴 막대 미리 보기를 PNG로 (인자: 저장 경로, light, nobars, spent, time)
+#[cfg(debug_assertions)]
+pub fn write_menubar_preview(args: &[String]) {
+    use crate::title::{Bar, Item, Part};
+    use usagi_core::engine::ProviderId;
+    let has = |f: &str| args.iter().any(|a| a == f);
+    let path = args.first().cloned().unwrap_or_else(|| "menubar.png".into());
+    let (bars, time_mode) = (!has("nobars"), has("time"));
+    let item = |label: &str, ratio: f64, left: f64| Item {
+        label: label.into(),
+        bar: bars.then_some(Bar { fill: ratio, level: texts::level(ratio) }),
+        value: if time_mode { texts::fmt_hm_short(left) } else { texts::fmt_usage(ratio, false) },
+    };
+    let first = if has("spent") { 1.0 } else { 0.62 };
+    let claude = if has("loggedout") {
+        Part { provider: ProviderId::Claude, items: vec![], note: Some(texts::login_needed().into()) }
+    } else {
+        Part { provider: ProviderId::Claude, items: vec![item("5h", first, 2.0 * 3600.0 + 14.0 * 60.0), item("7d", 0.38, 4.0 * 86400.0 + 17.0 * 3600.0)], note: None }
+    };
+    let parts = vec![claude, Part { provider: ProviderId::Codex, items: vec![item("5h", 0.47, 3.0 * 3600.0), item("7d", 0.12, 5.0 * 86400.0)], note: None }];
+    let Some(p) = crate::title::preview(&parts, !has("light")) else {
+        eprintln!("미리 보기 실패");
+        return;
+    };
+    let mut px = p.rgba.clone();
+    for c in px.chunks_exact_mut(4) {
+        c[3] = 255;
+    }
+    match tiny_skia::Pixmap::from_vec(px, tiny_skia::IntSize::from_wh(p.w, p.h).unwrap()).map(|pm| pm.save_png(&path)) {
+        Some(Ok(())) => println!("{path} {}x{}", p.w, p.h),
+        _ => eprintln!("저장 실패"),
     }
 }
 
@@ -489,8 +525,14 @@ fn app_path() -> Option<std::path::PathBuf> {
 fn set_autostart(on: bool) -> Result<(), String> {
     let path = agent_path().ok_or(usagi_core::tr!("홈 폴더 찾기 실패", "Couldn't find the home folder"))?;
     if !on {
-        let _ = std::fs::remove_file(&path);
-        return Ok(());
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(usagi_core::tr!(
+                format!("시작 시 실행 해제 실패 ({error})"),
+                format!("Could not turn off start at login ({error})")
+            )),
+        };
     }
     let app = app_path().ok_or(usagi_core::tr!("앱 위치 찾기 실패", "Couldn't find the app location"))?;
     let target = app.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;");

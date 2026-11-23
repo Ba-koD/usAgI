@@ -2,14 +2,17 @@
 //!
 //! Codex는 로그에 서버가 알려준 사용률을 그대로 적어 둡니다:
 //!   "rate_limits":{"primary":{"used_percent":44.0,"window_minutes":10080,"resets_at":1795247489},...}
-//! 그래서 추정 없이 정확한 값을 씁니다. 거기에 더해 Codex `app-server`로 지금 값을 직접 읽습니다(토큰 소모 없음).
+//! 파일에 저장된 ChatGPT 로그인은 HTTPS로 사용량을 읽고, 필요할 때 Codex app-server에 맡깁니다.
+
+mod http;
 
 use crate::logs::{home_dir, walk_files};
 use crate::time::{self, DAY};
+use crate::usage_retry::{self, UsageError};
 use memchr::memmem;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -28,16 +31,9 @@ impl CodexWindow {
         }
     }
 
-    /// 다음 리셋 시각 (지난 리셋이면 창 길이만큼 넘겨서 추정)
+    /// The provider's reset, while it is still in the future.
     pub fn next_reset(&self, now: f64) -> Option<f64> {
-        let mut r = self.resets_at?;
-        let span = self.minutes as f64 * 60.0;
-        if span > 0.0 {
-            while r <= now {
-                r += span;
-            }
-        }
-        Some(r)
+        self.resets_at.filter(|&reset| reset > now)
     }
 }
 
@@ -47,9 +43,11 @@ pub struct CodexSnapshot {
     pub windows: Vec<CodexWindow>,
     pub plan: Option<String>,
     pub reached: bool,
-    /// 계정 이메일 (app-server의 account/read)
+    /// 계정 이메일
     #[serde(default)]
     pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     /// 크레딧 잔액 (app-server)
     #[serde(default)]
     pub credits: Option<Credits>,
@@ -132,100 +130,124 @@ pub fn parse_line(line: &[u8]) -> Option<CodexSnapshot> {
         plan: limits.plan_type,
         reached: limits.rate_limit_reached_type.is_some_and(|v| !v.is_null()),
         email: None,
+        workspace_id: None,
         credits: None,
         refills: None,
     })
 }
 
-/// 파일 끝부분에서 마지막 rate_limits 줄을 찾습니다 (큰 파일도 꼬리만 읽음).
-fn last_snapshot(path: &Path) -> Option<CodexSnapshot> {
-    let mut f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let mut tail = 1u64 << 20;
-    loop {
-        let start = len.saturating_sub(tail);
-        f.seek(SeekFrom::Start(start)).ok()?;
-        let mut buf = Vec::with_capacity((len - start) as usize);
-        f.by_ref().take(len - start).read_to_end(&mut buf).ok()?;
-        let finder = memmem::FinderRev::new(b"\"rate_limits\"");
-        let mut end = buf.len();
-        while let Some(pos) = finder.rfind(&buf[..end]) {
-            let line_start = memchr::memrchr(b'\n', &buf[..pos]).map(|i| i + 1).unwrap_or(0);
-            let line_end = memchr::memchr(b'\n', &buf[pos..]).map(|i| pos + i).unwrap_or(buf.len());
-            if line_start > 0 || start == 0 {
-                if let Some(s) = parse_line(&buf[line_start..line_end]) {
-                    return Some(s);
-                }
-            }
-            end = line_start.saturating_sub(1);
-            if end == 0 {
-                break;
-            }
-        }
-        if start == 0 || tail >= 64 << 20 {
-            return None;
-        }
-        tail *= 4;
+fn session_started_after(file: &mut File, connected_at: f64) -> bool {
+    let mut header = Vec::new();
+    if BufReader::new(file.take(256 * 1024)).read_until(b'\n', &mut header).is_err() {
+        return false;
     }
+    let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&header) else { return false };
+    meta["type"].as_str() == Some("session_meta")
+        && meta["timestamp"].as_str().and_then(time::parse_iso).is_some_and(|at| at >= connected_at)
+        && meta["payload"]["timestamp"].as_str().is_none_or(|timestamp| {
+            time::parse_iso(timestamp).is_some_and(|at| at >= connected_at)
+        })
+}
+
+/// 파일 끝부분에서 현재 연결에 해당하는 마지막 rate_limits 줄을 찾습니다.
+fn last_snapshot(f: &mut File, start: u64, len: u64, connected_at: Option<f64>) -> std::io::Result<(u64, Option<CodexSnapshot>)> {
+    let offset = len.saturating_sub(4 << 20).max(start);
+    let read_at = offset.saturating_sub(1);
+    f.seek(SeekFrom::Start(read_at))?;
+    let mut buf = Vec::new();
+    f.by_ref().take(len - read_at).read_to_end(&mut buf)?;
+    let next = read_at + memchr::memrchr(b'\n', &buf).map_or(0, |i| i as u64 + 1);
+    let finder = memmem::FinderRev::new(b"\"rate_limits\"");
+    let mut end = buf.len();
+    while let Some(pos) = finder.rfind(&buf[..end]) {
+        let line_start = memchr::memrchr(b'\n', &buf[..pos]).map(|i| i + 1).unwrap_or(0);
+        let line_end = memchr::memchr(b'\n', &buf[pos..]).map(|i| pos + i).unwrap_or(buf.len());
+        if line_start > 0 || offset == 0 {
+            if let Some(s) = parse_line(&buf[line_start..line_end]).filter(|s| connected_at.is_none_or(|at| s.ts >= at)) {
+                return Ok((next.max(start), Some(s)));
+            }
+        }
+        end = line_start.saturating_sub(1);
+        if end == 0 {
+            break;
+        }
+    }
+    Ok((next.max(start), None))
+}
+
+struct Rollout {
+    offset: u64,
+    len: u64,
+    modified: f64,
+    accepted: bool,
+    snapshot: Option<CodexSnapshot>,
 }
 
 pub struct CodexReader {
     pub roots: Vec<PathBuf>,
     pub max_age_days: f64,
-    last_file: Option<(PathBuf, u64, f64)>,
+    files: std::collections::HashMap<PathBuf, Rollout>,
     pub snapshot: Option<CodexSnapshot>,
     /// 마지막으로 폴더 전체를 훑은 시각
     last_full: f64,
+    connected_at: Option<f64>,
 }
 
 impl CodexReader {
     pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self { roots, max_age_days: 30.0, last_file: None, snapshot: None, last_full: 0.0 }
+        Self { roots, max_age_days: 30.0, files: Default::default(), snapshot: None, last_full: 0.0, connected_at: None }
     }
 
-    /// 가장 최근에 바뀐 rollout 파일을 다시 확인. 바뀌었으면 true.
+    pub(crate) fn for_connection(roots: Vec<PathBuf>, revision: u64) -> Self {
+        Self { connected_at: (revision != 0).then_some(revision as f64 / 1_000_000.0), ..Self::new(roots) }
+    }
+
+    /// Pick the newest usage event across concurrent rollouts.
     pub fn poll(&mut self) -> bool {
         let now = time::now();
-        // 폴더 전체는 가끔만 훑고, 그 사이엔 지금 보고 있는 파일이 바뀌었는지만 확인
-        if now - self.last_full < crate::logs::FULL_SCAN_SECS {
-            match &self.last_file {
-                Some((path, len, mtime)) => {
-                    let same = std::fs::metadata(path).is_ok_and(|m| m.len() == *len && crate::logs::mtime_secs(&m) == *mtime);
-                    if same {
-                        return false;
-                    }
-                }
-                None => return false,
+        let cutoff = (now - self.max_age_days * DAY).max(self.connected_at.unwrap_or(0.0));
+        let full = now - self.last_full >= crate::logs::FULL_SCAN_SECS;
+        let mut paths = Vec::new();
+        if full {
+            self.last_full = now;
+            for root in &self.roots {
+                walk_files(root, "jsonl", &mut paths);
             }
+            let present: std::collections::HashSet<_> = paths.iter().collect();
+            self.files.retain(|path, _| present.contains(path));
+        } else {
+            paths.extend(self.files.iter().filter(|(_, file)| file.modified >= now - crate::logs::HOT_SECS).map(|(path, _)| path.clone()));
         }
-        self.last_full = now;
-        let mut files = Vec::new();
-        for root in &self.roots {
-            walk_files(root, "jsonl", &mut files);
-        }
-        let cutoff = now - self.max_age_days * DAY;
-        let mut newest: Option<(PathBuf, u64, f64)> = None;
-        for path in files {
-            let Ok(meta) = std::fs::metadata(&path) else { continue };
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            if mtime >= cutoff && newest.as_ref().is_none_or(|n| mtime > n.2) {
-                newest = Some((path, meta.len(), mtime));
+        for path in paths {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                self.files.remove(&path);
+                continue;
+            };
+            let mtime = crate::logs::mtime_secs(&meta);
+            if mtime < cutoff {
+                self.files.remove(&path);
+                continue;
             }
+            let len = meta.len();
+            let prior = self.files.get(&path);
+            if prior.is_some_and(|file| file.len == len && file.modified == mtime) {
+                continue;
+            }
+            let Ok(mut file) = File::open(&path) else { continue };
+            let append = prior.filter(|old| old.accepted && len > old.len);
+            let accepted = append.is_some() || self.connected_at.is_none_or(|at| session_started_after(&mut file, at));
+            let start = append.map_or(0, |old| old.offset);
+            let (offset, snapshot) = if accepted {
+                let Ok((offset, snapshot)) = last_snapshot(&mut file, start, len, self.connected_at) else { continue };
+                (offset, snapshot.or_else(|| append.and_then(|old| old.snapshot.clone())))
+            } else { (0, None) };
+            self.files.insert(path, Rollout { offset, len, modified: mtime, accepted, snapshot });
         }
-        if newest == self.last_file {
-            return false;
-        }
-        self.last_file = newest.clone();
-        let snap = newest.and_then(|(p, _, _)| last_snapshot(&p));
-        let changed = snap != self.snapshot;
-        if snap.is_some() || self.last_file.is_none() {
-            self.snapshot = snap;
-        }
+        let best = self.files.iter().filter_map(|(path, file)| Some((path, file.snapshot.as_ref()?)))
+            .max_by(|(path_a, a), (path_b, b)| a.ts.total_cmp(&b.ts).then_with(|| path_a.cmp(path_b)))
+            .map(|(_, snapshot)| snapshot);
+        let changed = self.snapshot.as_ref() != best;
+        if changed { self.snapshot = best.cloned(); }
         changed
     }
 }
@@ -244,6 +266,69 @@ pub fn window_label(minutes: u32) -> String {
 mod tests {
     use super::*;
 
+    fn session_line(at: &str) -> String {
+        serde_json::json!({"type": "session_meta", "timestamp": at, "payload": {"timestamp": at}}).to_string() + "\n"
+    }
+
+    fn quota_line(at: &str, percent: u32) -> String {
+        serde_json::json!({
+            "timestamp": at, "type": "event_msg",
+            "payload": { "rate_limits": { "primary": { "used_percent": percent, "window_minutes": 10080 } } }
+        }).to_string() + "\n"
+    }
+
+    #[test]
+    fn new_connection_skips_old_sessions_even_if_they_are_still_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = "2025-01-01T15:00:00Z";
+        let after = "2025-01-01T16:00:00Z";
+        let revision = (time::parse_iso("2025-01-01T15:30:00Z").unwrap() * 1_000_000.0) as u64;
+        std::fs::write(dir.path().join("old.jsonl"), session_line(before) + &quota_line(after, 80)).unwrap();
+        std::fs::write(dir.path().join("unidentified.jsonl"), quota_line(after, 90)).unwrap();
+        let mut reader = CodexReader::for_connection(vec![dir.path().to_owned()], revision);
+        assert!(!reader.poll());
+        assert!(reader.snapshot.is_none());
+        std::fs::write(dir.path().join("new.jsonl"), session_line(after) + &quota_line(after, 10)).unwrap();
+        reader.last_full = 0.0;
+        assert!(reader.poll());
+        assert_eq!(reader.snapshot.as_ref().unwrap().windows[0].used_percent, 10.0);
+    }
+
+    #[test]
+    fn appending_to_the_current_session_does_not_rescan_the_folders() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracked.jsonl");
+        let at = "2025-01-01T16:00:00Z";
+        std::fs::write(&path, quota_line(at, 20)).unwrap();
+        let mut reader = CodexReader::new(vec![dir.path().to_owned()]);
+        assert!(reader.poll());
+        let last_scan = reader.last_full;
+        let mut log = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        log.write_all(quota_line(at, 50).as_bytes()).unwrap();
+        assert!(reader.poll());
+        assert_eq!(reader.last_full, last_scan);
+        assert_eq!(reader.snapshot.as_ref().unwrap().windows[0].used_percent, 50.0);
+    }
+
+    #[test]
+    fn chooses_newest_quota_event_instead_of_last_modified_rollout() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let older_event = dir.path().join("older.jsonl");
+        let newer_event = dir.path().join("newer.jsonl");
+        std::fs::write(&newer_event, quota_line("2026-11-23T16:10:00Z", 40)).unwrap();
+        std::fs::write(&older_event, quota_line("2026-11-23T16:00:00Z", 10)).unwrap();
+        let mut reader = CodexReader::new(vec![dir.path().to_owned()]);
+        assert!(reader.poll());
+        assert_eq!(reader.snapshot.as_ref().unwrap().windows[0].used_percent, 40.0);
+
+        let mut older = std::fs::OpenOptions::new().append(true).open(older_event).unwrap();
+        older.write_all(quota_line("2026-11-23T16:20:00Z", 55).as_bytes()).unwrap();
+        assert!(reader.poll());
+        assert_eq!(reader.snapshot.as_ref().unwrap().windows[0].used_percent, 55.0);
+    }
+
     #[test]
     fn parses_rate_limits_line() {
         let line = br#"{"timestamp":"2026-11-15T10:12:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":44.0,"window_minutes":10080,"resets_at":1795247489},"secondary":{"used_percent":12.5,"window_minutes":300,"resets_at":1795200000},"plan_type":"plus","rate_limit_reached_type":null}}}"#;
@@ -255,7 +340,7 @@ mod tests {
         assert!(!s.reached);
         assert_eq!(s.windows[1].ratio_at(1_795_247_490.0), 0.0); // 리셋 지남
         assert!((s.windows[1].ratio_at(1_795_000_000.0) - 0.44).abs() < 1e-9);
-        assert_eq!(s.windows[1].next_reset(1_795_247_490.0), Some(1_795_247_489.0 + 10080.0 * 60.0));
+        assert_eq!(s.windows[1].next_reset(1_795_247_490.0), None);
     }
 
     #[test]
@@ -283,12 +368,13 @@ mod tests {
 /// 공식 Codex CLI의 `app-server`에 계정 사용률을 물어봅니다 (Codex VS Code 확장과 같은 방식).
 /// 모델을 부르지 않으므로 토큰을 쓰지 않고, 사용량 창을 새로 열지도 않습니다.
 /// 로그인 토큰은 Codex가 직접 다루며 usAgI는 보지 않습니다.
-pub fn read_via_app_server(acc: &crate::accounts::Account) -> Result<CodexSnapshot, String> {
+fn app_server_usage(acc: &crate::accounts::Account) -> Result<CodexSnapshot, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
     use std::time::Duration;
 
     let mut last_err = String::from(crate::tr!("Codex CLI 찾기 실패", "Codex CLI not found"));
+    let identity_before = http::profile_identity(&acc.path());
     for prog in crate::login::programs_or_hint("codex")? {
         let mut cmd = crate::login::quiet_command(&prog);
         cmd.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
@@ -371,12 +457,43 @@ pub fn read_via_app_server(acc: &crate::accounts::Account) -> Result<CodexSnapsh
         let _ = child.kill();
         let _ = child.wait();
         return result.map(|mut s| {
+            let identity_after = http::profile_identity(&acc.path());
+            if let Some((workspace, file_email)) = identity_after.filter(|identity| Some(identity) == identity_before.as_ref()) {
+                if email.as_deref().is_some_and(|email| email.eq_ignore_ascii_case(&file_email)) {
+                    s.workspace_id = Some(workspace);
+                }
+            }
             s.email = email;
             s.plan = plan.or(s.plan);
             s
         });
     }
     Err(last_err)
+}
+
+/// Read the current quotas without starting Codex when its file-based session is usable.
+pub fn read_usage(acc: &crate::accounts::Account) -> Result<CodexSnapshot, String> {
+    refresh_usage(acc).map_err(|error| error.to_string())
+}
+
+pub(crate) fn refresh_usage(acc: &crate::accounts::Account) -> Result<CodexSnapshot, UsageError> {
+    usage_retry::run(&acc.usage_key(), || match http::read(acc) {
+        Ok(Some(snapshot)) => Ok(snapshot),
+        Ok(None) => http::recover_with_cli(&acc.path(), || app_server_usage(acc)),
+        Err(error) => Err(error),
+    })
+}
+
+pub(crate) fn recover_usage(acc: &crate::accounts::Account) -> Result<CodexSnapshot, UsageError> {
+    usage_retry::run(&acc.usage_key(), || http::recover_with_cli(&acc.path(), || app_server_usage(acc)))
+}
+
+pub(crate) fn profile_identity(dir: &Path) -> Option<(String, String)> {
+    http::profile_identity(dir)
+}
+
+pub(crate) fn file_login_status(dir: &Path) -> Option<crate::login::LoginStatus> {
+    http::login_status(dir)
 }
 
 /// Codex(app-server)가 알려 주는 요금제 ID → 표시 이름.
@@ -422,6 +539,7 @@ pub fn parse_app_server(r: &serde_json::Value, now: f64) -> Result<CodexSnapshot
         plan: limits.get("planType").and_then(|p| p.as_str()).map(str::to_string),
         reached: limits.get("rateLimitReachedType").is_some_and(|v| !v.is_null()),
         email: None,
+        workspace_id: None,
         credits: limits.get("credits").filter(|c| !c.is_null()).map(|c| Credits {
             has: c.get("hasCredits").and_then(|v| v.as_bool()).unwrap_or(false),
             unlimited: c.get("unlimited").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -446,14 +564,8 @@ pub(crate) fn saved_path(account_id: &str) -> PathBuf {
     crate::config::config_dir().join(format!("codex-usage-{safe}.json"))
 }
 
-pub fn save(account_id: &str, s: &CodexSnapshot) {
-    let _ = std::fs::create_dir_all(crate::config::config_dir());
-    if let Ok(text) = serde_json::to_string(s) {
-        let tmp = saved_path(account_id).with_extension("json.tmp");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, saved_path(account_id));
-        }
-    }
+pub fn save(account_id: &str, s: &CodexSnapshot) -> std::io::Result<()> {
+    crate::config::write_json(&saved_path(account_id), s)
 }
 
 pub fn load(account_id: &str) -> Option<CodexSnapshot> {

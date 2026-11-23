@@ -153,6 +153,37 @@ impl Animator {
         }
     }
 
+    /// Time until the next visible change, after evaluating `frame` at `now`.
+    pub fn frame_delay(&self, now: f64) -> f64 {
+        const FRAME: f64 = 0.066;
+        if now < self.peek_until && self.mood != Some(Mood::Nap) {
+            return self.peek_until - now;
+        }
+        match self.mood {
+            Some(Mood::Nap) => 0.3 - (now % 2.4) % 0.3,
+            Some(Mood::Tired) => FRAME,
+            Some(Mood::Hop) => {
+                let (hop, pause) = hop_timing(self.hop_speed);
+                let phase = (now - self.hop_origin).rem_euclid(hop + pause);
+                if phase < hop { FRAME } else { hop + pause - phase }
+            }
+            Some(Mood::Rest) | None => {
+                let binky = now - self.binky_start;
+                if (self.idle_act.is_none() && (0.0..0.55).contains(&binky))
+                    || (self.long_idle && self.idle_act.is_some())
+                {
+                    return FRAME;
+                }
+                let twitch = if now < self.twitch_until { self.twitch_until } else { self.next_twitch };
+                let mut next = twitch.min(self.next_binky);
+                if self.long_idle {
+                    next = next.min(self.next_idle_act);
+                }
+                (next - now).max(0.0)
+            }
+        }
+    }
+
     fn hop(&self, pose: Pose, now: f64, speed: u8) -> Pose {
         let (hop, pause) = hop_timing(speed);
         let t = ((now - self.hop_origin).rem_euclid(hop + pause)) / hop;
@@ -246,6 +277,18 @@ mod tests {
     use super::*;
     use crate::tracker::Tracker;
     use crate::logs::UsageEvent;
+
+    #[test]
+    fn rest_schedules_fast_frames_only_during_motion() {
+        let now = 1_795_000_000.0;
+        let mut animator = Animator::new(7);
+        animator.frame(now);
+        assert_eq!(animator.frame_delay(now), 0.066);
+        animator.frame(now + 0.6);
+        assert!((animator.frame_delay(now + 0.6) - 0.3).abs() < 0.001);
+        animator.frame(now + 1.0);
+        assert!(animator.frame_delay(now + 1.0) > 1.0);
+    }
 
     #[test]
     fn hop_frames_are_finite() {

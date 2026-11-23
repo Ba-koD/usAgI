@@ -9,13 +9,14 @@
 //! Current week (Fable): 0% used · resets Nov 22, 10am (Asia/Seoul)
 //! ```
 //!
-//! 혹시 CLI가 이 명령을 모르는 버전이면 모델 요청으로 처리될 수 있으므로, 결과에 모델 사용이
-//! 보이면 그 계정은 이번 실행 동안 다시 쓰지 않고 기존 확인 방식([`crate::probe`])으로 돌아갑니다.
+//! 파일 기반 로그인은 HTTPS로 먼저 확인합니다. CLI가 `/usage`에 모델을 호출한 것으로
+//! 확인되면 그 계정에는 같은 명령을 다시 보내지 않습니다.
 
 use crate::accounts::Account;
 use crate::bridge::{BridgeFile, BridgeWindow, ModelWindow};
 use crate::logs::parse_reset;
 use crate::probe::run_cli;
+use crate::usage_retry::{self, UsageError};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -40,6 +41,39 @@ static UNSUPPORTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 pub fn supported(account_id: &str) -> bool {
     UNSUPPORTED.lock().ok().is_none_or(|g| g.as_ref().is_none_or(|s| !s.contains(account_id)))
+}
+
+pub(crate) fn available(acc: &Account) -> bool {
+    supported(&acc.usage_key()) || crate::claude_oauth::available(&acc.path())
+}
+
+pub(crate) fn read_usage(acc: &Account) -> Result<BridgeFile, UsageError> {
+    read_usage_for_session(acc, None)
+}
+
+pub(crate) fn read_usage_for_session(acc: &Account, fingerprint: Option<u64>) -> Result<BridgeFile, UsageError> {
+    usage_retry::run(&acc.usage_key(), || {
+        if let Some(usage) = crate::claude_oauth::read(acc, fingerprint)? {
+            return Ok(usage);
+        }
+        let rejected = crate::claude_oauth::file_session_rejected(&acc.path());
+        let result = if supported(&acc.usage_key()) {
+            run(acc)
+        } else {
+            Err(crate::tr!(
+                "설치된 Claude Code 버전은 사용량 조회 미지원. Claude Code 업데이트 필요",
+                "This Claude Code version does not support usage checks. Update Claude Code."
+            ).into())
+        };
+        result.map_err(|error| UsageError::Failed(if rejected {
+            crate::tr!(
+                format!("Claude 인증 거부 (401/403) · {error}"),
+                format!("Claude authentication was rejected (401/403) · {error}")
+            )
+        } else {
+            error
+        }))
+    })
 }
 
 fn mark_unsupported(account_id: &str) {
@@ -94,7 +128,7 @@ pub fn run(acc: &Account) -> Result<BridgeFile, String> {
     let model_used = v.get("modelUsage").and_then(|m| m.as_object()).is_some_and(|m| !m.is_empty())
         || v.get("total_cost_usd").and_then(|c| c.as_f64()).is_some_and(|c| c > 0.0);
     if model_used {
-        mark_unsupported(&acc.id);
+        mark_unsupported(&acc.usage_key());
         return Err(crate::tr!("이 Claude Code 버전은 /usage 바로 실행 불가", "This Claude Code version cannot run /usage directly").into());
     }
     let text = v.get("result").and_then(|r| r.as_str()).unwrap_or("");

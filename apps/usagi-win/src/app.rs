@@ -42,7 +42,6 @@ const TIMER_ANIM: usize = 10;
 const TIMER_PLACE: usize = 11;
 const TIMER_RECHECK: usize = 12;
 const TIMER_RETRY_ADD: usize = 13;
-const FRAME_MS: u32 = 66;
 const FAST_FRAME_MS: u32 = 15;
 
 
@@ -85,11 +84,13 @@ struct App {
     icon_size: u32,
     taskbar_created: u32,
     hook: HWINEVENTHOOK,
-    /// 위젯이 움직이는 동안 틱을 촘촘하게 (16ms)
-    fast_anim: bool,
+    frame_ms: u32,
+    last_control_tick: f64,
     /// 위젯 내용을 다시 계산해야 함 (사용량·설정이 바뀜). 아니면 1초에 한 번만.
     widget_dirty: bool,
     last_widget: f64,
+    /// 설정 창에 마지막으로 보낸 위젯 미리 보기 (같으면 다시 보내지 않음). 0 = 보낸 적 없음
+    preview_sent: std::cell::Cell<u64>,
 }
 
 impl App {
@@ -162,10 +163,12 @@ impl App {
         }
         let (on, side) = (self.widget_on(), self.side());
         let bar = self.ctl.state().pref_f64("barPx").map(|v| v as f32);
+        let bars = self.ctl.state().pref_bool("bars", true);
         for w in &mut self.widgets {
             w.enabled = on;
             w.side = side;
             w.bar_px = bar;
+            w.bars = bars;
             w.reposition();
         }
         // 위젯을 꺼 뒀으면 작업 표시줄 버튼 위치를 물어볼 필요가 없음
@@ -180,31 +183,20 @@ impl App {
 
     // -------------------------------------------------------------- 그리기
 
-    fn frame(&mut self) {
-        let now = time::now();
-        let pose = self.anim.frame(now);
-        // 알림 영역 토끼: 로고 색 설정을 따름 (자동이면 작업 표시줄 색). 위젯 글자는 아래 ink(작업 표시줄 색) 그대로
-        let (ink, size, tray_ink) = (self.ink, self.icon_size, self.logo_ink());
-        let key = hash_of(&(pose, tray_ink, size));
-        self.tray.set_icon(key, || (rabbit::render(&pose, size), size, tray_ink));
-        if !self.tray.is_added() {
-            self.schedule_retry();
-        }
-        // 위젯: 값이 차오르는 중이거나 내용이 바뀌었을 때만 매 틱 다시 계산, 평소엔 1초에 한 번 (남은 시간 글자)
-        let animating = self.widgets.iter().any(|w| w.animating());
-        if !(self.widget_dirty || animating || now - self.last_widget >= 1.0) {
-            return;
-        }
-        self.widget_dirty = false;
-        self.last_widget = now;
-        let sections: Vec<Section> = self
+    /// 위젯에 보일 내용: 계정마다 켜 둔 그래프의 라벨·값·비율
+    fn widget_sections(&self, now: f64) -> Vec<Section> {
+        self
             .ctl
             .snap
             .as_ref()
             .map(|s| {
                 s.visible()
-                    .filter(|p| !p.meters.is_empty())
+                    .filter(|p| !p.meters.is_empty() || s.logged_out(&p.account_id))
                     .map(|p| {
+                        // 로그아웃: 예전 값 대신 "로그인 필요"
+                        if s.logged_out(&p.account_id) {
+                            return Section { id: p.id, key: p.account_id.clone(), rows: Vec::new(), note: Some(texts::login_needed().into()) };
+                        }
                         let rows: Vec<Row> = p
                             .meters
                             .iter()
@@ -213,7 +205,7 @@ impl App {
                                 let left = self.meter_left(&usagi_core::engine::alert_key(&p.account_id, &m.label));
                                 let percent = m.exact && self.mode() == ValueMode::Percent;
                                 let value = if percent {
-                                    texts::fmt_pct(if left { (1.0 - m.ratio).max(0.0) } else { m.ratio })
+                                    texts::fmt_usage(m.ratio, left)
                                 } else {
                                     texts::meter_value(m, self.mode(), now)
                                 };
@@ -228,22 +220,71 @@ impl App {
                                 Row { key: m.label.clone(), label, value, ratio: if m.exact { m.ratio } else { 0.0 }, left, percent, short }
                             })
                             .collect();
-                        Section { id: p.id, key: p.account_id.clone(), rows }
+                        Section { id: p.id, key: p.account_id.clone(), rows, note: None }
                     })
-                    .filter(|s| !s.rows.is_empty()) // 그래프를 모두 끈 계정은 위젯에서 빠짐
+                    .filter(|s| !s.rows.is_empty() || s.note.is_some()) // 그래프를 모두 끈 계정은 위젯에서 빠짐
                     .collect()
             })
-            .unwrap_or_default();
-        // 위젯엔 토끼를 그리지 않음 (토끼는 알림 영역 아이콘으로만)
-        let rabbit: Option<Pose> = None;
-        let content = Content { sections, rabbit, ink, time_mode: self.mode() == ValueMode::Remaining };
-        for w in &mut self.widgets {
-            w.update(content.clone());
+            .unwrap_or_default()
+    }
+
+    /// 설정 창에 보일 위젯 미리 보기: 지금 계정·값·설정대로 그린 그림을 작업 표시줄 색 위에 합성.
+    /// 지난번에 보낸 것과 같으면 다시 보내지 않음 ({keep: true}), 보일 게 없으면 None
+    fn widget_preview(&self) -> Option<serde_json::Value> {
+        if !self.ctl.wants_widget_preview() {
+            self.preview_sent.set(0);
+            return None;
         }
-        let fast = self.widgets.iter().any(|w| w.animating());
-        if fast != self.fast_anim {
-            self.fast_anim = fast;
-            unsafe { SetTimer(self.host, TIMER_ANIM, if fast { FAST_FRAME_MS } else { FRAME_MS }, None) };
+        let sections = self.widget_sections(time::now());
+        if sections.is_empty() {
+            self.preview_sent.set(0);
+            return None;
+        }
+        let bars = self.ctl.state().pref_bool("bars", true);
+        let bar_px = self.ctl.state().pref_f64("barPx").map(|v| v as f32);
+        let scale = win::taskbar_dpi() as f32 / 96.0;
+        let light = win::taskbar_is_light();
+        let content = Content { sections, rabbit: None, ink: self.ink, time_mode: self.mode() == ValueMode::Remaining };
+        let key = hash_of(&(format!("{content:?}"), bars, bar_px.map(|v| v as i32), light, (scale * 100.0) as i32)) | 1;
+        if self.preview_sent.get() == key {
+            return Some(json!({ "keep": true }));
+        }
+        self.preview_sent.set(key);
+        Some(crate::widget::preview_json(&content, bars, bar_px, scale, light))
+    }
+
+    fn frame(&mut self) {
+        let now = time::now();
+        let pose = self.anim.frame(now);
+        // 알림 영역 토끼: 로고 색 설정을 따름 (자동이면 작업 표시줄 색). 위젯 글자는 아래 ink(작업 표시줄 색) 그대로
+        let (ink, size, tray_ink) = (self.ink, self.icon_size, self.logo_ink());
+        let key = hash_of(&(pose, tray_ink, size));
+        self.tray.set_icon(key, || (rabbit::render(&pose, size), size, tray_ink));
+        if !self.tray.is_added() {
+            self.schedule_retry();
+        }
+        // 위젯: 값이 차오르는 중이거나 내용이 바뀌었을 때만 매 틱 다시 계산, 평소엔 1초에 한 번 (남은 시간 글자)
+        let enabled = self.widgets.iter().any(|w| w.enabled);
+        let animating = self.widgets.iter().any(|w| w.enabled && w.animating());
+        if enabled && (self.widget_dirty || animating || now - self.last_widget >= 1.0) {
+            self.widget_dirty = false;
+            self.last_widget = now;
+            let sections = self.widget_sections(now);
+            let content = Content { sections, rabbit: None, ink, time_mode: self.mode() == ValueMode::Remaining };
+            for w in self.widgets.iter_mut().filter(|w| w.enabled) {
+                w.update(content.clone());
+            }
+        }
+        let frame_ms = if self.widgets.iter().any(|w| w.enabled && w.animating()) {
+            FAST_FRAME_MS
+        } else {
+            let control = if self.ctl.busy() { 0.2 } else { 1.0 };
+            let widget = if enabled { self.last_widget + 1.0 - now } else { 1.0 };
+            (self.anim.frame_delay(now).min(control).min(widget) * 1000.0).ceil().clamp(10.0, 1000.0) as u32
+        };
+        if frame_ms != self.frame_ms {
+            self.frame_ms = frame_ms;
+            unsafe { SetTimer(self.host, TIMER_ANIM, frame_ms, None) };
         }
     }
 
@@ -277,7 +318,7 @@ impl App {
                 Effect::Push => push = true,
                 Effect::Redraw => self.redraw(),
                 Effect::PlatformPref(key) => {
-                    if matches!(key.as_str(), "widget" | "side" | "monitor" | "barPx") {
+                    if matches!(key.as_str(), "widget" | "side" | "monitor" | "barPx" | "bars") {
                         self.sync_widgets();
                     }
                     if key == "logo" {
@@ -295,7 +336,11 @@ impl App {
                 Effect::OpenText(path) => shell_open(&path.to_string_lossy()),
                 Effect::OpenNotifySettings => shell_open("ms-settings:notifications"),
                 Effect::Notify(title, body) => self.notify(&title, &body),
-                Effect::SetAutostart(on) => crate::autostart::set(on),
+                Effect::SetAutostart(on) => {
+                    if let Err(error) = crate::autostart::set(on) {
+                        self.ctl.set_error(error);
+                    }
+                }
                 Effect::CloseSettings => {
                     self.settings = None;
                     queue.extend(self.ctl.settings_closed());
@@ -380,6 +425,8 @@ impl App {
         match settings::open(self.host) {
             Ok(s) => {
                 self.settings = Some(s);
+                // 새 설정 창에는 미리 보기 그림을 처음부터 다시 보냄
+                self.preview_sent.set(0);
                 self.ctl.settings_opened();
             }
             Err(e) => unsafe {
@@ -407,6 +454,7 @@ impl App {
             .collect();
         HostInfo {
             taskbar_light: Some(win::taskbar_is_light()),
+            widget_preview: self.widget_preview(),
             bar_range: Some(crate::widget::bar_range()).map(|(a, b, c)| (a.round() as f64, b.round() as f64, c.round() as f64)),
             autostart: crate::autostart::enabled(),
             urgent_supported: crate::toast::urgent_supported(),
@@ -491,9 +539,11 @@ impl App {
                 match wp {
                     TIMER_ANIM => {
                         self.frame();
-                        // 로그인 진행·재확인, 업데이트 확인 시각은 컨트롤러가 스스로 셈
-                        let fx = self.ctl.tick();
-                        if !fx.is_empty() {
+                        let now = time::now();
+                        let interval = if self.ctl.busy() { 0.2 } else { 1.0 };
+                        if now - self.last_control_tick >= interval {
+                            self.last_control_tick = now;
+                            let fx = self.ctl.tick();
                             self.run(fx);
                         }
                     }
@@ -707,7 +757,6 @@ pub fn run(from_autostart: bool) {
             }
         }
     }
-    crate::uia::start(); // 작업 표시줄 실제 버튼 위치 (위젯이 버튼을 가리지 않게)
     let ink = win::theme_ink();
     let mut tray = Tray::new(host);
     tray.set_balloon_icon(&rabbit::render(&Pose::default(), 64), 64, ink);
@@ -719,13 +768,15 @@ pub fn run(from_autostart: bool) {
         tray,
         widgets: Vec::new(),
         settings: None,
+        preview_sent: std::cell::Cell::new(0),
         ctl: Controller::new(engine, Platform { name: "windows", repo: crate::updater::REPO, managed_update: None }),
         anim: Animator::new(seed),
         ink,
         icon_size: win::small_icon_size(),
         taskbar_created: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
         hook,
-        fast_anim: false,
+        frame_ms: 0,
+        last_control_tick: 0.0,
         widget_dirty: true,
         last_widget: 0.0,
     };
@@ -735,14 +786,15 @@ pub fn run(from_autostart: bool) {
             app.tray.set_tip(usagi_core::tr!("usAgI · 불러오는 중…", "usAgI · Loading…"));
             app.sync_widgets();
             app.frame();
-            crate::updater::cleanup(); // 업데이트 뒤 남은 예전 exe
             crate::autostart::refresh(); // 자동 실행이 켜져 있으면 지금 위치로 로그온 작업을 맞춤 (예전 Run 등록은 옮김)
             let fx = app.ctl.startup();
             app.run(fx);
+            if !from_autostart && usagi_core::accounts::load(app.ctl.state()).is_empty() {
+                app.open_settings();
+            }
         }
     });
     unsafe {
-        SetTimer(host, TIMER_ANIM, FRAME_MS, None);
         SetTimer(host, TIMER_PLACE, 1000, None);
     }
 

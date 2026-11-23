@@ -187,6 +187,20 @@ pub fn fmt_pct(ratio: f64) -> String {
     }
 }
 
+/// 다 썼는지 (화면에 100% 사용 · 0% 남음으로 보이는 때)
+pub fn spent(ratio: f64) -> bool {
+    (ratio * 100.0).round() >= 100.0
+}
+
+/// 사용량 글자: 다 썼으면 "소진", 아니면 퍼센트 (`left`면 남은 양 기준)
+pub fn fmt_usage(ratio: f64, left: bool) -> String {
+    if spent(ratio) {
+        crate::tr!("소진", "Used up").into()
+    } else {
+        fmt_pct(if left { (1.0 - ratio).max(0.0) } else { ratio })
+    }
+}
+
 /// 막대 색 단계: 0 여유(초록), 1 주의(주황), 2 위험(빨강)
 pub fn level(ratio: f64) -> u8 {
     if ratio >= 0.8 {
@@ -239,12 +253,26 @@ pub fn wake_line(st: &Status) -> String {
     }
 }
 
+/// 로그아웃된 계정 자리에 보이는 글자 (위젯·메뉴 막대·툴팁)
+pub fn login_needed() -> &'static str {
+    crate::tr!("로그인 필요", "Login required")
+}
+
+/// 툴팁 한 줄: 로그아웃된 계정은 값 대신 로그인 필요
+fn account_line(snap: &Snapshot, p: &ProviderView) -> String {
+    if snap.logged_out(&p.account_id) {
+        format!("{} · {}", p.name, login_needed())
+    } else {
+        provider_line(p)
+    }
+}
+
 pub fn provider_line(p: &ProviderView) -> String {
     if !p.meters.iter().any(|m| m.exact) {
         return crate::tr!(format!("{} · 연결 필요", p.name), format!("{} · Not connected", p.name));
     }
     let parts: Vec<String> =
-        p.meters.iter().map(|m| format!("{} {}", meter_label(&m.label), fmt_pct(m.ratio))).collect();
+        p.meters.iter().map(|m| format!("{} {}", meter_label(&m.label), fmt_usage(m.ratio, false))).collect();
     format!("{} {}", p.name, parts.join(" · "))
 }
 
@@ -256,7 +284,7 @@ pub fn tooltip(snap: Option<&Snapshot>) -> String {
         Some(st) if st.has_data => {
             lines.push(APP_NAME.to_string());
             for p in snap.visible() {
-                lines.push(provider_line(p));
+                lines.push(account_line(snap, p));
             }
             let fl = forecast_line(st);
             if !fl.is_empty() {
@@ -267,7 +295,7 @@ pub fn tooltip(snap: Option<&Snapshot>) -> String {
         _ => {
             lines.push(APP_NAME.to_string());
             for p in &snap.providers {
-                lines.push(provider_line(p));
+                lines.push(account_line(snap, p));
             }
             if snap.providers.is_empty() {
                 lines.push(crate::tr!("사용 기록 없음", "No usage data").into());
@@ -288,7 +316,7 @@ pub fn menu_lines(snap: Option<&Snapshot>) -> Vec<String> {
     for p in &snap.providers {
         for m in &p.meters {
             let mut line =
-                format!("{} {} {}", p.name, meter_label(&m.label), if m.exact { fmt_pct(m.ratio) } else { "–".into() });
+                format!("{} {} {}", p.name, meter_label(&m.label), if m.exact { fmt_usage(m.ratio, false) } else { "–".into() });
             if let Some(r) = m.resets_at {
                 line += &crate::tr!(format!(" · {} 리셋", fmt_clock(r, snap.now)), format!(" · resets {}", when_en(r, snap.now)));
             }
@@ -323,7 +351,7 @@ pub fn meter_value(m: &Meter, mode: ValueMode, now: f64) -> String {
         return "–".into(); // 추정치는 보여 주지 않음
     }
     match mode {
-        ValueMode::Percent => fmt_pct(m.ratio),
+        ValueMode::Percent => fmt_usage(m.ratio, false),
         ValueMode::Remaining => m.resets_at.filter(|&r| r > now).map(|r| fmt_hm(r - now)).unwrap_or_else(|| "–".into()),
     }
 }
@@ -407,6 +435,14 @@ mod tests {
     fn pct_and_levels() {
         assert_eq!(fmt_pct(0.374), "37%");
         assert_eq!(fmt_pct(1.2), "100%+");
+        // 다 썼으면 숫자 대신 "소진" (사용량·남은 양 기준 모두). 99.4%는 99%로 보이므로 아직 아님
+        assert_eq!(fmt_usage(1.0, false), "소진");
+        assert_eq!(fmt_usage(1.2, true), "소진");
+        assert_eq!(fmt_usage(0.996, true), "소진");
+        assert_eq!(fmt_usage(0.994, false), "99%");
+        assert_eq!(fmt_usage(0.994, true), "1%");
+        assert_eq!(fmt_usage(0.25, true), "75%");
+        assert!(spent(1.0) && !spent(0.99));
         assert_eq!((level(0.2), level(0.6), level(0.85)), (0, 1, 2));
     }
 

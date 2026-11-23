@@ -6,7 +6,7 @@ cask "usagi" do
   version "{{VERSION}}"
   sha256 "{{SHA256}}"
 
-  url "https://github.com/{{REPO}}/releases/download/v#{version}/usAgI-mac-#{version}.zip"
+  url "https://github.com/{{REPO}}/releases/download/v#{version}/usAgI-mac.zip"
   name "usAgI"
   desc "AI 구독 사용량(5시간·주간)을 메뉴 막대에 보여 주는 앱"
   homepage "https://github.com/{{REPO}}"

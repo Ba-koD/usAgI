@@ -19,7 +19,7 @@ mod widget;
 mod win;
 
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use usagi_core::{accounts, bridge, config, engine, texts};
 
 fn main() {
@@ -29,6 +29,8 @@ fn main() {
         Some(usagi_settings::SETTINGS_ARG) => usagi_settings::main_window(),
         Some("statusline") => statusline(&args),
         Some("--widget-preview") => widget_preview(args.get(2).map(String::as_str).unwrap_or("widget-preview.bmp")),
+        // 디자인 확인용: 설정 창 미리 보기에 보내는 것과 같은 자료를 예시 값으로 출력
+        Some("--widget-preview-json") => widget_preview_json(&args[2..]),
         Some("--test-notify") => {
             // 알림 확인용: 설정의 "방해 금지 중에도 알림"을 따라 한 번 보냄
             toast::refresh_icon();
@@ -103,7 +105,7 @@ fn statusline(args: &[String]) {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let line = bridge::run_statusline(&input, &account);
-    let chain = accounts::load(&config::State::load()).into_iter().find(|a| a.id == account).and_then(|a| a.chain);
+    let chain = accounts::load(&config::State::load()).into_iter().find(|a| a.usage_key() == account).and_then(|a| a.chain);
     let out = chain.and_then(|cmd| run_chain(&cmd, &input)).unwrap_or(line);
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(out.as_bytes());
@@ -117,20 +119,12 @@ fn run_chain(cmd: &str, input: &str) -> Option<String> {
     let attempts: [(Option<std::path::PathBuf>, &[&str]); 2] = [(git_bash(&system), &["-c"]), (Some(system.join("cmd.exe")), &["/C"])];
     for (shell, flag) in attempts {
         let Some(shell) = shell else { continue };
-        let child = Command::new(shell)
-            .args(flag)
-            .arg(cmd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut child) = child else { continue };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(input.as_bytes());
+        let mut command = Command::new(shell);
+        command.args(flag).arg(cmd);
+        if let Some(out) = usagi_core::login::run_statusline_chain(command, input) {
+            return Some(out);
         }
-        if let Ok(out) = child.wait_with_output() {
-            return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-        }
+        return None;
     }
     None
 }
@@ -163,6 +157,44 @@ fn install_panic_log() {
     }));
 }
 
+/// 디자인 확인용: 예시 값으로 그린 위젯 미리 보기 자료(JSON) 출력. 인자: nobars · time · light · spent · bar=<px>
+fn widget_preview_json(flags: &[String]) {
+    use usagi_core::engine::ProviderId;
+    use widget::{Content, Row, Section};
+    let has = |f: &str| flags.iter().any(|a| a == f);
+    let (time, light, spent) = (has("time"), has("light"), has("spent"));
+    let bar_px = flags.iter().find_map(|a| a.strip_prefix("bar=")).and_then(|v| v.parse::<f32>().ok());
+    let row = |key: &str, label: &str, ratio: f64, remaining: f64| Row {
+        key: key.into(),
+        label: label.into(),
+        value: if time { usagi_core::texts::fmt_hm(remaining) } else { usagi_core::texts::fmt_usage(ratio, false) },
+        ratio,
+        left: false,
+        percent: !time,
+        short: None,
+    };
+    let content = Content {
+        time_mode: time,
+        sections: vec![
+            if has("loggedout") {
+                // 로그아웃된 계정: 그래프 대신 안내 글자
+                Section { id: ProviderId::Claude, key: "claude-1".into(), rows: vec![], note: Some(usagi_core::texts::login_needed().into()) }
+            } else {
+                Section {
+                    id: ProviderId::Claude,
+                    key: "claude-1".into(),
+                    rows: vec![row("5시간", "5시간", if spent { 1.0 } else { 0.62 }, 8000.0), row("주간", "주간", 0.38, 410000.0), row("Fable 주간", "Fable", 0.03, 560000.0)],
+                    note: None,
+                }
+            },
+            Section { id: ProviderId::Codex, key: "codex-1".into(), rows: vec![row("5시간", "5시간", 0.47, 8000.0), row("주간", "주간", 0.12, 500000.0)], note: None },
+        ],
+        rabbit: None,
+        ink: if light { win::INK_ON_LIGHT } else { win::INK_ON_DARK },
+    };
+    println!("{}", widget::preview_json(&content, !has("nobars"), bar_px, 1.0, light));
+}
+
 /// 디자인 확인용: 위젯을 어두운/밝은 작업 표시줄 배경에 그려 BMP로 저장
 fn widget_preview(path: &str) {
     use usagi_core::engine::ProviderId;
@@ -174,8 +206,8 @@ fn widget_preview(path: &str) {
             let content = Content {
                 time_mode: false,
                 sections: vec![
-                    Section { id: ProviderId::Claude, key: "claude-1".into(), rows: vec![row("5시간", 0.15), row("주간", 0.58), row("Fable", 0.03)] },
-                    Section { id: ProviderId::Codex, key: "codex-1".into(), rows: vec![row("주간", 0.07)] },
+                    Section { id: ProviderId::Claude, key: "claude-1".into(), rows: vec![row("5시간", 0.15), row("주간", 0.58), row("Fable", 0.03)], note: None },
+                    Section { id: ProviderId::Codex, key: "codex-1".into(), rows: vec![row("주간", 0.07)], note: None },
                 ],
                 // 실제 위젯과 같게 (위젯에는 토끼를 그리지 않음. 토끼는 알림 영역 아이콘)
                 rabbit: None,
@@ -195,7 +227,7 @@ fn widget_preview(path: &str) {
         ];
         let content = Content {
             time_mode: true,
-            sections: vec![Section { id: ProviderId::Claude, key: "claude-1".into(), rows: rows(["2시간 13분", "6일 23시간"]) }],
+            sections: vec![Section { id: ProviderId::Claude, key: "claude-1".into(), rows: rows(["2시간 13분", "6일 23시간"]), note: None }],
             rabbit: None,
             ink: win::INK_ON_DARK,
         };
@@ -222,7 +254,7 @@ fn widget_preview(path: &str) {
                 };
                 let content = Content {
                     time_mode,
-                    sections: vec![Section { id: ProviderId::Claude, key: "claude-1".into(), rows }],
+                    sections: vec![Section { id: ProviderId::Claude, key: "claude-1".into(), rows, note: None }],
                     rabbit: None,
                     ink: win::INK_ON_DARK,
                 };

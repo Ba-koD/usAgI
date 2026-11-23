@@ -108,19 +108,27 @@ pub fn enabled() -> bool {
 }
 
 /// 켜기: 로그온 작업 등록 (실패하면 Run 등록). 끄기: 둘 다 지움.
-pub fn set(on: bool) {
-    let Ok(exe) = std::env::current_exe() else { return };
-    if on {
+pub fn set(on: bool) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let applied = if on {
         if create_task(&exe) {
             win::reg_delete(RUN_KEY, RUN_VALUE);
+            true
         } else {
-            win::reg_set_string(RUN_KEY, RUN_VALUE, &format!("\"{}\" {ARG}", exe.display()));
+            win::reg_set_string(RUN_KEY, RUN_VALUE, &format!("\"{}\" {ARG}", exe.display()))
         }
     } else {
         schtasks(&["/Delete", "/TN", TASK, "/F"]);
         win::reg_delete(RUN_KEY, RUN_VALUE);
+        !task_exists() && win::reg_string(RUN_KEY, RUN_VALUE).is_none()
+    };
+    if applied {
+        STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+        Ok(())
+    } else {
+        STATE.store(0, Ordering::Relaxed);
+        Err(usagi_core::tr!("시작 시 실행 설정 실패", "Could not change start at login").into())
     }
-    STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
 }
 
 /// Run 값에 적힌 실행 파일 경로 (`"C:\경로\usagi.exe" --autostart` 또는 따옴표 없는 경로)
@@ -150,7 +158,7 @@ pub fn refresh() {
             .and_then(|v| run_value_exe(&v))
             .is_some_and(|p| same_file(&p, &exe));
         if ours {
-            set(true);
+            let _ = set(true);
         }
     });
 }

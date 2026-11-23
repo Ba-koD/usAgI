@@ -47,9 +47,20 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
         .map(|a| {
             let view = snap.and_then(|s| s.providers.iter().find(|p| p.account_id == a.id));
             let email = email_of(a);
-            // 같은 공급자에 같은 이메일이 이미 있으면 (브라우저가 기존 계정으로 바로 승인한 경우)
+            // Codex에서는 같은 이메일의 여러 워크스페이스를 연결할 수 있음.
+            let workspace = view.and_then(|v| v.workspace_id.as_deref());
+            let login_info = snap.and_then(|s| s.logins.get(&a.id));
             let dup = email.as_ref().is_some_and(|e| {
-                list.iter().any(|b| b.id != a.id && b.provider == a.provider && email_of(b).is_some_and(|x| x.eq_ignore_ascii_case(e)))
+                list.iter().any(|b| {
+                    b.id != a.id && b.provider == a.provider && email_of(b).is_some_and(|x| x.eq_ignore_ascii_case(e))
+                        && if a.is_claude() {
+                            login_info.zip(snap.and_then(|s| s.logins.get(&b.id)))
+                                .is_some_and(|(first, second)| crate::fallback::same_claude_identity(first, second))
+                        } else { workspace.is_some_and(|id| {
+                            snap.and_then(|s| s.providers.iter().find(|p| p.account_id == b.id))
+                                .and_then(|p| p.workspace_id.as_deref()) == Some(id)
+                        }) }
+                })
             });
             let (link, note) = if a.is_claude() {
                 match accounts::link_state(a) {
@@ -60,14 +71,17 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
             } else {
                 ("n/a", String::new())
             };
-            let login_info = snap.and_then(|s| s.logins.get(&a.id));
             let login = json!({
                 "state": match login_info.and_then(|l| l.logged_in) { Some(true) => "in", Some(false) => "out", None => "unknown" },
                 "email": login_info.and_then(|l| l.email.clone()),
                 "org": login_info.and_then(|l| l.org.clone()),
                 "plan": login_info.and_then(|l| l.plan.clone()),
                 "ends": login_info.and_then(|l| l.ends.clone()),
+                "reconnectSoon": login_info.is_some_and(|l| l.logged_in == Some(true)
+                    && l.sign_in_expiry.is_some_and(|expiry| expiry.needs_reconnect(now))),
                 "error": login_info.and_then(|l| l.error.clone()),
+                // 주 폴더 로그인이 끊겨 대신 쓰는 폴더 (같은 계정)
+                "fallback": login_info.and_then(|l| l.fallback.clone()),
                 "checking": login_checking,
             });
             let probe = snap.and_then(|s| s.probes.get(&a.id)).cloned().unwrap_or_default();
@@ -81,9 +95,6 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
                             let hint: String = if !m.exact {
                                 if logged_out {
                                     crate::tr!("로그인하면 정확한 값 표시", "Sign in to see exact values").into()
-                                } else if crate::install::installing(&a.provider) {
-                                    let cli = crate::install::cli_name(&a.provider);
-                                    crate::tr!(format!("{cli} 설치 중"), format!("Installing {cli}"))
                                 } else if probe.running {
                                     crate::tr!("확인하는 중…", "Checking…").into()
                                 } else if let Some(e) = &probe.error {
@@ -114,6 +125,8 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
                                 "pct": texts::fmt_pct(m.ratio),
                                 "hint": hint,
                                 "exact": m.exact,
+                                // 다 썼는지 (숫자 대신 "소진"으로 보임)
+                                "spent": m.exact && texts::spent(m.ratio),
                                 "level": texts::level(m.ratio),
                                 "resetAt": reset.map(|r| texts::fmt_clock(r, now)),
                                 "remaining": reset.map(|r| texts::fmt_duration(r - now)),
@@ -148,7 +161,12 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
                 "note": view.and_then(|v| v.note.clone()),
                 "forecast": view.and_then(|v| v.forecast.clone()),
                 "login": login,
-                "probe": { "running": probe.running, "error": probe.error, "triedAt": probe.tried_at.map(|t| texts::fmt_clock(t, now)) },
+                "probe": {
+                    "running": probe.running, "error": probe.error,
+                    "triedAt": probe.tried_at.map(|t| texts::fmt_clock(t, now)),
+                    "retryAt": probe.retry_at.filter(|t| *t > now).map(|t| texts::fmt_clock(t, now)),
+                    "nextAt": probe.next_at.filter(|t| *t > now && !logged_out).map(|t| texts::fmt_clock(t, now)),
+                },
                 "meters": meters,
             })
         })
@@ -227,7 +245,6 @@ fn save_alert_set(state: &mut State, key: &str, s: &AlertSet) {
             }
         }
     }
-    state.save();
 }
 
 /// 그래프·카드 설정 변경 (알림 기준, 그래프별 기준, 위젯 표시, 접기). 처리했으면 true.
@@ -307,7 +324,6 @@ pub fn apply_meter_ipc(state: &mut State, cmd: &str, msg: &Value) -> bool {
                     }
                 }
             }
-            state.save();
         }
         "meterBasis" | "meterWidget" => {
             let (field, value) = if cmd == "meterBasis" {
@@ -327,7 +343,6 @@ pub fn apply_meter_ipc(state: &mut State, cmd: &str, msg: &Value) -> bool {
                     }
                 }
             }
-            state.save();
         }
         "collapse" => {
             let on = msg.get("value").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -349,11 +364,23 @@ pub fn apply_meter_ipc(state: &mut State, cmd: &str, msg: &Value) -> bool {
     true
 }
 
-/// 지운 계정의 흔적 정리: 받은 사용량·알림·그래프 설정. usAgI가 만든 프로필이면 로그아웃 후 폴더도.
-pub fn forget_account(state: &mut State, a: &Account) {
-    let _ = std::fs::remove_file(crate::codex::saved_path(&a.id));
-    let _ = std::fs::remove_file(crate::bridge::path(&a.id));
+pub fn clear_usage(a: &Account) {
+    let key = a.usage_key();
+    let _ = std::fs::remove_file(crate::codex::saved_path(&key));
+    let _ = std::fs::remove_file(crate::bridge::path(&key));
+    crate::usage_retry::forget(&key);
+}
+
+/// 계정 제거와 함께 저장할 알림·그래프 설정 정리.
+pub fn forget_account_settings(state: &mut State, a: &Account) {
     let prefix = format!("{}:", a.id);
+    for kind in ["login", "login-expiry", "refill", "nap"] {
+        state.0.remove(&format!("{kind}:{}", a.id));
+    }
+    state.0.retain(|k, _| !["soon:", "tired:"].iter().any(|p| k.strip_prefix(p).is_some_and(|rest| rest.starts_with(&prefix))));
+    if let Some(rules) = state.0.get_mut("refill_rules").and_then(Value::as_object_mut) {
+        rules.remove(&a.id);
+    }
     if let Some(map) = state.0.get_mut("alerts").and_then(|v| v.as_object_mut()) {
         map.retain(|k, _| !k.starts_with(&prefix));
     }
@@ -366,14 +393,5 @@ pub fn forget_account(state: &mut State, a: &Account) {
         if let Some(list) = prefs.get_mut("collapsed").and_then(|v| v.as_array_mut()) {
             list.retain(|x| x.as_str() != Some(a.id.as_str()));
         }
-    }
-    state.save();
-    if accounts::is_managed(a) {
-        // CLI 로그아웃은 몇 초 걸릴 수 있어 백그라운드에서
-        let a = a.clone();
-        std::thread::spawn(move || {
-            let _ = crate::login::logout(&a);
-            let _ = std::fs::remove_dir_all(a.path());
-        });
     }
 }

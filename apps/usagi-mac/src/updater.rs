@@ -1,7 +1,7 @@
 //! macOS 자동 업데이트 (GitHub Releases).
 //!
 //! 1. 확인: `api.github.com/repos/<저장소>/releases/latest`의 태그를 지금 버전과 비교
-//! 2. 받기: `usAgI-mac.zip`(+ `usAgI-mac.zip.sha256`)을 curl로 받아 SHA-256 검증 후 임시 폴더에 풀기
+//! 2. 받기: `usAgI-mac.zip`을 받아 릴리스 본문 또는 기존 첨부의 체크섬과 서명으로 검증 후 임시 폴더에 풀기
 //!    (curl로 받은 파일엔 격리 표시가 붙지 않아 "확인되지 않은 개발자" 경고가 없음)
 //! 3. 적용: 지금 `.app`을 `.app.old`로 비켜 두고 새 `.app`을 그 자리에 놓은 뒤, 잠깐 뒤에 새 앱을 열고 종료
 //!
@@ -25,6 +25,7 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("/usr/bin/curl")
         // https만 (리다이렉트도), TLS 1.2 이상
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "--max-time", "120"])
+        .args(["--max-filesize", "67108864"])
         .args(["-A", &format!("usAgI/{} (macOS)", usagi_core::VERSION)])
         .args(args)
         .output()
@@ -44,7 +45,19 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// Homebrew로 설치한 앱인지 (그러면 brew upgrade로)
 pub fn installed_by_brew() -> bool {
-    ["/opt/homebrew/Caskroom/usagi", "/usr/local/Caskroom/usagi"].iter().any(|p| Path::new(p).exists())
+    let Some(bundle) = current_app().and_then(|path| path.canonicalize().ok()) else { return false };
+    ["/opt/homebrew/Caskroom/usagi", "/usr/local/Caskroom/usagi"]
+        .iter().any(|path| bundle.starts_with(path) || brew_has_bundle(Path::new(path), &bundle))
+}
+
+fn brew_has_bundle(cask: &Path, bundle: &Path) -> bool {
+    let default_target = Path::new("/Applications/usAgI.app");
+    if bundle == default_target && cask.join(".metadata").join(usagi_core::VERSION).is_dir() {
+        return true;
+    }
+    bundle.file_name().and_then(|name| {
+        cask.join(usagi_core::VERSION).join(name).canonicalize().ok()
+    }).is_some_and(|installed| installed == bundle)
 }
 
 /// 최신 릴리스 확인. 지금보다 새 버전이면 Some.
@@ -67,18 +80,20 @@ pub fn download(rel: &Release) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let zip = dir.join("usAgI-mac.zip");
     curl(&["-o", &zip.to_string_lossy(), &rel.asset_url])?;
-    // 체크섬은 꼭 있어야 하고 일치해야 함
-    let want = usagi_core::update::parse_sha256(&String::from_utf8_lossy(&curl(&[&rel.sha_url])?)).ok_or(usagi_core::tr!("체크섬 수신 실패", "Couldn't download the checksum"))?;
-    let bytes = std::fs::read(&zip).map_err(|e| e.to_string())?;
+    let verification_text = |url: &str| curl(&[url]).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let want = rel.verification.checksum(verification_text)?;
+    use std::io::Read as _;
+    const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(&zip).and_then(|file| file.take(MAX_ARCHIVE + 1).read_to_end(&mut bytes))
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_ARCHIVE {
+        return Err(usagi_core::tr!("파일 크기 초과", "File too large").into());
+    }
     if usagi_core::sha256::hex(&bytes) != want {
         return Err(usagi_core::tr!("받은 파일 손상 (체크섬 불일치). 다시 시도 필요", "Downloaded file is damaged (checksum mismatch). Try again").into());
     }
-    // 서명: 이 빌드에 공개 키가 있으면 꼭 있어야 하고 맞아야 함 (체크섬은 같은 릴리스에서 오므로 바꿔치기를 막지 못함)
-    if let Some(key) = usagi_core::update::signing_key() {
-        let missing = || usagi_core::tr!("서명 수신 실패. 설치 중단", "Couldn't download the signature. Not installing").to_string();
-        let sig = curl(&[rel.sig_url.as_deref().ok_or_else(missing)?]).map_err(|_| missing())?;
-        usagi_core::update::verify_signature(key, &bytes, &String::from_utf8_lossy(&sig), &rel.version, "usAgI-mac.zip")?;
-    }
+    rel.verify_signature(&bytes, "usAgI-mac.zip", verification_text)?;
     drop(bytes);
     let ok = Command::new("/usr/bin/ditto").args(["-x", "-k"]).arg(&zip).arg(&dir).status().map_err(|e| e.to_string())?;
     let app = dir.join("usAgI.app");
@@ -102,8 +117,18 @@ pub fn apply(staged: &Path) -> Result<(), String> {
         return Err(usagi_core::tr!("새 버전 복사 실패", "Couldn't copy the new version").into());
     }
     let _ = Command::new("/usr/bin/xattr").args(["-dr", "com.apple.quarantine"]).arg(&app).status();
-    // 지금 프로세스가 끝난 뒤 새 앱을 열고 예전 앱을 지움
-    let q = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
-    let script = format!("sleep 1; /usr/bin/open -n {}; sleep 3; rm -rf {}", q(&app), q(&old));
-    Command::new("/bin/sh").args(["-c", &script]).spawn().map(|_| ()).map_err(|e| usagi_core::tr!(format!("다시 시작 실패: {e}"), format!("Couldn't restart: {e}")))
+    // Keep the previous app available after launch. Restore it if Launch Services rejects the replacement.
+    let script = r#"while kill -0 "$3" 2>/dev/null; do sleep 0.2; done
+if ! /usr/bin/open -n "$1"; then
+    /bin/mv "$1" "$1.failed" && /bin/mv "$2" "$1" && /usr/bin/open -n "$1"
+fi"#;
+    match Command::new("/bin/sh").args(["-c", script, "usagi-update"])
+        .arg(&app).arg(&old).arg(std::process::id().to_string()).spawn() {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            std::fs::remove_dir_all(&app).and_then(|()| std::fs::rename(&old, &app))
+                .map_err(|rollback| format!("{error}: {rollback}"))?;
+            Err(usagi_core::tr!(format!("다시 시작 실패: {error}"), format!("Couldn't restart: {error}")))
+        }
+    }
 }

@@ -1,8 +1,7 @@
-//! 계정 로그인 상태 — 각 회사의 공식 CLI로만 확인하고, 로그인도 공식 흐름으로 띄웁니다.
+//! 계정 로그인 상태 — 유효한 로컬 파일을 먼저 확인하고, 필요하면 공식 CLI를 실행합니다.
 //!
-//! usAgI는 토큰·세션을 읽거나 저장하지 않습니다. Anthropic 정책상 서드파티 앱은 Claude.ai 로그인을
-//! 대신 받거나 자격 증명을 저장할 수 없고, 로그인은 Anthropic의 흐름에서 끝나야 합니다.
-//! (https://code.claude.com/docs/en/legal-and-compliance)
+//! 로그인과 토큰 파일 갱신은 공식 CLI가 담당합니다.
+//! 파일에 저장된 세션을 이용한 사용량 조회는 공급자별 모듈에서 합니다.
 //!
 //! - Claude: `claude auth status --text` / `claude auth login`  (프로필: CLAUDE_CONFIG_DIR)
 //! - Codex:  `codex login status`        / `codex login`        (프로필: CODEX_HOME)
@@ -25,12 +24,95 @@ pub struct LoginStatus {
     pub logged_in: Option<bool>,
     pub email: Option<String>,
     pub org: Option<String>,
+    pub(crate) organization_id: Option<String>,
+    pub(crate) credential_fingerprint: Option<u64>,
     /// "Claude Max account" 같은 로그인 방식/플랜
     pub plan: Option<String>,
     /// "Sign-in ends" 같은 만료 안내 (CLI가 준 그대로)
     pub ends: Option<String>,
+    pub(crate) sign_in_expiry: Option<SignInExpiry>,
     pub checked_at: f64,
     pub error: Option<String>,
+    /// 주 폴더 로그인이 끊겨 같은 계정의 다른 폴더를 대신 쓰는 중이면 그 폴더
+    pub fallback: Option<String>,
+}
+
+pub(crate) const SIGN_IN_WARNING_DAYS: i32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SignInExpiry {
+    pub expires_at: f64,
+    /// The CLI may give an earlier date at which it recommends signing in again.
+    reconnect_by: f64,
+}
+
+impl SignInExpiry {
+    fn at(expires_at: f64) -> Option<Self> {
+        (expires_at.is_finite() && expires_at > 0.0)
+            .then_some(Self { expires_at, reconnect_by: expires_at })
+    }
+
+    fn from_cli(text: &str) -> Option<Self> {
+        let timestamp = text.rsplit_once('(')
+            .and_then(|(_, suffix)| suffix.strip_suffix(')'))
+            .unwrap_or(text)
+            .parse::<jiff::Timestamp>()
+            .ok()?;
+        let mut expiry = Self::at(timestamp.as_second() as f64)?;
+        if let Some(date) = text.strip_prefix("between ").and_then(|range| range.split_once(" and "))
+            .and_then(|(early, _)| early.parse::<jiff::civil::Date>().ok())
+            .and_then(|date| time::local_to_ts(date.year().into(), date.month() as u32, date.day() as u32, 0, 0))
+        {
+            expiry.reconnect_by = date.min(expiry.expires_at);
+        }
+        Some(expiry)
+    }
+
+    pub(crate) fn needs_reconnect(self, now: f64) -> bool {
+        now >= self.reconnect_by - f64::from(SIGN_IN_WARNING_DAYS) * time::DAY
+    }
+
+    pub(crate) fn warning_due(self, now: f64) -> bool {
+        self.needs_reconnect(now) && now < self.expires_at
+    }
+}
+
+/// Stable account identifiers, never a credential or a token fingerprint.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct Identity {
+    email: Option<String>,
+    organization: Option<String>,
+    organization_id: Option<String>,
+}
+
+impl Identity {
+    pub(crate) fn from_status(status: &LoginStatus) -> Option<Self> {
+        let identity = Self {
+            email: status.email.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
+            organization: status.org.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
+            organization_id: status.organization_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
+        };
+        (identity.email.is_some() || identity.organization_id.is_some()).then_some(identity)
+    }
+
+    pub(crate) fn from_codex(usage: &crate::codex::CodexSnapshot) -> Option<Self> {
+        Self::from_status(&LoginStatus {
+            email: usage.email.clone(),
+            organization_id: usage.workspace_id.clone(),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn conflicts(&self, actual: &Self) -> bool {
+        fn different(old: &Option<String>, new: &Option<String>) -> bool {
+            matches!((old, new), (Some(old), Some(new)) if !old.trim().eq_ignore_ascii_case(new.trim()))
+        }
+        different(&self.email, &actual.email)
+            || match (&self.organization_id, &actual.organization_id) {
+                (Some(_), Some(_)) => different(&self.organization_id, &actual.organization_id),
+                _ => different(&self.organization, &actual.organization),
+            }
+    }
 }
 
 pub(crate) fn same_dir(a: &Path, b: Option<PathBuf>) -> bool {
@@ -153,12 +235,94 @@ pub(crate) fn quiet_command(program: &Path) -> Command {
     cmd
 }
 
+#[cfg(windows)]
+struct ChildJob(windows_sys::Win32::Foundation::HANDLE);
+
+// The parent controls this handle, and never shares it with the child processes.
+#[cfg(windows)]
+unsafe impl Send for ChildJob {}
+
+#[cfg(windows)]
+impl ChildJob {
+    fn attach(child: &Child) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::*;
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() { return Err(std::io::Error::last_os_error()); }
+            let job = Self(job);
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(job.0, JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of_val(&limits) as u32) == 0
+                || AssignProcessToJobObject(job.0, child.as_raw_handle()) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildJob {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0); }
+    }
+}
+
+/// Run the original status line with a fixed deadline and bounded output.
+pub fn run_statusline_chain(mut command: Command, input: &str) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    #[cfg(windows)]
+    let _job = ChildJob::attach(&child).ok();
+    let mut stdin = child.stdin.take()?;
+    let mut stdout = child.stdout.take()?;
+    let input = input.to_owned();
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        (&mut stdout).take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+        (bytes.len() <= 64 * 1024).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if writer.is_finished() && reader.is_finished() => {
+                return status.success().then(|| reader.join().ok().flatten()).flatten();
+            }
+            Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(15)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<String, String> {
-    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+    let child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| e.to_string())?;
+    let (mut stdout, stderr) = capture_child_output(child, timeout).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            crate::tr!("CLI 응답 시간 초과", "CLI response timed out").into()
+        } else {
+            error.to_string()
+        }
+    })?;
+    stdout.push_str(&stderr);
+    Ok(stdout)
+}
+
+pub(crate) fn capture_child_output(mut child: Child, timeout: Duration) -> std::io::Result<(String, String)> {
     let read = |mut output: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = (&mut output).take(256 * 1024).read_to_end(&mut bytes);
+        // Keep draining after the capture limit so the child never blocks on a full pipe.
+        let _ = std::io::copy(&mut output, &mut std::io::sink());
         String::from_utf8_lossy(&bytes).into_owned()
     });
     let out = read(Box::new(child.stdout.take().expect("stdout")));
@@ -171,16 +335,11 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<String
             state => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(state
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| crate::tr!("연결 도구 응답 시간 초과", "The CLI did not respond in time").into()));
+                return Err(state.err().unwrap_or_else(|| std::io::ErrorKind::TimedOut.into()));
             }
         }
     }
-    let mut output = out.join().unwrap_or_default();
-    output.push_str(&err.join().unwrap_or_default());
-    Ok(output)
+    Ok((out.join().unwrap_or_default(), err.join().unwrap_or_default()))
 }
 
 pub(crate) fn usable_program(provider: &str, path: &Path) -> bool {
@@ -210,12 +369,28 @@ pub(crate) fn has_subscription(provider: &str, path: &Path) -> bool {
     }
 }
 
+pub(crate) fn has_file_session(provider: &str, dir: &Path) -> bool {
+    file_status(provider, dir).is_some_and(|status| status.logged_in == Some(true))
+}
+
+pub(crate) fn file_status(provider: &str, dir: &Path) -> Option<LoginStatus> {
+    match provider {
+        "claude" => claude_file_status(dir, time::now()),
+        "codex" => crate::codex::file_login_status(dir),
+        _ => None,
+    }
+}
+
 /// 공식 CLI가 설치돼 있는지 (계정을 추가하기 전에 확인)
 pub fn cli_installed(provider: &str) -> bool {
     !installed_programs(provider).is_empty()
 }
 
-/// 자동 설치가 안 될 때 보여 줄 직접 설치 방법 (각 회사의 공식 설치 프로그램)
+pub(crate) fn cli_name(provider: &str) -> &'static str {
+    if provider == "claude" { "Claude Code CLI" } else { "Codex CLI" }
+}
+
+/// CLI가 없을 때 보여 줄 직접 설치 방법 (각 회사의 공식 설치 프로그램)
 pub fn install_hint(provider: &str) -> String {
     let (name, script) = match (provider, cfg!(windows)) {
         ("claude", true) => ("Claude Code CLI", "irm https://claude.ai/install.ps1 | iex"),
@@ -227,9 +402,10 @@ pub fn install_hint(provider: &str) -> String {
     crate::tr!(format!("{name} 직접 설치: {shell}에서 {script}"), format!("Install {name} manually: in {shell}, run {script}"))
 }
 
-/// 설치된 CLI 목록. 하나도 없으면 공식 설치 프로그램으로 자동 설치 (실패하면 직접 설치 방법을 오류로).
+/// 설치된 CLI 목록. 없으면 직접 설치 방법을 표시합니다.
 pub(crate) fn programs_or_hint(provider: &str) -> Result<Vec<PathBuf>, String> {
-    crate::install::ensure(provider, false)
+    let programs = installed_programs(provider);
+    if programs.is_empty() { Err(install_hint(provider)) } else { Ok(programs) }
 }
 
 fn run(acc: &Account, args: &[&str]) -> Result<String, String> {
@@ -242,7 +418,7 @@ fn run(acc: &Account, args: &[&str]) -> Result<String, String> {
         }
         match output_with_timeout(cmd, Duration::from_secs(15)) {
             Ok(text) => return Ok(text),
-            Err(e) => last_err = format!("{}: {e}", prog.display()),
+            Err(e) => last_err = format!("{e} ({})", prog.display()),
         }
     }
     Err(last_err)
@@ -262,29 +438,34 @@ pub fn parse_claude(text: &str) -> LoginStatus {
     let get = |key: &str| f.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
     let low = text.to_lowercase();
     let expired = get("login").is_some_and(|v| v.to_lowercase().starts_with("expired")) || low.contains("not logged in");
-    let logged_in = if expired {
+    let api_key = get("login method").is_some_and(|method| method.to_ascii_lowercase().contains("api key"));
+    let logged_in = if expired || api_key {
         Some(false)
-    } else if ["email", "login method", "login", "sign-in ends"].iter().any(|key| get(key).is_some()) {
+    } else if ["email", "login method", "login", "sign-in ends", "sign-in"].iter().any(|key| get(key).is_some()) {
         Some(true)
     } else {
         None
     };
+    let sign_in_ends = get("sign-in ends").or_else(|| get("sign-in"));
+    let sign_in_expiry = sign_in_ends.as_deref().and_then(SignInExpiry::from_cli);
     LoginStatus {
         logged_in,
         email: get("email"),
         org: get("organization"),
         plan: get("login method"),
-        ends: get("sign-in ends").or_else(|| get("login").filter(|_| !expired)),
+        ends: sign_in_ends.or_else(|| get("login").filter(|_| !expired)),
+        sign_in_expiry,
         checked_at: time::now(),
-        error: None,
+        organization_id: get("organization id"),
+        ..Default::default()
     }
 }
 
 pub fn parse_codex(text: &str) -> LoginStatus {
     let account = text.lines().find_map(|line| line.trim().strip_prefix("Logged in using "));
-    let logged_in = if account.is_some() {
+    let logged_in = if account.is_some_and(|value| value.eq_ignore_ascii_case("ChatGPT")) {
         Some(true)
-    } else if text.to_ascii_lowercase().contains("not logged in") {
+    } else if account.is_some() || text.to_ascii_lowercase().contains("not logged in") {
         Some(false)
     } else {
         None
@@ -296,44 +477,105 @@ pub fn parse_codex(text: &str) -> LoginStatus {
         org: account.map(str::to_owned),
         ends: None,
         checked_at: time::now(),
-        error: None,
+        ..Default::default()
     }
 }
 
-/// 공식 CLI로 로그인 상태 확인 (1초 안팎 걸리므로 백그라운드에서)
+/// 로컬 로그인 상태 확인. 필요한 경우 공식 CLI를 실행하므로 백그라운드에서 호출.
 pub fn status(acc: &Account) -> LoginStatus {
     let result = match acc.provider.as_str() {
-        "claude" => run(acc, &["auth", "status", "--text"]).map(|t| {
-            let mut st = parse_claude(&t);
-            if st.logged_in == Some(true) {
-                if let Some(tier) = claude_tier(acc) {
-                    st.plan = Some(tier);
+        "claude" => match claude_file_status(&acc.path(), time::now()) {
+            Some(status) => Ok(status),
+            None => run(acc, &["auth", "status", "--text"]).map(|t| {
+                let mut st = parse_claude(&t);
+                if st.organization_id.is_none() {
+                    if let (Some(email), Some(org)) = (&st.email, &st.org) {
+                        st.organization_id = claude_profiles(&acc.path()).find(|profile| {
+                            profile.email_address.as_deref().is_some_and(|v| v.trim().eq_ignore_ascii_case(email.trim()))
+                                && profile.organization_name.as_deref().is_some_and(|v| v.trim().eq_ignore_ascii_case(org.trim()))
+                        }).and_then(|profile| profile.organization_uuid);
+                    }
                 }
-            }
-            st
-        }),
-        "codex" => run(acc, &["login", "status"]).map(|t| parse_codex(&t)),
+                if st.logged_in == Some(true) {
+                    if let Some(tier) = claude_tier(acc) {
+                        st.plan = Some(tier);
+                    }
+                }
+                st
+            }),
+        },
+        "codex" => match crate::codex::file_login_status(&acc.path()) {
+            Some(status) => Ok(status),
+            None => run(acc, &["login", "status"]).map(|t| parse_codex(&t)),
+        },
         _ => return LoginStatus::default(),
     };
     result.unwrap_or_else(|e| LoginStatus { logged_in: None, checked_at: time::now(), error: Some(e), ..Default::default() })
 }
 
-/// Claude Code가 저장해 둔 계정 프로필(.claude.json의 oauthAccount, 토큰 아님)에서 요금제 배율.
-/// 기본 프로필(~/.claude)은 ~/.claude.json, 다른 프로필은 그 폴더 안의 .claude.json.
-pub fn claude_tier(acc: &Account) -> Option<String> {
-    let dir = acc.path();
-    let mut files = vec![dir.join(".claude.json")];
-    if dir.file_name().is_some_and(|n| n == ".claude") {
-        if let Some(parent) = dir.parent() {
-            files.push(parent.join(".claude.json"));
-        }
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeProfile {
+    email_address: Option<String>,
+    organization_name: Option<String>,
+    organization_uuid: Option<String>,
+    user_rate_limit_tier: Option<String>,
+    organization_rate_limit_tier: Option<String>,
+}
+
+impl ClaudeProfile {
+    fn tier(&self) -> Option<String> {
+        self.user_rate_limit_tier.as_deref().and_then(tier_label)
+            .or_else(|| self.organization_rate_limit_tier.as_deref().and_then(tier_label))
     }
-    files.into_iter().find_map(|p| {
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
-        let a = v.get("oauthAccount")?;
-        ["userRateLimitTier", "organizationRateLimitTier"]
-            .iter()
-            .find_map(|k| a.get(*k).and_then(|t| t.as_str()).and_then(tier_label))
+}
+
+pub fn claude_tier(acc: &Account) -> Option<String> {
+    claude_profiles(&acc.path()).find_map(|profile| profile.tier())
+}
+
+/// 기본 프로필(~/.claude)은 ~/.claude.json에 계정 정보가 있을 수 있습니다.
+fn claude_profiles(dir: &Path) -> impl Iterator<Item = ClaudeProfile> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Settings {
+        oauth_account: Option<ClaudeProfile>,
+    }
+
+    let parent = dir.file_name().filter(|n| *n == ".claude")
+        .and_then(|_| dir.parent()).map(|dir| dir.join(".claude.json"));
+    std::iter::once(dir.join(".claude.json")).chain(parent).filter_map(|path| {
+        let file = std::fs::File::open(path).ok()?;
+        let settings: Settings = serde_json::from_reader(std::io::BufReader::new(file)).ok()?;
+        settings.oauth_account
+    })
+}
+
+fn claude_file_status(dir: &Path, now: f64) -> Option<LoginStatus> {
+    let session = crate::claude_oauth::file_session(dir, now)?;
+    let mut profiles = claude_profiles(dir);
+    let profile = profiles.next().unwrap_or_default();
+    let plan = profile.tier()
+        .or_else(|| profiles.find_map(|profile| profile.tier()))
+        .or_else(|| session.rate_limit_tier.as_deref().and_then(tier_label))
+        .or_else(|| session.subscription_type.as_deref().and_then(tier_label));
+    let sign_in_expiry = session.refresh_token_expires_at.and_then(|ms| SignInExpiry::at(ms / 1000.0));
+    let ends = sign_in_expiry
+        .map(|expiry| {
+            let when = crate::texts::fmt_clock(expiry.expires_at, now);
+            crate::tr!(format!("로그인 만료 {when}"), format!("Sign-in ends {when}"))
+        });
+    Some(LoginStatus {
+        logged_in: Some(true),
+        email: profile.email_address.filter(|s| !s.trim().is_empty()),
+        org: profile.organization_name.filter(|s| !s.trim().is_empty()),
+        organization_id: profile.organization_uuid.filter(|s| !s.trim().is_empty()),
+        credential_fingerprint: Some(session.fingerprint()),
+        plan,
+        ends,
+        sign_in_expiry,
+        checked_at: now,
+        ..Default::default()
     })
 }
 
@@ -366,23 +608,41 @@ pub fn tier_label(tier: &str) -> Option<String> {
     })
 }
 
-/// 공식 CLI로 로그아웃 (usAgI가 만든 프로필 계정을 지울 때)
-pub fn logout(acc: &Account) -> Result<(), String> {
-    let args: &[&str] = if acc.is_claude() { &["auth", "logout"] } else { &["logout"] };
-    run(acc, args).map(|_| ())
-}
-
-/// 공식 로그인 명령 (보이는 콘솔 창에서 실행해야 함: 브라우저 열기/코드 입력)
+/// 공식 로그인 명령. CLI가 기본 브라우저에서 계정 승인을 요청합니다.
 pub fn login_args(acc: &Account) -> (String, Vec<String>) {
     match acc.provider.as_str() {
         "codex" => ((if cfg!(windows) { "codex.cmd" } else { "codex" }).into(), vec!["login".into()]),
-        _ => ("claude".into(), vec!["auth".into(), "login".into()]),
+        _ => {
+            let mut args = vec!["auth".into(), "login".into(), "--claudeai".into()];
+            if let Some(email) = acc.identity.as_ref().and_then(|identity| identity.email.as_ref()) {
+                args.extend(["--email".into(), email.clone()]);
+            }
+            ("claude".into(), args)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_capture_drains_stderr_and_caps_captured_output() {
+        const CHILD: &str = "USAGI_TEST_CAPTURE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::io::stderr().write_all(&vec![b'x'; 320 * 1024]).unwrap();
+            std::io::stdout().write_all(b"capture completed\n").unwrap();
+            return;
+        }
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "login::tests::cli_capture_drains_stderr_and_caps_captured_output", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap();
+        let (stdout, stderr) = capture_child_output(child, Duration::from_secs(10)).unwrap();
+        assert!(stdout.contains("capture completed"));
+        assert_eq!(stderr.len(), 256 * 1024);
+    }
 
     #[test]
     fn which_finds_only_real_programs() {
@@ -404,6 +664,26 @@ mod tests {
     }
 
     #[test]
+    fn reads_claude_profile_metadata_from_its_home_layout() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(home.path().join(".claude.json"), r#"{
+            "oauthAccount": {
+                "emailAddress": "test@example.com",
+                "organizationName": "Test org",
+                "organizationRateLimitTier": "default_claude_max_5x"
+            }
+        }"#).unwrap();
+
+        let profile = claude_profiles(&dir).next().unwrap();
+        assert_eq!(profile.tier().as_deref(), Some("Max 5x"));
+        assert_eq!(profile.email_address.as_deref(), Some("test@example.com"));
+        assert_eq!(profile.organization_name.as_deref(), Some("Test org"));
+        assert!(claude_profiles(&home.path().join("other-profile")).next().is_none());
+    }
+
+    #[test]
     fn parses_claude_text() {
         let expired = "Login: Expired — log in again\nOrganization: Someone's Organization\nEmail: a@b.c\nNot logged in. Run claude auth login to authenticate.";
         let s = parse_claude(expired);
@@ -413,6 +693,35 @@ mod tests {
         let s = parse_claude(ok);
         assert_eq!(s.logged_in, Some(true));
         assert_eq!(s.ends.as_deref(), Some("Dec 20, 2026"));
+        assert!(s.sign_in_expiry.is_none());
+    }
+
+    #[test]
+    fn parses_claude_sign_in_range_and_uses_the_earlier_date_for_warning() {
+        let status = parse_claude("Sign-in ends: between 2026-11-20 and 2026-11-23 (2026-11-23T17:04:11.000Z)\n");
+        let expiry = status.sign_in_expiry.unwrap();
+        let expected_end = time::parse_iso("2026-11-23T17:04:11Z").unwrap();
+        let first_date = time::local_to_ts(2026, 11, 20, 0, 0).unwrap();
+        let first_warning = first_date - 3.0 * time::DAY;
+        assert_eq!(expiry.expires_at, expected_end);
+        assert!(!expiry.warning_due(first_warning - 1.0));
+        assert!(expiry.warning_due(first_warning));
+        assert!(!expiry.warning_due(expected_end));
+    }
+
+    #[test]
+    fn file_sign_in_expiry_is_distinct_from_access_token_expiry() {
+        let profile = tempfile::tempdir().unwrap();
+        std::fs::write(profile.path().join(".credentials.json"), serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-fixture",
+                "expiresAt": 500_000,
+                "refreshTokenExpiresAt": 900_000_000,
+                "scopes": ["user:profile"]
+            }
+        }).to_string()).unwrap();
+        let status = claude_file_status(profile.path(), 100.0).unwrap();
+        assert_eq!(status.sign_in_expiry.unwrap().expires_at, 900_000.0);
     }
 
     #[test]
@@ -448,8 +757,15 @@ pub struct SessionView {
 pub struct LoginSession {
     pub account_id: String,
     child: Child,
+    #[cfg(windows)]
+    job: Option<ChildJob>,
     stdin: Option<ChildStdin>,
     output: Arc<Mutex<String>>,
+    readers: Vec<std::thread::JoinHandle<()>>,
+    failure_seen: Option<Instant>,
+    verify_account: Option<Account>,
+    verification: Option<std::sync::mpsc::Receiver<Option<LoginStatus>>>,
+    pub(crate) verified_status: Option<LoginStatus>,
     view: SessionView,
     started: f64,
 }
@@ -486,7 +802,7 @@ fn find_url(text: &str) -> Option<String> {
         .last()
 }
 
-fn spawn_reader(pipe: Box<dyn std::io::Read + Send>, out: Arc<Mutex<String>>) {
+fn spawn_reader(pipe: Box<dyn std::io::Read + Send>, out: Arc<Mutex<String>>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut pipe = pipe;
         let mut buf = [0u8; 1024];
@@ -506,7 +822,7 @@ fn spawn_reader(pipe: Box<dyn std::io::Read + Send>, out: Arc<Mutex<String>>) {
                 }
             }
         }
-    });
+    })
 }
 
 impl LoginSession {
@@ -528,63 +844,112 @@ impl LoginSession {
         if let Some((k, v)) = profile_env(acc) {
             cmd.env(k, v);
         }
-        match cmd.spawn() {
-            Ok(mut child) => {
-                let output = Arc::new(Mutex::new(String::new()));
-                if let Some(p) = child.stdout.take() {
-                    spawn_reader(Box::new(p), output.clone());
-                }
-                if let Some(p) = child.stderr.take() {
-                    spawn_reader(Box::new(p), output.clone());
-                }
-                let stdin = child.stdin.take();
-                Ok(Self {
-                    account_id: acc.id.clone(),
-                    child,
-                    stdin,
-                    output,
-                    view: SessionView { account_id: acc.id.clone(), ..Default::default() },
-                    started: time::now(),
-                })
-            }
-            Err(e) => Err(format!("{}: {e}", prog.display())),
-        }
+        cmd.spawn().map(|child| {
+            let mut session = Self::from_child(&acc.id, child);
+            session.verify_account = Some(acc.clone());
+            session
+        }).map_err(|e| format!("{}: {e}", prog.display()))
     }
 
+    fn from_child(account_id: &str, mut child: Child) -> Self {
+        #[cfg(windows)]
+        let job = ChildJob::attach(&child).ok();
+        let output = Arc::new(Mutex::new(String::new()));
+        let mut readers = Vec::with_capacity(2);
+        if let Some(pipe) = child.stdout.take() {
+            readers.push(spawn_reader(Box::new(pipe), output.clone()));
+        }
+        if let Some(pipe) = child.stderr.take() {
+            readers.push(spawn_reader(Box::new(pipe), output.clone()));
+        }
+        Self {
+            account_id: account_id.into(),
+            stdin: child.stdin.take(),
+            child,
+            #[cfg(windows)]
+            job,
+            output,
+            readers,
+            failure_seen: None,
+            verify_account: None,
+            verification: None,
+            verified_status: None,
+            view: SessionView { account_id: account_id.into(), ..Default::default() },
+            started: time::now(),
+        }
+    }
 
     /// 출력과 프로세스 상태를 읽어 진행 상황 갱신
     pub fn poll(&mut self) -> &SessionView {
         if self.view.done.is_some() {
             return &self.view;
         }
-        let text = self.output.lock().map(|o| strip_ansi(&o)).unwrap_or_default();
-        let low = text.to_lowercase();
-        if let Some(u) = find_url(&text) {
-            self.view.url = Some(u);
-        }
-        self.view.accepts_code =
-            low.contains("paste code") || low.contains("enter code") || low.contains("authorization code") || low.contains("paste the code");
         match self.child.try_wait() {
-            Ok(Some(status)) => {
-                let said_ok = low.contains("login successful") || low.contains("successfully logged in");
-                let ok = status.success() && (said_ok || (!low.contains("error") && !low.contains("failed")));
-                self.view.done = Some(ok);
-                if !ok {
-                    let last = text.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("").to_string();
-                    self.view.message = Some(if last.is_empty() {
-                        crate::tr!(format!("종료 코드 {:?}", status.code()), format!("Exit code {:?}", status.code()))
-                    } else {
-                        last
-                    });
-                }
+            Ok(Some(exit_status)) if exit_status.success() => {
+                self.view.done = Some(true);
                 self.stdin = None;
+                if let Some(account) = self.verify_account.take() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let result = status(&account);
+                        let _ = tx.send((result.logged_in == Some(true)).then_some(result));
+                    });
+                    self.verification = Some(rx);
+                }
+                if let Some(verification) = &self.verification {
+                    match verification.try_recv() {
+                        Ok(Some(status)) => {
+                            self.verified_status = Some(status);
+                            self.view.message = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            self.view.done = None;
+                            self.view.accepts_code = false;
+                            self.view.url = None;
+                            self.view.message = Some(crate::tr!("로그인 확인 중", "Verifying sign-in").into());
+                        }
+                        _ => {
+                            self.view.done = Some(false);
+                            self.view.message = Some(crate::tr!("사용 가능한 로그인 확인 실패", "Could not verify a usable sign-in").into());
+                        }
+                    }
+                }
+            }
+            Ok(Some(status)) => {
+                // Let the reader catch up after exit, but don't wait for pipes held by descendants.
+                let seen = self.failure_seen.get_or_insert_with(Instant::now);
+                if self.readers.iter().all(std::thread::JoinHandle::is_finished) || seen.elapsed() >= Duration::from_millis(400) {
+                    let text = self.output.lock().map(|o| strip_ansi(&o)).unwrap_or_default();
+                    let last = text.lines().rev().map(str::trim).find(|l| !l.is_empty());
+                    self.view.done = Some(false);
+                    self.view.message = Some(last.map_or_else(
+                        || crate::tr!(format!("종료 코드 {:?}", status.code()), format!("Exit code {:?}", status.code())),
+                        str::to_owned,
+                    ));
+                    self.stdin = None;
+                }
             }
             Ok(None) if time::now() - self.started > 600.0 => {
                 self.cancel();
                 self.view.message =
                     Some(crate::tr!("10분 동안 로그인이 끝나지 않아 취소", "Sign-in canceled after 10 minutes without finishing").into());
             }
-            _ => {}
+            Ok(None) => {
+                let text = self.output.lock().map(|o| strip_ansi(&o)).unwrap_or_default();
+                if let Some(url) = find_url(&text) {
+                    self.view.url = Some(url);
+                }
+                let low = text.to_lowercase();
+                self.view.accepts_code = ["paste code", "enter code", "authorization code", "paste the code"]
+                    .iter().any(|prompt| low.contains(prompt));
+            }
+            Err(error) => {
+                self.cancel();
+                self.view.message = Some(crate::tr!(
+                    format!("CLI 로그인 상태 확인 실패 ({error})"),
+                    format!("Could not check the CLI sign-in ({error})")
+                ));
+            }
         }
         &self.view
     }
@@ -610,6 +975,8 @@ impl LoginSession {
 
     pub fn cancel(&mut self) {
         if self.view.done.is_none() {
+            #[cfg(windows)]
+            drop(self.job.take());
             let _ = self.child.kill();
             let _ = self.child.wait();
             self.view.done = Some(false);
@@ -630,6 +997,36 @@ impl Drop for LoginSession {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn login_completion_uses_the_exit_code_and_preserves_cli_errors() {
+        const MODE: &str = "USAGI_TEST_LOGIN_COMPLETION";
+        if let Ok(mode) = std::env::var(MODE) {
+            if mode == "failure" {
+                writeln!(std::io::stderr(), "provider sign-in failure").unwrap();
+                std::process::exit(9);
+            }
+            eprintln!("Transient error before opening the browser");
+            return;
+        }
+        for (mode, success) in [("success", true), ("failure", false)] {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "login::session_tests::login_completion_uses_the_exit_code_and_preserves_cli_errors", "--nocapture"])
+                .env(MODE, mode)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn().unwrap();
+            let mut session = LoginSession::from_child("fixture", child);
+            let end = Instant::now() + Duration::from_secs(4);
+            while session.poll().done.is_none() && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(session.view().done, Some(success));
+            if !success {
+                assert_eq!(session.view().message.as_deref(), Some("provider sign-in failure"));
+            }
+        }
+    }
 
     #[test]
     fn finds_login_url_and_strips_ansi() {

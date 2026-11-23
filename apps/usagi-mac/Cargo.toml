@@ -22,5 +22,8 @@ usagi-settings = { path = "../../crates/usagi-settings" }
 # 메뉴 막대 글자 꾸미기 (tray-icon과 같은 objc2 버전)
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSAttributedString", "NSDictionary", "NSString", "NSData", "NSValue", "NSObject", "NSGeometry", "NSUserDefaults"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSAttributedString", "NSFont", "NSFontDescriptor", "NSColor", "NSTextAttachment", "NSImage", "NSAppearance", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSResponder", "NSCell"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSAttributedString", "NSDictionary", "NSString", "NSData", "NSValue", "NSObject", "NSGeometry", "NSUserDefaults", "NSBundle", "NSError"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSAttributedString", "NSFont", "NSFontDescriptor", "NSColor", "NSTextAttachment", "NSImage", "NSAppearance", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSResponder", "NSCell", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSGraphics", "NSStringDrawing"] }
+# 앱 자체 알림 (알림 센터에 usAgI 이름·아이콘으로 표시)
+block2 = "0.6"
+objc2-user-notifications = "0.3.2"

@@ -40,7 +40,7 @@ pub struct Extents {
 }
 
 static EXTENTS: Mutex<Option<HashMap<isize, Extents>>> = Mutex::new(None);
-static ACTIVE: AtomicBool = AtomicBool::new(true);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
 
 /// 최근 값만
@@ -51,19 +51,25 @@ pub fn get(taskbar: isize) -> Option<Extents> {
 
 /// 작업 표시줄 버튼이 바뀌었을 수 있음 (앞 창이 바뀜, 화면 구성이 바뀜) → 곧 다시 확인
 pub fn poke() {
-    if let Some(tx) = WAKE.get() {
-        let _ = tx.send(());
+    if ACTIVE.load(Ordering::Relaxed) {
+        if let Some(tx) = WAKE.get() {
+            let _ = tx.send(());
+        }
     }
 }
 
 /// 보이는 위젯이 있을 때만 확인
 pub fn set_active(on: bool) {
     if ACTIVE.swap(on, Ordering::Relaxed) != on && on {
-        poke();
+        if WAKE.get().is_some() {
+            poke();
+        } else {
+            start();
+        }
     }
 }
 
-pub fn start() {
+fn start() {
     let (tx, rx) = mpsc::channel::<()>();
     if WAKE.set(tx).is_err() {
         return; // 이미 시작함
@@ -81,16 +87,20 @@ pub fn start() {
         });
         let mut quick = QUICK_ROUNDS;
         loop {
-            if ACTIVE.load(Ordering::Relaxed) {
-                let mut found = HashMap::new();
-                for tb in crate::win::taskbars() {
-                    if let Some(e) = probe(&uia, cache.as_ref(), tb.hwnd as isize) {
-                        found.insert(tb.hwnd as isize, e);
-                    }
+            if !ACTIVE.load(Ordering::Relaxed) {
+                if rx.recv().is_err() {
+                    return;
                 }
-                if let Ok(mut g) = EXTENTS.lock() {
-                    *g = Some(found);
+                continue;
+            }
+            let mut found = HashMap::new();
+            for tb in crate::win::taskbars() {
+                if let Some(e) = probe(&uia, cache.as_ref(), tb.hwnd as isize) {
+                    found.insert(tb.hwnd as isize, e);
                 }
+            }
+            if let Ok(mut g) = EXTENTS.lock() {
+                *g = Some(found);
             }
             let wait = if quick > 0 {
                 quick -= 1;

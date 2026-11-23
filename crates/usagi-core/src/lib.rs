@@ -7,11 +7,10 @@
 //! - [`rabbit`]: 단색 실루엣 토끼 렌더러 (알파 마스크)
 //! - [`accounts`]: 공급자별 계정(로컬 프로필 폴더)과 Claude Code 연결
 //! - [`bridge`]: Claude Code 상태 표시줄로 받은 정확한 사용량 (로그인·토큰 없음)
-//! - [`usage_cmd`]: Claude Code `/usage` (로컬 명령, 토큰 0)로 정확한 사용률 받기
+//! - [`usage_cmd`]: Claude 사용량 직접 조회와 Claude Code `/usage` 연동
 //! - [`probe`]: `/usage`가 안 될 때 공식 CLI로 아주 작은 요청을 보내 사용률 받기
 //! - [`codex`]: Codex 로그의 정확한 사용률
-//! - [`login`]: 계정 로그인 상태 확인과 공식 로그인 실행 (토큰은 다루지 않음)
-//! - `install`: 공식 CLI가 없을 때 공식 설치 프로그램으로 설치
+//! - [`login`]: 계정 로그인 상태 확인과 공식 로그인 실행
 //! - [`logos`]: 공급자 로고
 //! - [`config`], [`engine`]: 설정 파일, 백그라운드 폴링과 알림 판단
 //! - [`controller`], [`ui`]: 설정 화면 상태와 모든 명령 처리 (Windows·macOS·Linux가 같은 화면·같은 동작)
@@ -19,15 +18,17 @@
 
 pub mod accounts;
 pub mod animator;
+pub mod b64;
 pub mod bridge;
 pub mod changelog;
+mod claude_oauth;
 pub mod codex;
 pub mod config;
 mod connection;
 pub mod controller;
 pub mod engine;
+pub mod fallback;
 pub mod i18n;
-mod install;
 pub mod login;
 pub mod logos;
 pub mod logs;
@@ -42,6 +43,8 @@ pub mod tracker;
 pub mod ui;
 pub mod update;
 pub mod usage_cmd;
+mod usage_http;
+mod usage_retry;
 pub mod version;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

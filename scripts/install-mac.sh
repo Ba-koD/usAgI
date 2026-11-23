@@ -12,7 +12,6 @@
 set -euo pipefail
 
 REPO="${USAGI_REPO:-Ba-koD/usAgI}"
-URL="https://github.com/${REPO}/releases/latest/download/usAgI-mac.zip"
 DEST="${USAGI_DEST:-/Applications}"
 mkdir -p "$DEST" 2>/dev/null || true
 if [ ! -w "$DEST" ]; then
@@ -27,11 +26,67 @@ trap 'rm -rf "$TMP"' EXIT
 if [ -n "${USAGI_ZIP:-}" ]; then
   cp "$USAGI_ZIP" "$TMP/usAgI-mac.zip"
 else
-  echo "usAgI 내려받는 중… ($URL)"
-  # https만 (리다이렉트도), 받은 뒤 릴리스의 체크섬과 비교
+  [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "저장소 이름 형식 오류" >&2; exit 1; }
   CURL=(curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2)
+  # ZIP과 체크섬은 같은 릴리스 응답에서 고름. 설치 중에 최신 버전이 바뀌어도 섞이지 않음.
+  "${CURL[@]}" -sS -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${REPO}/releases/latest" -o "$TMP/release.json"
+  VERIFICATION="$(/usr/bin/osascript -l JavaScript - "$TMP/release.json" "$REPO" <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+    const text = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+    const release = JSON.parse(ObjC.unwrap(text));
+    const name = 'usAgI-mac.zip';
+    if (!/^v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(release.tag_name)) {
+        throw new Error('릴리스 버전 형식 오류');
+    }
+    const prefix = 'https://github.com/' + argv[1] + '/releases/download/' + release.tag_name + '/';
+    const assetUrl = (filename) => {
+        const asset = release.assets.find(item => item.name === filename);
+        if (!asset || typeof asset.browser_download_url !== 'string' ||
+            asset.browser_download_url.toLowerCase() !== (prefix + filename).toLowerCase()) {
+            throw new Error('릴리스 파일 확인 실패: ' + filename);
+        }
+        return asset.browser_download_url;
+    };
+
+    const lines = (release.body || '').split(/\r?\n/);
+    const startMarker = '<!-- usagi-verification:start -->';
+    const endMarker = '<!-- usagi-verification:end -->';
+    const start = lines.indexOf(startMarker);
+    const end = lines.indexOf(endMarker);
+    const url = assetUrl(name);
+    if (start === -1 && end === -1) {
+        return url + '\n' + assetUrl(name + '.sha256');
+    }
+    if (start === -1 || end <= start || start !== lines.lastIndexOf(startMarker) || end !== lines.lastIndexOf(endMarker)) {
+        throw new Error('릴리스 본문의 검증 정보 형식 오류');
+    }
+    const block = lines.slice(start + 1, end);
+    const heading = block.indexOf('### SHA-256');
+    const opening = block.findIndex((line, index) => index > heading && line.trim() !== '');
+    const closing = block.indexOf('```', opening + 1);
+    if (heading < 0 || block[opening] !== '```text' || closing < 0) {
+        throw new Error('릴리스 본문의 체크섬 형식 오류');
+    }
+    const matches = block.slice(opening + 1, closing)
+        .map(line => line.trim().split(/\s+/))
+        .filter(fields => fields[1] === name);
+    if (matches.length !== 1 || matches[0].length !== 2 || !/^[0-9a-f]{64}$/i.test(matches[0][0])) {
+        throw new Error('릴리스 본문의 Mac 체크섬 오류');
+    }
+    return url + '\n' + matches[0][0].toLowerCase();
+}
+JXA
+)"
+  URL="${VERIFICATION%%$'\n'*}"
+  WANT="${VERIFICATION#*$'\n'}"
+  if [[ "$WANT" == https://* ]]; then
+    WANT="$("${CURL[@]}" -sS "$WANT" | awk 'NR == 1 {print tolower($1)}')"
+  fi
+  echo "usAgI 내려받는 중… ($URL)"
   "${CURL[@]}" --progress-bar "$URL" -o "$TMP/usAgI-mac.zip"
-  WANT="$("${CURL[@]}" -sS "$URL.sha256" | awk '{print tolower($1)}')"
   GOT="$(shasum -a 256 "$TMP/usAgI-mac.zip" | awk '{print $1}')"
   if [ "${#WANT}" -ne 64 ] || [ "$WANT" != "$GOT" ]; then
     echo "체크섬 불일치. 잠시 뒤 다시 시도 필요." >&2

@@ -24,8 +24,8 @@
 Claude Code나 Codex를 쓰다가 한도가 얼마나 남았는지 확인하려면 `/usage`를 입력하거나 사용량 페이지를 열어야 함.
 usAgI는 그 수치를 Windows 작업 표시줄과 macOS 메뉴 막대에 항상 표시하고, 정해 둔 기준에 도달하면 알림을 보내는 프로그램.
 
-- 공식 CLI가 알려 주는 수치를 그대로 표시 (추정 없음)
-- 로그인과 토큰은 공식 CLI가 관리 (usAgI는 읽거나 저장하거나 전송하지 않음)
+- 공급자가 알려 주는 수치를 그대로 표시 (추정 없음)
+- 로그인과 토큰 갱신은 공식 CLI가 관리. Claude Code와 Codex의 파일 로그인은 usAgI가 사용량 조회에 재사용
 - Rust로 만든 단일 실행 파일, 실행 중 메모리 약 8MB
 
 ## 기능
@@ -63,17 +63,16 @@ Claude와 ChatGPT·Codex 계정을 여러 개 연결.
 
 ### Windows 10 / 11
 
-[최신 릴리스](https://github.com/Ba-koD/usAgI/releases/latest)에서 파일을 받아 실행. 설치 과정 없음.
+[최신 릴리스](https://github.com/Ba-koD/usAgI/releases/latest)에서 `usagi.exe`를 받아 실행. 설정은 `%APPDATA%\usAgI`에 저장.
 
-| 파일 | 설명 |
-|---|---|
-| `usagi.exe` | 실행 파일. 설정은 `%APPDATA%\usAgI`에 저장 |
-| `usAgI-portable-x.y.z.zip` | 포터블. 설정을 옆의 `data` 폴더에 저장 |
+포터블로 쓰려면 `usagi.exe` 옆에 `data` 폴더를 만든 뒤, 그 안에 빈 파일 `usagi.portable`을 만들고 실행. 설정과 사용량은 `data`에 저장.
 
 > [!NOTE]
 > 포터블에서 계정을 추가하면 `data\profiles`에 공식 CLI의 로그인 파일이 생김. `data` 폴더는 다른 사람과 공유 금지.
 
 ### macOS
+
+[최신 릴리스](https://github.com/Ba-koD/usAgI/releases/latest)의 `usAgI-mac.zip`을 풀거나 아래 명령으로 설치.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ba-koD/usAgI/main/scripts/install-mac.sh | bash
@@ -106,10 +105,12 @@ flowchart LR
     APP --> ALERT["알림"]
 ```
 
-1. 계정을 추가하면 공식 CLI(Claude Code, Codex)의 로그인이 브라우저에서 진행. CLI가 없으면 각 회사의 공식 설치 프로그램으로 자동 설치
-2. 설정한 주기(기본 5분)마다 공식 CLI에 사용량 요청 (`claude -p "/usage"`, `codex app-server`). 토큰을 쓰지 않고 5시간 창도 열지 않음
-3. Claude Code를 쓰는 동안에는 상태 표시줄 연결로 메시지마다 바로 갱신
-4. 받은 수치를 위젯에 그리고, 정한 기준에 도달하면 알림 표시
+1. 유효한 기존 파일 로그인은 바로 연결. 새 로그인은 공식 CLI에서 브라우저로 진행. CLI가 필요한 경우 설정에서 공식 설치 안내 열기
+2. 앱 시작과 설정창을 열 때 유효한 파일로 로그인 상태 확인. 설정한 주기(기본 5분)에 HTTPS로 사용량 조회. Claude는 사용할 수 있는 파일 세션이 없을 때 `/usage` 사용
+3. Claude 계정의 **실시간 연결 켜기**를 선택하면 Claude Code 사용 중에 메시지마다 갱신
+4. 받은 수치를 위젯에 표시하고, 계정의 알림 설정에 따라 사용량·리셋 알림 전송
+
+**계정 제거**는 usAgI에 저장된 계정과 사용량을 제거. usAgI 전용 프로필의 로그인 파일, 대화 기록, 설정을 지우려면 **프로필·기록 삭제** 선택. 계정 제거 후 남은 프로필은 설정의 **일반 → 보관된 프로필**에서 정리 가능.
 
 ## 리소스 사용량
 
@@ -123,12 +124,12 @@ flowchart LR
 
 - 메모리는 작업 관리자와 활성 상태 보기에 표시되는 값 기준. Windows는 계정 2개를 연결한 상태
 - 설정 창은 별도 프로세스로 실행되고, 닫으면 종료
-- 갱신 주기마다 공식 CLI가 몇 초 실행되며, 그 사용량은 위 값에 포함되지 않음
+- 위 수치는 usAgI 프로세스 기준. 파일 세션을 쓸 수 없어 실행한 CLI의 리소스는 별도
 
 ## 개인정보와 보안
 
-- **로그인 정보**: 공식 CLI가 보관. usAgI는 토큰과 로그인 파일을 읽지 않음
-- **네트워크**: GitHub 업데이트 확인·내려받기와 공식 CLI 설치 스크립트 내려받기뿐. 사용 정보 수집 없음
+- **로그인 정보**: 공식 CLI가 보관. usAgI는 사용량을 조회할 때 파일의 액세스 토큰을 메모리에서만 사용
+- **네트워크**: Claude의 `api.anthropic.com`과 Codex의 `chatgpt.com`에서 사용량 조회. GitHub에서 업데이트 확인·내려받기
 - **업데이트**: 이 저장소의 릴리스 파일만 허용. 체크섬과 서명을 모두 확인한 뒤 설치
 - **프로필 폴더**: 계정마다 만드는 폴더는 이 사용자만 접근 가능하게 생성
 

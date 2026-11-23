@@ -21,4 +21,10 @@ minisign-verify = "0.3"
 minisign = "0.10"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+ureq = { version = "~3.2.0", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+ureq = { version = "~3.2.0", default-features = false, features = ["rustls"] }

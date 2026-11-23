@@ -173,6 +173,9 @@ pub fn load() -> Config {
 /// 설정 창에서 바꾼 값(state.json의 prefs)을 설정에 덮어씀
 pub fn apply_prefs(cfg: &mut Config, state: &State) {
     cfg.notify = state.pref_bool("notify", cfg.notify);
+    if let Some(seconds) = state.pref_f64("poll") {
+        cfg.poll_seconds = seconds.clamp(1.0, 60.0);
+    }
     if let Some(t) = state.pref_f64("tired") {
         cfg.tired_percent = t.clamp(50.0, 95.0);
     }
@@ -186,7 +189,15 @@ pub struct State(pub serde_json::Map<String, serde_json::Value>);
 
 impl State {
     pub fn path() -> PathBuf {
-        config_dir().join("state.json")
+        #[cfg(not(test))]
+        return config_dir().join("state.json");
+        #[cfg(test)]
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            thread_local! { static ID: usize = NEXT.fetch_add(1, Ordering::Relaxed); }
+            ID.with(|id| config_dir().join(format!("state-test-{id}.json")))
+        }
     }
 
     pub fn load() -> Self {
@@ -205,18 +216,41 @@ impl State {
     }
 
     pub fn save(&self) {
-        let dir = config_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let tmp = dir.join("state.json.tmp");
-        if let Ok(text) = serde_json::to_string(&self.0) {
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, Self::path());
-            }
-        }
+        let _ = self.try_save();
     }
 
+    pub(crate) fn try_save(&self) -> std::io::Result<()> {
+        self.save_to(&Self::path())
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        write_json(path, &self.0)
+    }
+}
+
+pub(crate) fn write_json(path: &std::path::Path, value: &impl serde::Serialize) -> std::io::Result<()> {
+    let dir = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer(tmp.as_file_mut(), value)?;
+    // A short-lived file lock on Windows can block replacement.
+    let mut retries = [8, 25].into_iter();
+    loop {
+        let failure = match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(failure) => failure,
+        };
+        let Some(delay) = retries.next().filter(|_| {
+            cfg!(windows) && matches!(failure.error.raw_os_error(), Some(5 | 32 | 33))
+        }) else {
+            return Err(failure.error);
+        };
+        tmp = failure.file;
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+    }
+}
+
+impl State {
     pub fn get_str(&self, key: &str) -> Option<&str> {
         self.0.get(key).and_then(|v| v.as_str())
     }
@@ -249,10 +283,10 @@ impl State {
 
     pub fn set_pref(&mut self, key: &str, value: serde_json::Value) {
         let prefs = self.0.entry("prefs").or_insert_with(|| serde_json::json!({}));
-        if let Some(obj) = prefs.as_object_mut() {
-            obj.insert(key.into(), value);
+        if !prefs.is_object() {
+            *prefs = serde_json::json!({});
         }
-        self.save();
+        prefs[key] = value;
     }
 }
 

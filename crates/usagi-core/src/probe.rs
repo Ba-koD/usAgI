@@ -11,9 +11,8 @@
 use crate::accounts::Account;
 use crate::bridge::{BridgeFile, BridgeWindow};
 use crate::config::config_dir;
-use crate::login::{profile_env, programs_or_hint};
+use crate::login::{capture_child_output, profile_env, programs_or_hint};
 use crate::time;
-use std::io::Read;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -109,33 +108,22 @@ pub(crate) fn run_cli(acc: &Account, args: &[&str], timeout_secs: u64) -> Result
         if let Some((k, v)) = profile_env(acc) {
             cmd.env(k, v);
         }
-        let mut child = match cmd.spawn() {
+        let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 last_err = format!("{}: {e}", prog.display());
                 continue;
             }
         };
-        let mut stdout = child.stdout.take().expect("stdout");
-        let reader = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = stdout.read_to_string(&mut s);
-            s
-        });
-        let started = std::time::Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if started.elapsed() > Duration::from_secs(timeout_secs) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(crate::tr!(format!("확인 시간 초과 ({timeout_secs}초)"), format!("Check timed out ({timeout_secs}s)")));
+        return capture_child_output(child, Duration::from_secs(timeout_secs))
+            .map(|(stdout, _)| stdout)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    crate::tr!(format!("확인 시간 초과 ({timeout_secs}초)"), format!("Check timed out ({timeout_secs}s)"))
+                } else {
+                    error.to_string()
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        return Ok(reader.join().unwrap_or_default());
+            });
     }
     Err(last_err)
 }

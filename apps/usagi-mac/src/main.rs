@@ -3,6 +3,8 @@
 #[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
+mod notify;
+#[cfg(target_os = "macos")]
 mod title;
 #[cfg(target_os = "macos")]
 mod updater;
@@ -17,6 +19,9 @@ fn main() {
             Some("statusline") => statusline(&args),
             // 빌드 스크립트용: 앱 아이콘(.iconset) PNG 만들기
             Some("--iconset") => app::write_iconset(std::path::Path::new(args.get(2).map(String::as_str).unwrap_or("usAgI.iconset"))),
+            // 디자인 확인용: 예시 값으로 메뉴 막대 미리 보기 PNG (light, nobars, spent, time)
+            #[cfg(debug_assertions)]
+            Some("--menubar-preview") => app::write_menubar_preview(&args[2..]),
             _ => {
                 std::panic::set_hook(Box::new(|info| app::log(&format!("panic: {info}"))));
                 app::run();
@@ -42,7 +47,7 @@ fn statusline(args: &[String]) {
     let line = usagi_core::bridge::run_statusline(&input, &account);
     let chain = usagi_core::accounts::load(&usagi_core::config::State::load())
         .into_iter()
-        .find(|a| a.id == account)
+        .find(|a| a.usage_key() == account)
         .and_then(|a| a.chain);
     let out = chain.and_then(|cmd| run_chain(&cmd, &input)).unwrap_or(line);
     let mut stdout = std::io::stdout();
@@ -52,11 +57,7 @@ fn statusline(args: &[String]) {
 
 #[cfg(target_os = "macos")]
 fn run_chain(cmd: &str, input: &str) -> Option<String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("/bin/sh").arg("-c").arg(cmd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input.as_bytes());
-    }
-    child.wait_with_output().ok().map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    let mut command = std::process::Command::new("/bin/sh");
+    command.arg("-c").arg(cmd);
+    usagi_core::login::run_statusline_chain(command, input)
 }

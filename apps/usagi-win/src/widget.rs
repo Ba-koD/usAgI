@@ -145,6 +145,8 @@ pub struct Section {
     /// 계정 id (막대가 이어서 움직이도록 값을 기억하는 열쇠. 순서를 바꿔도 같은 계정이면 그 자리에서 이어짐)
     pub key: String,
     pub rows: Vec<Row>,
+    /// 그래프 대신 보일 글자 (로그아웃된 계정: "로그인 필요"). 있으면 rows는 비어 있음
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -211,10 +213,14 @@ pub struct Widget {
     short_col: f32,
     /// 막대 길이 설정 (0..1, 0 = 가장 긴 남은 시간 글자만큼)
     pub bar_px: Option<f32>,
+    /// 막대를 그릴지. 끄면 자리가 넉넉해도 라벨과 값만 있는 모양
+    pub bars: bool,
     /// 넓은 모양의 한 열 너비 (논리 px) = 라벨 + 막대 + 간격 + 가장 긴 값. 모드를 바꿔도 위젯 너비는 그대로
     col_w: f32,
     /// 가장 긴 값 글자 너비 캐시 (배율, 영어인지, 너비)
     widest: (f32, bool, f32),
+    /// 안내 글자(로그인 필요) 너비 (논리 px)
+    note_w: f32,
 }
 
 fn hash_of<T: Hash>(v: &T) -> u64 {
@@ -247,8 +253,10 @@ impl Widget {
             label_cols: (32.0, 18.0),
             short_col: 30.0,
             bar_px: None,
+            bars: true,
             col_w: 207.0,
             widest: (0.0, false, 0.0),
+            note_w: 0.0,
         }
     }
 
@@ -289,7 +297,7 @@ impl Widget {
         let n = content.sections.len() as f32;
         let val = if fit == Fit::Short { self.short_col } else { self.value_col.unwrap_or(32.0) as f32 };
         let lab = if fit == Fit::Short { self.label_cols.1 } else { self.label_cols.0 };
-        let secs: f32 = content.sections.iter().map(|s| section_width(s.rows.len(), fit, lab, val, self.col_w)).sum();
+        let secs: f32 = content.sections.iter().map(|s| self.sec_w(s, fit, lab, val)).sum();
         let rabbit = if content.rabbit.is_some() { RABBIT_W } else { 0.0 };
         let divider = if fit == Fit::Full { DIVIDER_W } else { COMPACT_DIVIDER };
         PAD * 2.0 + rabbit + secs + (n - 1.0).max(0.0) * divider
@@ -306,8 +314,36 @@ impl Widget {
         (long.ceil(), short.ceil())
     }
 
+    /// 안내 글자 너비 (라벨과 같은 글꼴) — 논리 px
+    fn measure_notes(&mut self, content: &Content, scale: f32) -> f32 {
+        let spec = FontSpec { px: (12.0 * scale).round() as i32, weight: 700, face: "Malgun Gothic" };
+        let mut w = 0.0f32;
+        for n in content.sections.iter().filter_map(|s| s.note.as_deref()) {
+            w = w.max(self.text.measure(n, spec).0 as f32 / scale);
+        }
+        w.ceil()
+    }
+
+    /// 한 칸의 너비: 안내 글자 칸은 로고 + 글자, 나머지는 그래프 열
+    fn sec_w(&self, s: &Section, fit: Fit, lab: f32, val: f32) -> f32 {
+        if s.note.is_some() {
+            let logo = if fit == Fit::Full { LOGO_COL } else { COMPACT_LOGO };
+            return logo + self.note_w + 2.0;
+        }
+        section_width(s.rows.len(), fit, lab, val, self.col_w)
+    }
+
     /// 애니메이션 틱마다. 바뀐 게 있을 때만 다시 그림.
     pub fn update(&mut self, mut content: Content) {
+        let scale = self.place.map(|p| p.scale).unwrap_or(1.0);
+        if !self.animating()
+            && self.content.as_ref() == Some(&content)
+            && self.widest.0 == scale
+            && self.widest.1 == usagi_core::i18n::is_en()
+            && self.col_w == self.full_col_width(scale)
+        {
+            return;
+        }
         // 막대·퍼센트가 새 값으로 부드럽게 차오르게 (처음 켤 때는 0에서). 틱 간격과 무관하게 시간 기준.
         let now = std::time::Instant::now();
         let dt = self.last_tick.map(|t| now.duration_since(t).as_secs_f64().min(0.25)).unwrap_or(0.066);
@@ -322,14 +358,14 @@ impl Widget {
                 let next = if (target - cur).abs() < 0.004 { target } else { cur + (target - cur) * k };
                 easing |= next != target;
                 self.eased.insert(key, next);
-                if row.percent && target <= 1.0 {
-                    row.value = texts::fmt_pct(if row.left { (1.0 - next).max(0.0) } else { next });
+                if row.percent {
+                    // 차오르는 동안은 숫자, 다 쓴 값에 닿으면 "소진"
+                    row.value = if next == target { texts::fmt_usage(target, row.left) } else { texts::fmt_pct(if row.left { (1.0 - next).max(0.0) } else { next.min(1.0) }) };
                 }
                 row.ratio = next;
             }
         }
         // 값 칸 = 지금 보이는 값 중 가장 넓은 것. 막대는 그만큼만 줄고 늘며, 모든 줄이 같은 길이.
-        let scale = self.place.map(|p| p.scale).unwrap_or(1.0);
         let target = self.measure_col(content.sections.iter().flat_map(|s| s.rows.iter().map(|r| r.value.as_str())), scale) as f64;
         let col = match self.value_col {
             Some(c) if (target - c).abs() >= 0.3 => c + (target - c) * (1.0 - (-dt / COL_TAU).exp()),
@@ -338,6 +374,7 @@ impl Widget {
         easing |= col != target;
         self.value_col = Some(col);
         self.label_cols = self.measure_labels(&content, scale);
+        self.note_w = self.measure_notes(&content, scale);
         self.short_col = self.measure_col(content.sections.iter().flat_map(|s| s.rows.iter().map(|r| r.shown(true))), scale);
         self.col_w = self.full_col_width(scale);
         // 좁은 모양은 글자 너비에, 넓은 모양은 막대 길이 설정에 맞추므로 너비가 바뀌면 창 크기도 다시
@@ -360,7 +397,7 @@ impl Widget {
         let structure_changed = self.content.as_ref().is_none_or(|c| {
             c.sections.len() != content.sections.len()
                 || c.rabbit.is_some() != content.rabbit.is_some()
-                || c.sections.iter().zip(&content.sections).any(|(a, b)| columns(a.rows.len()) != columns(b.rows.len()))
+                || c.sections.iter().zip(&content.sections).any(|(a, b)| columns(a.rows.len()) != columns(b.rows.len()) || a.note != b.note)
         });
         self.content = Some(content);
         if structure_changed || resize {
@@ -446,8 +483,8 @@ impl Widget {
 
         let fit = |lo: i32, hi: i32, from_right: bool| -> Option<Place> {
             let avail = hi - lo;
-            // 실제로 남는 자리에 맞춰: 막대 → 라벨+값 → 짧은 라벨+값 → 숨김
-            let (w, fit) = if avail >= full_w {
+            // 실제로 남는 자리에 맞춰: 막대(켜 둔 경우) → 라벨+값 → 짧은 라벨+값 → 숨김
+            let (w, fit) = if self.bars && avail >= full_w {
                 (full_w, Fit::Full)
             } else if avail >= compact_w {
                 (compact_w, Fit::Compact)
@@ -484,7 +521,7 @@ impl Widget {
     }
 
     fn paint(&mut self) {
-        let (Some(place), Some(content)) = (self.place, self.content.clone()) else { return };
+        let (Some(place), Some(content)) = (self.place, self.content.as_ref()) else { return };
         let progress = self.switch_progress();
         let step = progress.map(|t| (t * 1000.0) as u32);
         let col = self.value_col.map(|c| (c * 10.0) as i64);
@@ -492,19 +529,19 @@ impl Widget {
         if Some(key) == self.last_key {
             return;
         }
+        let content = content.clone();
         // 글자/막대/로고 레이아웃은 토끼 프레임과 따로 캐시
-        let layout_key = hash_of(&(format!("{:?}{:?}", content.sections, content.ink), place.w, place.h, place.fit, step, col));
-        let base = match &self.layout {
-            Some((k, img)) if *k == layout_key => img.clone(),
+        let layout_key = content.rabbit.map(|_| hash_of(&(format!("{:?}{:?}", content.sections, content.ink), place.w, place.h, place.fit, step, col)));
+        let mut img = match (&self.layout, layout_key) {
+            (Some((cached, img)), Some(key)) if *cached == key => img.clone(),
             _ => {
                 let from = self.switch.as_ref().map(|s| s.from.clone());
                 let tr = from.as_ref().zip(progress);
                 let img = self.draw_layout(&content, &place, tr);
-                self.layout = Some((layout_key, img.clone()));
+                self.layout = layout_key.map(|key| (key, img.clone()));
                 img
             }
         };
-        let mut img = base;
         if let Some(pose) = content.rabbit {
             let size = ((24.0 * place.scale).round() as u32).min(place.h as u32 - 2);
             if self.rabbits.len() > 400 {
@@ -591,6 +628,14 @@ impl Widget {
             let logo = self.logos.entry((sec.id, logo_size)).or_insert_with(|| logos::render(sec.id, logo_size)).clone();
             let color = logos::brand_color(sec.id).unwrap_or(content.ink);
             img.blend_mask(x0, (h - logo_size as i32) / 2, &logo, logo_size, logo_size, color, 255);
+            // 로그아웃된 계정: 그래프 대신 "로그인 필요" (설정 창의 빨간 안내와 같은 색)
+            if let Some(note) = &sec.note {
+                let tx = x + if place.fit == Fit::Full { LOGO_COL } else { COMPACT_LOGO };
+                self.text.draw(&mut img, px(tx), h / 2, note, label, BAR_COLORS[2], 255, Align::Left);
+                let (lab_w, vcol) = if place.fit == Fit::Short { (self.label_cols.1, self.short_col) } else { (self.label_cols.0, col) };
+                x += self.sec_w(sec, place.fit, lab_w, vcol);
+                continue;
+            }
 
             // 두 줄씩 열로 나눔 (세 번째 줄부터 같은 칸의 다음 열)
             for (ci, chunk) in sec.rows.chunks(2).enumerate() {
@@ -634,7 +679,7 @@ impl Widget {
             }
             }
             let (lab_w, vcol) = if place.fit == Fit::Short { (self.label_cols.1, self.short_col) } else { (self.label_cols.0, col) };
-            x += section_width(sec.rows.len(), place.fit, lab_w, vcol, col_w);
+            x += self.sec_w(sec, place.fit, lab_w, vcol);
         }
         img
     }
@@ -656,6 +701,7 @@ pub fn preview_bar(content: &Content, scale: f32, height: i32, level: u8, tr: Op
     let mut w = Widget::new(std::ptr::null_mut(), std::ptr::null_mut(), true);
     w.bar_px = bar_px;
     w.label_cols = w.measure_labels(content, scale); // 열 너비가 라벨 칸을 따르므로 먼저
+    w.note_w = w.measure_notes(content, scale);
     w.col_w = w.full_col_width(scale);
     let fit = match level {
         0 => Fit::Full,
@@ -676,6 +722,22 @@ pub fn preview_bar(content: &Content, scale: f32, height: i32, level: u8, tr: Op
         img.blend_mask((PAD * scale).round() as i32, (height - size as i32) / 2, &mask, size, size, content.ink, 255);
     }
     img
+}
+
+/// 설정 창에 보낼 위젯 미리 보기: 지금 설정대로 그린 그림을 작업 표시줄 색 위에 얹어 불투명 RGBA(base64)로.
+/// {w, h, scale, light, rgba}
+pub fn preview_json(content: &Content, bars: bool, bar_px: Option<f32>, scale: f32, light: bool) -> serde_json::Value {
+    let height = (48.0 * scale).round() as i32;
+    let img = preview_bar(content, scale, height, if bars { 0 } else { 1 }, None, bar_px);
+    // 위젯 그림은 반투명(프리멀티플라이드 BGRA) → 작업 표시줄 색 위에 얹음
+    let bg: Rgb = if light { (238, 238, 238) } else { (32, 32, 32) };
+    let mut rgba = Vec::with_capacity(img.px.len());
+    for p in img.px.chunks_exact(4) {
+        let rest = 255 - p[3] as u32;
+        let over = |c: u8, b: u8| (c as u32 + b as u32 * rest / 255).min(255) as u8;
+        rgba.extend_from_slice(&[over(p[2], bg.0), over(p[1], bg.1), over(p[0], bg.2), 255]);
+    }
+    serde_json::json!({ "w": img.w, "h": img.h, "scale": scale, "light": light, "rgba": usagi_core::b64::encode(&rgba) })
 }
 
 /// 값 글꼴: 숫자·%는 Segoe UI, 한글이 섞인 남은 시간(6일 23시간)은 라벨과 같은 맑은 고딕 굵게

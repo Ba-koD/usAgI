@@ -18,6 +18,7 @@ fn send(message: Value) {
 }
 
 fn wire_actions(view: &SettingsView) {
+    view.on_preview_visibility(|visible| send(json!({"cmd":"widgetPreview","visible":visible})));
     let actions = view.global::<Actions>();
     actions.on_has_threshold(|values, threshold| values.iter().any(|v| v == threshold));
     actions.on_drag_payload(|id| {

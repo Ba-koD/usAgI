@@ -79,6 +79,7 @@ fn meter(v: &Value, previous: Option<Meter>) -> Meter {
         key: text(v, "alertKey").into(),
         label: text(v, "label").into(),
         exact: flag(v, "exact"),
+        spent: flag(v, "spent"),
         percent: ((if left { 1.0 - ratio } else { ratio }) * 100.0).round() as i32,
         level: v["level"].as_u64().unwrap_or_default().min(2) as i32,
         left,
@@ -122,8 +123,9 @@ fn account(v: &Value, previous: Option<Account>) -> Account {
         login_status,
         if label.is_empty() { "" } else { email },
         text(login, "org"),
-        text(login, "ends"),
+        if flag(login, "reconnectSoon") { "" } else { text(login, "ends") },
         text(login, "error"),
+        if text(login, "fallback").is_empty() { "" } else { tr!("대체 로그인 폴더 사용 중", "Using a backup sign-in folder") },
         text(v, "linkNote"),
         if flag(v, "dup") {
             tr!("다른 카드와 동일한 계정", "Same account as another card")
@@ -135,16 +137,21 @@ fn account(v: &Value, previous: Option<Account>) -> Account {
     .filter(|s| !s.is_empty())
     .collect::<Vec<_>>()
     .join(" · ");
-    let mut footer: Vec<String> = [text(v, "forecast"), text(v, "note"), text(probe, "error")]
+    let footer = [text(v, "forecast"), text(v, "note")]
         .into_iter()
         .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
-    if flag(probe, "running") {
-        footer.push(tr!("확인 중…", "Checking…").into());
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let retry = if flag(probe, "running") {
+        tr!("확인 중…", "Checking…").to_owned()
+    } else if let Some(at) = probe["retryAt"].as_str().or_else(|| probe["nextAt"].as_str()) {
+        tr!(format!("다음 확인 {at}"), format!("Next check {at}"))
     } else if let Some(at) = probe["triedAt"].as_str() {
-        footer.push(tr!(format!("마지막 확인 {at}"), format!("Last checked {at}")));
-    }
+        tr!(format!("마지막 확인 {at}"), format!("Last checked {at}"))
+    } else {
+        String::new()
+    };
+    let refresh_status = [text(probe, "error"), &retry].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
     // 크레딧·리필권은 카드 머리줄의 작은 표시로
     let credits = &v["credits"];
     let credits = if flag(credits, "unlimited") {
@@ -193,9 +200,23 @@ fn account(v: &Value, previous: Option<Account>) -> Account {
         .into(),
         refill_lead: v["refill"]["lead"].as_f64().unwrap_or(1440.0).round() as i32,
         refills: refills.into(),
-        folder: text(v, "dir").into(),
+        // 대체 폴더를 쓰는 중이면 두 폴더 모두
+        folder: match text(login, "fallback") {
+            "" => text(v, "dir").to_string(),
+            fb => tr!(
+                format!("{} (로그인 만료) · 사용 중: {fb}", text(v, "dir")),
+                format!("{} (signed out) · in use: {fb}", text(v, "dir"))
+            ),
+        }
+        .into(),
         details: details.into(),
-        footer: footer.join(" · ").into(),
+        footer: footer.into(),
+        refresh_status: refresh_status.into(),
+        refreshing: flag(probe, "running"),
+        managed: flag(v, "managed"),
+        live_link: text(v, "link").into(),
+        reconnect_soon: flag(login, "reconnectSoon"),
+        sign_in_ends: text(login, "ends").into(),
         collapsed: flag(v, "collapsed"),
         show_widget: flag(v, "show"),
         meters: rows(old_meters, meters),
@@ -284,6 +305,7 @@ pub fn apply(view: &SettingsView, state: &Value) {
         bar_min: prefs["barMin"].as_f64().unwrap_or(60.0).round() as i32,
         bar_max: prefs["barMax"].as_f64().unwrap_or(240.0).round() as i32,
         bar_default: prefs["barDefault"].as_f64().unwrap_or(77.0).round() as i32,
+        bars: prefs["bars"].as_bool().unwrap_or(true),
         locale: match text(prefs, "locale") {
             "ko" | "en" => text(prefs, "locale"),
             _ => "system",
@@ -301,7 +323,8 @@ pub fn apply(view: &SettingsView, state: &Value) {
             .unwrap_or(2) as i32,
         notify: flag(prefs, "notify"),
         nap: flag(prefs, "napNotify"),
-        login: flag(prefs, "loginNotify"),
+        login: prefs["loginNotify"].as_bool().unwrap_or(true),
+        login_warning_days: prefs["loginWarningDays"].as_i64().unwrap_or(3) as i32,
         refill: flag(prefs, "refillNotify"),
         refill_lead: prefs["refillLead"].as_f64().unwrap_or(1440.0).round() as i32,
         urgent: flag(prefs, "urgent"),
@@ -322,6 +345,8 @@ pub fn apply(view: &SettingsView, state: &Value) {
         .map(|(i, v)| account(v, old.row_data(i).filter(|a| a.id == text(v, "id"))))
         .collect();
     view.set_accounts(rows(old, accounts));
+    let inactive_profiles = list(&state["inactiveProfiles"]).iter().filter_map(Value::as_str).map(SharedString::from).collect();
+    view.set_inactive_profiles(rows(view.get_inactive_profiles(), inactive_profiles));
     let login = &state["loginSession"];
     view.set_login(LoginInfo {
         id: text(login, "id").into(),
@@ -341,6 +366,17 @@ pub fn apply(view: &SettingsView, state: &Value) {
         done: login["done"].is_boolean(),
         failed: login["done"].as_bool() == Some(false),
     });
+    // macOS: Slint는 창을 투명하게 만들어서 제목 표시줄 뒤로 다른 창이 비쳐 보임 → 불투명 창으로 (한 번만)
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::WinitWindowAccessor;
+        use slint::ComponentHandle;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static OPAQUE: AtomicBool = AtomicBool::new(false);
+        if !OPAQUE.load(Ordering::Relaxed) && view.window().with_winit_window(|w| w.set_transparent(false)).is_some() {
+            OPAQUE.store(true, Ordering::Relaxed);
+        }
+    }
     // 창 제목 표시줄도 같은 테마로 (Windows는 Slint 색 설정이 제목 표시줄까지 가지 않음). 바뀔 때만.
     {
         use slint::winit_030::{winit::window::Theme as WinitTheme, WinitWindowAccessor};
@@ -379,6 +415,30 @@ pub fn apply(view: &SettingsView, state: &Value) {
             }
         }
     }
+    // 위젯 미리 보기 (Windows 호스트가 그려 보낸 그림). {keep}이면 그대로 두고, 없으면 비움
+    match &state["widgetPreview"] {
+        Value::Object(p) if p.contains_key("rgba") => {
+            let (w, h) = (p["w"].as_u64().unwrap_or(0) as u32, p["h"].as_u64().unwrap_or(0) as u32);
+            let scale = p["scale"].as_f64().filter(|s| *s > 0.0).unwrap_or(1.0) as f32;
+            let bytes = p["rgba"].as_str().and_then(usagi_core::b64::decode).unwrap_or_default();
+            let ok = w > 0 && h > 0 && bytes.len() == (w * h * 4) as usize;
+            if ok {
+                let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&bytes, w, h);
+                view.set_widget_preview(slint::Image::from_rgba8(buffer));
+                view.set_preview_width(w as f32 / scale);
+                view.set_preview_height(h as f32 / scale);
+                view.set_preview_light(p["light"].as_bool().unwrap_or(false));
+            }
+            view.set_has_preview(ok);
+        }
+        Value::Object(_) => {}
+        _ => {
+            if view.get_has_preview() {
+                view.set_widget_preview(slint::Image::default());
+                view.set_has_preview(false);
+            }
+        }
+    }
     view.set_update(update(&state["update"]));
     view.set_update_notes(rows(view.get_update_notes(), note_lines(text(&state["update"], "notes"))));
     // 이 버전의 변경 내용 (빌드에 들어 있는 CHANGELOG). 한 번만 채움
@@ -388,6 +448,7 @@ pub fn apply(view: &SettingsView, state: &Value) {
         }
     }
     view.set_error(text(state, "error").into());
+    view.set_install_help(text(state, "installHelp").into());
     view.set_windows(text(state, "platform") == "windows");
     view.set_version(text(state, "version").into());
     view.set_folder(text(state, "dataDir").into());

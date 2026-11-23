@@ -1,13 +1,13 @@
 import { FocusOut, Theme, CenterItem, NavItem, UiButton, Segments, Toggle } from "style.slint";
 import { AboutSlint, Palette, ScrollView } from "std-widgets.slint";
-import { Account, AccountCard, Actions, AddAccount, Banner, Debug, Fold, NoteLine, Notes, Dropdown, Motion, LeadTime, BarLength, TextField, Caption, Group, Hint, Heading, Panel, PrefToggle, Rule, Section, SettingRow } from "components.slint";
+import { Account, AccountCard, Actions, AddAccount, Banner, Debug, Fold, NoteLine, Notes, WidgetPreview, Dropdown, Motion, LeadTime, BarLength, TextField, Caption, Group, Hint, Heading, Panel, PrefToggle, Rule, Section, SettingRow } from "components.slint";
 import "fonts/Pretendard-Medium.otf";
 import "fonts/Pretendard-SemiBold.otf";
 export { Account, Meter, AlertItem, NoteLine, Actions, Debug, Motion } from "components.slint";
 
 export struct Preferences {
-    widget: bool, side: string, monitor-index: int, mode: string, theme: string, locale: string, logo: string, bar-px: int, bar-min: int, bar-max: int, bar-default: int, basis: string, refresh: int,
-    notify: bool, nap: bool, login: bool, refill: bool, refill-lead: int, urgent: bool, urgent-supported: bool, urgent-status: string,
+    widget: bool, side: string, monitor-index: int, mode: string, theme: string, locale: string, logo: string, bar-px: int, bar-min: int, bar-max: int, bar-default: int, bars: bool, basis: string, refresh: int,
+    notify: bool, nap: bool, login: bool, login-warning-days: int, refill: bool, refill-lead: int, urgent: bool, urgent-supported: bool, urgent-status: string,
     autostart: bool, auto-update: bool,
 }
 export struct UpdateInfo {
@@ -43,14 +43,24 @@ export component SettingsView inherits Window {
     in property <[string]> monitor-ids;
     in property <string> version;
     in property <string> folder;
+    in property <[string]> inactive-profiles;
     in property <string> font-license;
     // 변경 내용: 이 버전(빌드에 들어 있는 CHANGELOG)과 받을 새 버전(릴리스 노트)
     in property <[NoteLine]> version-notes;
     in property <[NoteLine]> update-notes;
+    // 위젯 미리 보기 (Windows가 그려 보낸 그림과 그 크기)
+    in property <image> widget-preview;
+    in property <length> preview-width;
+    in property <length> preview-height;
+    in property <bool> preview-light;
+    in property <bool> has-preview;
     in property <string> error;
+    in property <string> install-help;
     in property <bool> windows;
     in property <bool> portable;
     in-out property <int> page;
+    callback preview-visibility(bool);
+    changed page => { root.preview-visibility(root.page == 1); }
     // 개발용 화면 캡처: 내용을 이만큼 내린 상태로
     in-out property <length> debug-scroll;
     changed debug-scroll => { scroll.viewport-y = -root.debug-scroll; }
@@ -62,7 +72,7 @@ export component SettingsView inherits Window {
     changed dbg => { if root.dbg == "notes" { root.show-notes = true; } }
     private property <[string]> pages: [@tr("사용량"), root.windows ? @tr("위젯") : @tr("메뉴 막대"), @tr("알림"), @tr("일반"), @tr("정보")];
     private property <string> description: root.page == 1 ? (root.windows ? @tr("작업 표시줄에 사용량을 항상 표시") : @tr("메뉴 막대에 사용량을 항상 표시"))
-        : root.page == 2 ? @tr("사용량이 설정한 기준에 도달하면 {} 알림 표시", root.windows ? "Windows" : "macOS")
+        : root.page == 2 ? @tr("사용량과 로그인 만료에 대한 {} 알림 설정", root.windows ? "Windows" : "macOS")
         : root.page == 4 ? "usAgI v" + root.version : "";
     // 820px 이하: 사이드바를 아이콘 줄로. 680px 이하: 여백과 버튼 글자를 줄임
     private property <bool> narrow;
@@ -84,6 +94,10 @@ export component SettingsView inherits Window {
     private property <[image]> icons: [@image-url("icons/usage.svg"), @image-url("icons/widget.svg"), @image-url("icons/alerts.svg"), @image-url("icons/general.svg"), @image-url("icons/about.svg")];
     changed width => {
         root.window-width = root.width; root.narrow = root.width <= 820px; root.small = root.width <= 680px;
+        root.note-resize();
+    }
+    changed height => { root.note-resize(); }
+    function note-resize() {
         // 크기를 바꾸는 동안: 카드 높이 애니메이션 없이 바로 맞춤 (마지막 변화 300ms 뒤 다시 켬)
         Motion.resizing = true;
         resize-done.stop();
@@ -100,6 +114,8 @@ export component SettingsView inherits Window {
     // 조건부 줄이 생기고 없어질 때 (높이·투명도)
     private property <float> refill-k: root.prefs.refill ? 1 : 0;
     animate refill-k { duration: 240ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+    private property <float> bars-k: root.prefs.bars ? 1 : 0;
+    animate bars-k { duration: 240ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
     private property <float> warn-k: root.prefs.refresh <= 1 ? 1 : 0;
     animate warn-k { duration: 240ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
     private property <float> license-k: root.show-font-license ? 1 : 0;
@@ -142,6 +158,10 @@ export component SettingsView inherits Window {
                 }
                 if root.description != "": Hint { text: root.description; }
                 if root.error != "": Banner { text: root.error; }
+                if root.install-help != "": HorizontalLayout {
+                    alignment: start;
+                    UiButton { text: @tr("공식 설치 안내"); clicked => { Actions.command("openInstall"); } }
+                }
             }
             scroll := ScrollView {
                 vertical-stretch: 1;
@@ -183,7 +203,7 @@ export component SettingsView inherits Window {
                                 Image { width: 44px; height: 44px; source: @image-url("icons/rabbit.svg"); colorize: Theme.faint; } }
                             Rectangle { height: 2px; }
                             Caption { text: @tr("연결된 계정 없음"); font-size: Theme.size-section; horizontal-alignment: center; }
-                            Hint { text: @tr("Claude Code·Codex CLI로 로그인한 계정의 사용량 표시. CLI가 없으면 공식 설치 프로그램으로 자동 설치"); horizontal-alignment: center; }
+                            Hint { text: @tr("기존 로그인을 확인하고, CLI가 필요하면 설치 안내 표시"); horizontal-alignment: center; }
                             Rectangle { height: 6px; }
                             HorizontalLayout { alignment: center; spacing: Theme.gap-s;
                                 UiButton { text: "Claude"; icon: @image-url("icons/claude.svg"); icon-colored: true; icon-color: #d97757; clicked => { Actions.account("addNew", "claude", ""); } }
@@ -191,11 +211,13 @@ export component SettingsView inherits Window {
                             }
                         }
                         if root.page == 2: Group {
-                            PrefToggle { title: @tr("알림 받기"); subtitle: @tr("끄면 그래프별 알림도 모두 꺼짐"); key: "notify"; checked: root.prefs.notify; }
+                            PrefToggle { title: @tr("알림 받기"); subtitle: @tr("끄면 usAgI 알림이 모두 꺼짐"); key: "notify"; checked: root.prefs.notify; }
                             Rule {}
                             PrefToggle { title: @tr("한도 도달·리셋 알림"); subtitle: @tr("Claude 한도에 도달했을 때와 한도가 리셋됐을 때 알림"); key: "napNotify"; checked: root.prefs.nap; }
                             Rule {}
-                            PrefToggle { title: @tr("로그인 만료 알림"); subtitle: @tr("로그인이 만료되어 다시 로그인해야 할 때 알림"); key: "loginNotify"; checked: root.prefs.login; }
+                            PrefToggle { title: @tr("로그인 만료 알림");
+                                subtitle: @tr("Claude는 만료 예정일 {}일 전부터 한 번 알림. 날짜를 모르면 다시 연결이 필요할 때 알림", root.prefs.login-warning-days);
+                                key: "loginNotify"; checked: root.prefs.login; }
                             Rule {}
                             VerticalLayout {
                                 SettingRow { title: @tr("리필권 만료 알림"); subtitle: @tr("리필권이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경");
@@ -213,10 +235,16 @@ export component SettingsView inherits Window {
                             if root.windows: Rule {}
                             if root.windows: SettingRow { title: @tr("Windows 알림 설정"); subtitle: root.prefs.urgent-status;
                                 UiButton { text: @tr("Windows 설정 열기"); clicked => { Actions.command("openNotifySettings"); } } }
+                            if !root.windows: Rule {}
+                            if !root.windows: SettingRow { title: @tr("macOS 알림 설정"); subtitle: @tr("알림 허용, 배너 모양, 소리 설정");
+                                UiButton { text: @tr("알림 설정 열기"); clicked => { Actions.command("openNotifySettings"); } } }
+                            if !root.windows: Rule {}
+                            if !root.windows: SettingRow { title: @tr("방해 금지 중에도 알림"); subtitle: @tr("집중 모드 설정의 허용된 앱에 usAgI 추가 시 방해 금지 중에도 알림 표시");
+                                UiButton { text: @tr("집중 모드 설정 열기"); clicked => { Actions.command("openFocusSettings"); } } }
                         }
                         if root.page == 0 || root.page == 2: VerticalLayout {
                             spacing: 10px;
-                            if root.page == 2 && root.accounts.length > 0: Section { text: @tr("그래프별 알림"); }
+                            if root.page == 2 && root.accounts.length > 0: Section { text: @tr("계정별 알림"); }
                             VerticalLayout {
                                 spacing: Theme.gap-l;
                                 for acc[i] in root.accounts: AccountCard {
@@ -233,6 +261,7 @@ export component SettingsView inherits Window {
                             SettingRow { title: @tr("모니터"); subtitle: @tr("선택한 모니터가 연결되어 있지 않으면 주 모니터에 표시");
                                 Dropdown {
                                     width: root.small ? 170px : 220px; label: @tr("위젯을 표시할 모니터");
+                                    popup-width: min(420px, root.pane-width - 2 * root.gutter - 2 * Theme.pad);
                                     model: root.monitors; current: root.prefs.monitor-index;
                                     selected(i) => { Actions.pref("monitor", i); }
                                 }
@@ -247,11 +276,27 @@ export component SettingsView inherits Window {
                             SettingRow { title: @tr("표시 값"); subtitle: root.windows ? @tr("위젯을 우클릭해도 전환 가능") : @tr("메뉴 막대 메뉴에서도 변경 가능");
                                 Segments { options: [@tr("퍼센트"), @tr("남은 시간")]; index: root.prefs.mode == "time" ? 1 : 0;
                                     selected(i) => { Actions.pref("mode", i == 0 ? "percent" : "time"); } } }
-                            if root.windows: Rule {}
-                            if root.windows: SettingRow { title: @tr("막대 길이"); subtitle: @tr("남은 시간을 표시할 때의 막대 길이 · 기본 {}px", root.prefs.bar-default);
-                                BarLength {
-                                    value: root.prefs.bar-px; minimum: root.prefs.bar-min; maximum: root.prefs.bar-max; small: root.small;
-                                    commit(v) => { Actions.pref("barPx", "" + v); }
+                            Rule {}
+                            VerticalLayout {
+                                PrefToggle { title: @tr("막대 표시"); subtitle: @tr("끄면 라벨과 값만 표시"); key: "bars"; checked: root.prefs.bars; }
+                                // 막대를 켰을 때만 길이 설정 (Windows 위젯만, 메뉴 막대는 자리가 좁아 고정 길이)
+                                if root.windows: Fold { k: root.bars-k; gap: 12px;
+                                    Rule {}
+                                    Rectangle { height: 12px; }
+                                    SettingRow { title: @tr("막대 길이"); subtitle: @tr("남은 시간을 표시할 때의 막대 길이 · 기본 {}px", root.prefs.bar-default);
+                                        BarLength {
+                                            value: root.prefs.bar-px; minimum: root.prefs.bar-min; maximum: root.prefs.bar-max; small: root.small;
+                                            commit(v) => { Actions.pref("barPx", "" + v); }
+                                        }
+                                    }
+                                }
+                            }
+                            Rule {}
+                            VerticalLayout { spacing: Theme.gap-s;
+                                Caption { text: @tr("미리 보기"); font-size: Theme.size-row; }
+                                WidgetPreview {
+                                    source: root.widget-preview; natural-width: root.preview-width; natural-height: root.preview-height;
+                                    light: root.preview-light; has: root.has-preview;
                                 }
                             }
                         }
@@ -303,6 +348,19 @@ export component SettingsView inherits Window {
                             SettingRow { title: @tr("모든 설정 초기화"); subtitle: @tr("계정·로그인만 남기고 모든 설정과 알림 기준을 기본값으로 되돌림");
                                 UiButton { text: @tr("초기화"); danger: true;
                                     clicked => { Actions.ask("resetSettings", "", @tr("모든 설정 초기화"), @tr("계정·로그인만 남기고 모든 설정과 알림 기준을 기본값으로 되돌림")); } } }
+                        }
+                        if root.page == 3 && root.inactive-profiles.length > 0: Group {
+                            title: @tr("보관된 프로필");
+                            Hint { text: @tr("연결되지 않은 usAgI 프로필의 로그인 파일과 로컬 기록을 정리할 수 있음"); }
+                            for profile in root.inactive-profiles: VerticalLayout {
+                                Rule {}
+                                SettingRow { title: profile;
+                                    UiButton { text: @tr("다시 연결"); clicked => { Actions.account("restoreInactiveProfile", profile, ""); } }
+                                    UiButton { text: @tr("프로필·기록 삭제"); danger: true;
+                                        clicked => { Actions.ask("removeInactiveProfile", profile, @tr("{} 프로필·로컬 기록 삭제", profile),
+                                            @tr("usAgI 전용 폴더의 로그인 파일, 대화 기록, 설정을 영구 삭제.")); } }
+                                }
+                            }
                         }
                         if root.page == 3: Group {
                             title: @tr("종료");
@@ -425,7 +483,11 @@ export component SettingsView inherits Window {
             HorizontalLayout {
                 alignment: end; spacing: Theme.gap-s;
                 UiButton { text: @tr("취소"); ghost: true; clicked => { Actions.confirm-cmd = ""; } }
-                UiButton { text: Actions.confirm-cmd == "quit" ? @tr("종료") : Actions.confirm-cmd == "resetSettings" || Actions.confirm-cmd == "resetPage" ? @tr("초기화") : @tr("삭제"); danger: true; clicked => {
+                UiButton { text: Actions.confirm-cmd == "quit" ? @tr("종료")
+                    : Actions.confirm-cmd == "resetSettings" || Actions.confirm-cmd == "resetPage" ? @tr("초기화")
+                    : Actions.confirm-cmd == "remove" ? @tr("계정 제거")
+                    : Actions.confirm-cmd == "linkStatusline" ? @tr("연결") : @tr("삭제");
+                    danger: Actions.confirm-cmd != "linkStatusline" && Actions.confirm-cmd != "remove"; clicked => {
                     if Actions.confirm-cmd == "quit" || Actions.confirm-cmd == "resetSettings" { Actions.command(Actions.confirm-cmd); }
                     else if Actions.confirm-cmd == "resetPage" { Actions.reset-page(Actions.confirm-id); }
                     else { Actions.account(Actions.confirm-cmd, Actions.confirm-id, ""); }

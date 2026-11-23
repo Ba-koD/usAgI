@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_TRAY: u32 = WM_APP + 1;
-const ICON_CACHE_MAX: usize = 600;
+const ICON_CACHE_MAX: usize = 128;
 
 fn stable_guid() -> GUID {
     // Windows는 트레이 GUID를 실행 파일 경로에 묶으므로 경로마다 고정된 값을 만듦

@@ -19,10 +19,38 @@ pub struct Release {
     pub notes: String,
     /// 이 플랫폼용 파일 (usagi.exe, usAgI-mac.zip …)
     pub asset_url: String,
-    /// 같은 이름 + .sha256 (없는 릴리스는 받지 않음)
-    pub sha_url: String,
-    /// 같은 이름 + .minisig (서명). 이 빌드에 공개 키가 있으면 꼭 있어야 함
-    pub sig_url: Option<String>,
+    pub verification: Verification,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Verification {
+    Body { checksum: String, signature: Option<String> },
+    Attachments { sha_url: String, sig_url: Option<String> },
+}
+
+impl Verification {
+    pub fn checksum(&self, fetch: impl FnOnce(&str) -> Result<String, String>) -> Result<String, String> {
+        match self {
+            Self::Body { checksum, .. } => Ok(checksum.clone()),
+            Self::Attachments { sha_url, .. } => parse_sha256(&fetch(sha_url)?)
+                .ok_or_else(|| crate::tr!("체크섬 수신 실패", "Couldn't download the checksum").into()),
+        }
+    }
+
+    fn signature(&self, fetch: impl FnOnce(&str) -> Result<String, String>) -> Result<String, String> {
+        let missing = || crate::tr!("서명 수신 실패. 설치 중단", "Couldn't download the signature. Not installing").to_string();
+        match self {
+            Self::Body { signature, .. } => signature.clone().ok_or_else(missing),
+            Self::Attachments { sig_url, .. } => fetch(sig_url.as_deref().ok_or_else(missing)?).map_err(|_| missing()),
+        }
+    }
+}
+
+impl Release {
+    pub fn verify_signature(&self, data: &[u8], asset: &str, fetch: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
+        let Some(key) = signing_key() else { return Ok(()) };
+        verify_signature(key, data, &self.verification.signature(fetch)?, &self.version, asset)
+    }
 }
 
 /// 저장소의 서명 공개 키 파일 (minisign 형식: 설명 한 줄 + 키 한 줄). `usagi-sign keygen`이 만들어 넣음
@@ -70,23 +98,81 @@ fn safe_version(v: &str) -> bool {
     !v.is_empty() && v.len() <= 64 && !v.contains("..") && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
+const VERIFICATION_START: &str = "<!-- usagi-verification:start -->";
+const VERIFICATION_END: &str = "<!-- usagi-verification:end -->";
+
+fn body_verification(body: &str) -> Result<Option<(&str, &str, &str)>, String> {
+    if !body.contains(VERIFICATION_START) && !body.contains(VERIFICATION_END) {
+        return Ok(None);
+    }
+    let (before, section) = body.split_once(VERIFICATION_START).ok_or_else(invalid_verification)?;
+    let (block, after) = section.split_once(VERIFICATION_END).ok_or_else(invalid_verification)?;
+    if before.contains(VERIFICATION_END) || section.contains(VERIFICATION_START) || after.contains(VERIFICATION_END) {
+        return Err(invalid_verification());
+    }
+    Ok(Some((before, block, after)))
+}
+
+fn invalid_verification() -> String {
+    crate::tr!("릴리스 본문의 검증 정보 형식 오류", "Invalid verification information in release notes").into()
+}
+
+fn fenced_text(block: &str, heading: &str) -> Option<String> {
+    let mut lines = block.lines();
+    lines.find(|line| *line == heading)?;
+    if lines.find(|line| !line.trim().is_empty())? != "```text" {
+        return None;
+    }
+    let mut value = String::new();
+    for line in lines {
+        if line == "```" {
+            return (!value.trim().is_empty()).then_some(value);
+        }
+        value.push_str(line);
+        value.push('\n');
+    }
+    None
+}
+
+fn body_checksum(block: &str, asset: &str) -> Option<String> {
+    let checksums = fenced_text(block, "### SHA-256")?;
+    let mut matches = checksums.lines().filter(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next();
+        fields.next() == Some(asset)
+    });
+    let line = matches.next()?;
+    if matches.next().is_some() || line.split_whitespace().count() != 2 {
+        return None;
+    }
+    parse_sha256(line)
+}
+
+/// GitHub의 접힌 검증 정보는 앱의 변경 내용에 표시하지 않음.
+fn display_notes(before: &str, after: &str) -> String {
+    match (before.trim_end(), after.trim_start()) {
+        ("", notes) | (notes, "") => notes.to_owned(),
+        (before, after) => format!("{before}\n\n{after}"),
+    }
+}
+
 /// `releases/latest` 응답을 읽음. 지금(`current`)보다 새 버전이고 `asset` 파일과 체크섬이 있으면 Some.
-/// 받을 주소는 이 저장소(`repo`)의 릴리스 파일 주소여야 해요. 이 빌드에 서명 공개 키가 있으면 서명 파일도 있어야 해요.
+/// 받을 주소는 이 저장소(`repo`)의 릴리스 파일 주소여야 해요. 공개 키가 들어 있는 빌드는 서명도 필요해요.
 pub fn parse_latest(body: &[u8], current: &str, repo: &str, asset: &str) -> Result<Option<Release>, String> {
     parse_latest_with(body, current, repo, asset, signing_key().is_some())
 }
 
-/// `require_signature`: 서명 파일(`<asset>.minisig`)이 없는 릴리스를 받지 않음
+/// `require_signature`: 본문이나 첨부에 서명이 없는 릴리스를 받지 않음
 pub fn parse_latest_with(body: &[u8], current: &str, repo: &str, asset: &str, require_signature: bool) -> Result<Option<Release>, String> {
     let v: Value =
         serde_json::from_slice(body).map_err(|_| crate::tr!("릴리스 정보 읽기 실패", "Failed to read the release info").to_string())?;
     let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
+    let version = version::clean(tag);
+    if !tag.is_empty() && !safe_version(&version) {
+        return Err(crate::tr!("릴리스 버전 형식 오류", "Invalid release version format").into());
+    }
     if !version::is_newer(tag, current) {
         return Ok(None);
-    }
-    let version = version::clean(tag);
-    if !safe_version(&version) {
-        return Err(crate::tr!("릴리스 버전 형식 오류", "Invalid release version format").into());
     }
     let assets = v.get("assets").and_then(|a| a.as_array()).cloned().unwrap_or_default();
     let prefix = format!("https://github.com/{repo}/releases/download/").to_lowercase();
@@ -100,24 +186,34 @@ pub fn parse_latest_with(body: &[u8], current: &str, repo: &str, asset: &str, re
     };
     let asset_url = url_of(asset)
         .ok_or_else(|| crate::tr!(format!("새 릴리스에 {asset} 파일 없음"), format!("The new release has no {asset} file")))?;
-    let sha_url = url_of(&format!("{asset}.sha256")).ok_or_else(|| {
-        crate::tr!(format!("새 릴리스에 {asset}.sha256 (체크섬) 없음"), format!("The new release has no {asset}.sha256 (checksum)"))
-    })?;
-    let sig_url = url_of(&format!("{asset}.minisig"));
-    if require_signature && sig_url.is_none() {
-        // 릴리스 게시 뒤 서명을 올리기 전일 수 있음
-        return Err(crate::tr!(
-            format!("v{version} 서명 파일 없음 (게시 직후면 서명 올리는 중). 잠시 뒤 다시 확인"),
-            format!("v{version} has no signature file yet (it may still be uploading). Check again later")
-        ));
-    }
+    let body = v.get("body").and_then(Value::as_str).unwrap_or("");
+    let missing_signature = || crate::tr!(
+        format!("v{version} 업데이트 서명 없음. 잠시 뒤 다시 확인"),
+        format!("v{version} has no update signature. Check again later")
+    );
+    let (verification, notes) = if let Some((before, block, after)) = body_verification(body)? {
+        let checksum = body_checksum(block, asset).ok_or_else(invalid_verification)?;
+        let signature = fenced_text(block, &format!("**`{asset}.minisig`**"));
+        if require_signature && signature.is_none() {
+            return Err(missing_signature());
+        }
+        (Verification::Body { checksum, signature }, display_notes(before, after))
+    } else {
+        let sha_url = url_of(&format!("{asset}.sha256")).ok_or_else(|| {
+            crate::tr!(format!("새 릴리스에 {asset}.sha256 (체크섬) 없음"), format!("The new release has no {asset}.sha256 (checksum)"))
+        })?;
+        let sig_url = url_of(&format!("{asset}.minisig"));
+        if require_signature && sig_url.is_none() {
+            return Err(missing_signature());
+        }
+        (Verification::Attachments { sha_url, sig_url }, body.to_owned())
+    };
     Ok(Some(Release {
         version,
         page: v.get("html_url").and_then(|u| u.as_str()).unwrap_or("").to_string(),
-        notes: v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string(),
+        notes,
         asset_url,
-        sha_url,
-        sig_url,
+        verification,
     }))
 }
 
@@ -134,13 +230,28 @@ mod tests {
     const BODY: &str = r#"{"tag_name":"v0.2.0","html_url":"https://github.com/o/r/releases/tag/v0.2.0","body":"notes",
         "assets":[{"name":"usagi.exe","browser_download_url":"https://github.com/o/r/releases/download/v0.2.0/usagi.exe"},
                   {"name":"usagi.exe.sha256","browser_download_url":"https://github.com/o/r/releases/download/v0.2.0/usagi.exe.sha256"}]}"#;
+    const HASH: &str = "b4c4c0d84196b00ba360934efae3c67d683ebf23c01af88124fbaa742be4f864";
 
     #[test]
     fn newer_release_with_asset() {
         let r = parse_latest_with(BODY.as_bytes(), "0.1.0", "o/r", "usagi.exe", false).unwrap().unwrap();
         assert_eq!(r.version, "0.2.0");
         assert!(r.asset_url.ends_with("/usagi.exe"));
-        assert!(r.sha_url.ends_with(".sha256"));
+        let checksum = r.verification.checksum(|url| {
+            assert!(url.ends_with("/usagi.exe.sha256"));
+            Ok(format!("{HASH}  usagi.exe\n"))
+        }).unwrap();
+        assert_eq!(checksum, HASH);
+    }
+
+    #[test]
+    fn hides_release_verification_block_from_update_notes() {
+        let mut response: Value = serde_json::from_str(BODY).unwrap();
+        response["body"] = Value::String(format!(
+            "### 변경 내용\r\n\r\n{VERIFICATION_START}\r\n<details>\r\n\r\n### SHA-256\r\n\r\n```text\r\n{HASH}  usagi.exe\r\n```\r\n</details>\r\n{VERIFICATION_END}\r\n\r\n추가 안내"
+        ));
+        let release = parse_latest_with(&serde_json::to_vec(&response).unwrap(), "0.1.0", "o/r", "usagi.exe", false).unwrap().unwrap();
+        assert_eq!(release.notes, "### 변경 내용\n\n추가 안내");
     }
 
     #[test]
@@ -182,13 +293,14 @@ mod tests {
     fn signature_file_is_required_when_a_key_is_built_in() {
         // 서명 파일이 없는 릴리스: 키가 있는 빌드는 받지 않음 (없는 빌드는 체크섬만)
         assert!(parse_latest_with(BODY.as_bytes(), "0.1.0", "o/r", "usagi.exe", true).unwrap_err().contains("서명"));
-        assert_eq!(parse_latest_with(BODY.as_bytes(), "0.1.0", "o/r", "usagi.exe", false).unwrap().unwrap().sig_url, None);
+        let unsigned = parse_latest_with(BODY.as_bytes(), "0.1.0", "o/r", "usagi.exe", false).unwrap().unwrap();
+        assert!(matches!(unsigned.verification, Verification::Attachments { sig_url: None, .. }));
         let signed = BODY.replace(
             r#""assets":["#,
             r#""assets":[{"name":"usagi.exe.minisig","browser_download_url":"https://github.com/o/r/releases/download/v0.2.0/usagi.exe.minisig"},"#,
         );
         let r = parse_latest_with(signed.as_bytes(), "0.1.0", "o/r", "usagi.exe", true).unwrap().unwrap();
-        assert!(r.sig_url.unwrap().ends_with("/usagi.exe.minisig"));
+        assert!(matches!(r.verification, Verification::Attachments { sig_url: Some(url), .. } if url.ends_with("/usagi.exe.minisig")));
         // 다른 서버의 서명 주소는 없는 것으로 봄
         let evil = signed.replace("https://github.com/o/r/releases/download/v0.2.0/usagi.exe.minisig", "https://evil.example/usagi.exe.minisig");
         assert!(parse_latest_with(evil.as_bytes(), "0.1.0", "o/r", "usagi.exe", true).is_err());
@@ -201,6 +313,42 @@ mod tests {
         let minisign::KeyPair { pk, sk } = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
         let sig = minisign::sign(Some(&pk), &sk, std::io::Cursor::new(data), Some(comment), Some("test")).unwrap();
         (pk.to_base64(), sig.into_string())
+    }
+
+    #[test]
+    fn body_only_release_uses_the_checksum_and_signature_for_its_asset() {
+        let data = b"release fixture";
+        let checksum = crate::sha256::hex(data);
+        for (asset, other) in [("usagi.exe", "usAgI-mac.zip"), ("usAgI-mac.zip", "usagi.exe")] {
+            let (key, sig) = sign_for_test(data, &signed_comment("0.3.1", asset));
+            let response = serde_json::json!({
+                "tag_name": "v0.3.1",
+                "body": format!("Notes\n\n{VERIFICATION_START}\n<details>\n\n### SHA-256\n\n```text\n{HASH}  {other}\n{checksum}  {asset}\n```\n\n### Minisign\n\n**`{asset}.minisig`**\n\n```text\n{sig}```\n</details>\n{VERIFICATION_END}"),
+                "assets": [{"name": asset, "browser_download_url": format!("https://github.com/o/r/releases/download/v0.3.1/{asset}")}],
+            });
+            let release = parse_latest_with(&serde_json::to_vec(&response).unwrap(), "0.3.0", "o/r", asset, true).unwrap().unwrap();
+            assert_eq!(release.verification.checksum(|_| panic!("unexpected checksum download")).unwrap(), checksum);
+            let signature = release.verification.signature(|_| panic!("unexpected signature download")).unwrap();
+            assert_eq!(verify_signature(&key, data, &signature, &release.version, asset), Ok(()));
+            assert!(verify_signature(&key, b"changed fixture", &signature, &release.version, asset).is_err());
+            assert_eq!(release.notes, "Notes");
+        }
+    }
+
+    #[test]
+    fn invalid_body_verification_does_not_fall_back_to_attachments() {
+        let mut response: Value = serde_json::from_str(BODY).unwrap();
+        for text in [
+            format!("{VERIFICATION_START}\nunfinished"),
+            format!("{VERIFICATION_START}\n### SHA-256\n```text\n{HASH}  usagi.exe\n{HASH}  usagi.exe\n```\n{VERIFICATION_END}"),
+        ] {
+            response["body"] = Value::String(text);
+            assert!(parse_latest_with(&serde_json::to_vec(&response).unwrap(), "0.1.0", "o/r", "usagi.exe", false).is_err());
+        }
+        response["body"] = Value::String(format!(
+            "{VERIFICATION_START}\n### SHA-256\n```text\n{HASH}  usagi.exe\n```\n{VERIFICATION_END}"
+        ));
+        assert!(parse_latest_with(&serde_json::to_vec(&response).unwrap(), "0.1.0", "o/r", "usagi.exe", true).unwrap_err().contains("서명"));
     }
 
     #[test]

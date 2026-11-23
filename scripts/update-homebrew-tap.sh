@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 릴리스된 macOS zip으로 Homebrew 탭(<owner>/homebrew-usagi)의 Casks/usagi.rb 갱신
-#   사용: TAP_TOKEN=... scripts/update-homebrew-tap.sh v0.1.0 dist/usAgI-mac-0.1.0.zip
+#   사용: TAP_TOKEN=... scripts/update-homebrew-tap.sh v0.3.0 dist/release/usAgI-mac.zip
 #   GitHub Actions에서는 저장소 비밀값 HOMEBREW_TAP_TOKEN(탭 저장소에 쓰기 권한)이 있을 때만 실행돼요.
 set -euo pipefail
 

@@ -1,9 +1,9 @@
 //! 자동 업데이트 (GitHub Releases).
 //!
 //! 1. 확인: `api.github.com/repos/<저장소>/releases/latest`의 태그를 지금 버전과 비교
-//! 2. 받기: 릴리스의 `usagi.exe`와 `usagi.exe.sha256`을 받아 SHA-256이 맞는지 검증 → exe 옆 `usagi.exe.new`
+//! 2. 받기: `usagi.exe`를 받아 릴리스 본문 또는 기존 첨부의 체크섬과 서명으로 검증 → exe 옆 `usagi.exe.new`
 //! 3. 적용: 실행 중인 exe는 이름은 바꿀 수 있으므로 `usagi.exe` → `usagi.exe.old`, `.new` → `usagi.exe`로 바꾸고
-//!    새 exe를 `--after-update <pid>`로 띄운 뒤 지금 프로세스는 종료. 새 exe가 다음 시작 때 `.old`를 지움.
+//!    새 exe를 `--after-update <pid>`로 띄운 뒤 지금 프로세스는 종료. `.old`는 복구용으로 보존.
 //!
 //! 통신은 Windows 기본 WinHTTP, 해시는 Windows 기본 BCrypt (추가 라이브러리 없음).
 
@@ -79,15 +79,15 @@ fn get(url: &str, accept: &str) -> Result<(u32, Vec<u8>), String> {
                 break;
             }
             let start = body.len();
+            if avail as usize > 64 * 1024 * 1024 - start {
+                return Err(usagi_core::tr!("파일 크기 초과", "File too large").into());
+            }
             body.resize(start + avail as usize, 0);
             let mut read = 0u32;
             if WinHttpReadData(req.0, body[start..].as_mut_ptr() as *mut _, avail, &mut read) == 0 {
                 return Err(usagi_core::tr!("내려받는 중 연결 끊김", "Connection lost during download").into());
             }
             body.truncate(start + read as usize);
-            if body.len() > 64 * 1024 * 1024 {
-                return Err(usagi_core::tr!("파일 크기 초과", "File too large").into());
-            }
         }
         Ok((status, body))
     }
@@ -124,27 +124,22 @@ pub fn download(rel: &Release) -> Result<PathBuf, String> {
         return Err(usagi_core::tr!(format!("새 버전 수신 실패 ({status})"), format!("Couldn't download the new version ({status})")));
     }
     // 체크섬은 꼭 있어야 하고 일치해야 함
-    let (s, text) = get(&rel.sha_url, "text/plain")?;
-    let want = usagi_core::update::parse_sha256(&String::from_utf8_lossy(&text)).filter(|_| s == 200).ok_or(usagi_core::tr!("체크섬 수신 실패", "Couldn't download the checksum"))?;
+    let want = rel.verification.checksum(verification_text)?;
     if sha256_hex(&exe).as_deref() != Some(want.as_str()) {
         return Err(usagi_core::tr!("받은 파일 손상 (체크섬 불일치). 다시 시도 필요", "Downloaded file is damaged (checksum mismatch). Try again").into());
     }
-    verify_signature(rel, &exe, "usagi.exe")?;
+    rel.verify_signature(&exe, "usagi.exe", verification_text)?;
     let staged = exe_path()?.with_extension("exe.new");
     std::fs::write(&staged, &exe).map_err(|e| usagi_core::tr!(format!("새 버전 저장 실패 (폴더 쓰기 권한 확인 필요): {e}"), format!("Couldn't save the new version (check folder write permission): {e}")))?;
     Ok(staged)
 }
 
-/// 서명 확인: 이 빌드에 공개 키가 있으면 서명이 꼭 있어야 하고 맞아야 함 (체크섬은 같은 릴리스에서 오므로 바꿔치기를 막지 못함)
-fn verify_signature(rel: &Release, data: &[u8], asset: &str) -> Result<(), String> {
-    let Some(key) = usagi_core::update::signing_key() else { return Ok(()) };
-    let missing = || usagi_core::tr!("서명 수신 실패. 설치 중단", "Couldn't download the signature. Not installing").to_string();
-    let url = rel.sig_url.as_deref().ok_or_else(missing)?;
-    let (status, sig) = get(url, "text/plain")?;
+fn verification_text(url: &str) -> Result<String, String> {
+    let (status, text) = get(url, "text/plain")?;
     if status != 200 {
-        return Err(missing());
+        return Err(usagi_core::tr!("검증 정보 수신 실패", "Couldn't download verification information").into());
     }
-    usagi_core::update::verify_signature(key, data, &String::from_utf8_lossy(&sig), &rel.version, asset)
+    Ok(String::from_utf8_lossy(&text).into_owned())
 }
 
 /// 받아 둔 새 exe로 바꾸고 다시 시작. 성공하면 호출한 쪽이 지금 프로세스를 끝내야 함.
@@ -168,13 +163,6 @@ pub fn apply(staged: &Path) -> Result<(), String> {
             let _ = std::fs::rename(&old, &exe);
             usagi_core::tr!(format!("새 버전 시작 실패: {e}"), format!("Couldn't start the new version: {e}"))
         })
-}
-
-/// 업데이트 뒤 남은 예전 exe·받다 만 파일 정리 (시작할 때)
-pub fn cleanup() {
-    if let Ok(exe) = exe_path() {
-        let _ = std::fs::remove_file(exe.with_extension("exe.old"));
-    }
 }
 
 /// `--after-update <pid>`: 예전 프로세스가 끝날 때까지 잠깐 기다림 (중복 실행 방지 뮤텍스를 넘겨받으려고)

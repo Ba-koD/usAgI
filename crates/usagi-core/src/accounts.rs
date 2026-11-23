@@ -1,7 +1,7 @@
 //! 계정 = 공급자별 로컬 프로필 폴더. 로그인 정보는 저장하지 않습니다.
 //!
 //! - Claude: Claude Code 설정 폴더 (기본 ~/.claude, CLAUDE_CONFIG_DIR로 다른 프로필 가능)
-//!   "연결"하면 그 폴더의 settings.json에 usAgI 상태 표시줄 브리지를 넣어 정확한 사용량을 받습니다.
+//!   실시간 연결을 켜면 그 폴더의 settings.json에 usAgI 상태 표시줄 브리지를 넣습니다.
 //!   원래 쓰던 상태 표시줄이 있으면 지우지 않고 이어서 실행(chain)하고, 연결 해제 시 되돌립니다.
 //! - Codex: Codex 홈 폴더 (기본 ~/.codex). 로그에 정확한 사용률이 있어 연결 과정이 필요 없습니다.
 
@@ -9,9 +9,31 @@ use crate::config::State;
 use crate::logs::home_dir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CHANGES: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_changes() -> MutexGuard<'static, ()> {
+    CHANGES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn new_revision() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = (crate::time::now() * 1_000_000.0) as u64;
+    let previous = LAST.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(now.max(n + 1)));
+    now.max(previous.unwrap() + 1)
+}
 
 fn yes() -> bool {
     true
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatuslineBackup {
+    Missing,
+    Present(serde_json::Value),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -28,14 +50,44 @@ pub struct Account {
     /// 연결 전에 쓰던 상태 표시줄 명령 (이어서 실행)
     #[serde(default)]
     pub chain: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statusline_original: Option<StatuslineBackup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity: Option<crate::login::Identity>,
 }
 
 impl Account {
     pub fn path(&self) -> PathBuf {
-        PathBuf::from(&self.dir)
+        let path = PathBuf::from(&self.dir);
+        if !path.is_absolute() && path.parent() == Some(Path::new("profiles"))
+            && path.file_name().is_some_and(|name| name == self.id.as_str())
+        {
+            return profiles_dir().join(&self.id);
+        }
+        path
     }
     pub fn is_claude(&self) -> bool {
         self.provider == "claude"
+    }
+
+    pub fn usage_key(&self) -> String {
+        if self.revision == 0 { self.id.clone() } else { format!("{}-r{}", self.id, self.revision) }
+    }
+
+    pub(crate) fn commit_usage(&self, write: impl FnOnce() -> std::io::Result<()>) -> Result<(), crate::usage_retry::UsageError> {
+        let _guard = lock_changes();
+        if load(&State::load()).iter().any(|current| {
+            current.id == self.id && current.revision == self.revision
+                && current.provider == self.provider && current.dir == self.dir
+        }) {
+            write().map_err(|error| crate::usage_retry::UsageError::Failed(crate::tr!(
+                format!("사용량 저장 실패 ({error})"),
+                format!("Could not save usage ({error})")
+            )))?;
+        }
+        Ok(())
     }
 }
 
@@ -54,22 +106,54 @@ pub fn default_codex_dir() -> Option<PathBuf> {
 
 /// 등록한 계정. 처음엔 비어 있어요 (설정의 "+ 추가"로 공식 로그인해서 추가).
 pub fn load(state: &State) -> Vec<Account> {
-    state
-        .0
-        .get("accounts")
-        .and_then(|v| serde_json::from_value::<Vec<Account>>(v.clone()).ok())
-        .unwrap_or_default()
-        .into_iter()
-        // 예전 브라우저 연결 계정은 프로필 폴더가 없음 → 목록에서 제외
-        .filter(|a| !a.dir.is_empty())
-        .collect()
+    entries(state).filter_map(parse_account).collect()
 }
 
-pub fn save(state: &mut State, accounts: &[Account]) {
-    if let Ok(v) = serde_json::to_value(accounts) {
-        state.0.insert("accounts".into(), v);
-        state.save();
+fn entries(state: &State) -> impl Iterator<Item = &serde_json::Value> {
+    state.0.get("accounts").and_then(|v| v.as_array()).into_iter().flatten()
+}
+
+fn parse_account(value: &serde_json::Value) -> Option<Account> {
+    let mut acc: Account = serde_json::from_value(value.clone()).ok()?;
+    if acc.dir.is_empty() || !matches!(acc.provider.as_str(), "claude" | "codex") {
+        return None;
     }
+    let path = acc.path();
+    // Older portable versions stored absolute paths. Relocate only a missing
+    // managed path when the matching profile already exists beside this app.
+    let destination = profiles_dir().join(&acc.id);
+    let moved = crate::config::is_portable() && path.is_absolute() && !path.exists()
+        && path.ends_with(Path::new("data").join("profiles").join(&acc.id))
+        && validate_managed_profile(&destination).is_ok();
+    if moved || is_managed_path(&path) {
+        acc.dir = if moved { destination } else { path }.to_string_lossy().into();
+    }
+    Some(acc)
+}
+
+pub(crate) fn has_unread_accounts(state: &State) -> bool {
+    state.0.get("accounts").is_some_and(|v| !v.is_array())
+        || entries(state).any(|value| parse_account(value).is_none())
+}
+
+pub fn save(state: &mut State, accounts: &[Account]) -> std::io::Result<()> {
+    if state.0.get("accounts").is_some_and(|v| !v.is_array()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "accounts is not a list"));
+    }
+    let mut updated = state.clone();
+    let mut saved = entries(state).filter(|value| parse_account(value).is_none()).cloned().collect::<Vec<_>>();
+    for account in accounts {
+        let mut account = account.clone();
+        let path = account.path();
+        if is_managed_path(&path) && path.file_name().is_some_and(|name| name == account.id.as_str()) {
+            account.dir = format!("profiles/{}", account.id);
+        }
+        saved.push(serde_json::to_value(account)?);
+    }
+    updated.0.insert("accounts".into(), serde_json::Value::Array(saved));
+    updated.try_save()?;
+    *state = updated;
+    Ok(())
 }
 
 /// usAgI가 계정마다 만드는 프로필 폴더 (CLAUDE_CONFIG_DIR / CODEX_HOME 로 씀)
@@ -81,23 +165,102 @@ pub fn profiles_dir() -> PathBuf {
 /// 프로필 폴더 **바로 아래** 한 단계만 인정해요. 이 판정으로 폴더를 지우므로,
 /// `..`가 섞였거나 이름만 비슷한 옆 폴더(`profiles2`)는 관리 대상이 아니에요.
 pub fn is_managed(acc: &Account) -> bool {
+    is_managed_path(&acc.path())
+}
+
+fn is_managed_path(p: &Path) -> bool {
     use std::path::Component;
-    let p = acc.path();
     if p.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
         return false;
     }
-    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
     match (p.parent(), p.file_name()) {
-        (Some(parent), Some(name)) => !name.is_empty() && norm(parent) == norm(&profiles_dir()),
+        (Some(parent), Some(name)) => !name.is_empty() && parent == profiles_dir(),
         _ => false,
     }
 }
 
+pub(crate) fn validate_managed_profile(path: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let root = profiles_dir();
+    if !is_managed_path(path) || !plain_directory(&root)? || !plain_directory(path)?
+        || std::fs::canonicalize(path)?.parent() != Some(std::fs::canonicalize(root)?.as_path())
+    {
+        return Err(Error::from(ErrorKind::PermissionDenied));
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_managed_profile(path: &Path) -> std::io::Result<()> {
+    // Only remove the app-owned directory. Calling provider logout could also
+    // clear a shared credential store.
+    validate_managed_profile(path)?;
+    std::fs::remove_dir_all(path)
+}
+
+fn plain_directory(path: &Path) -> std::io::Result<bool> {
+    let meta = std::fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(meta.is_dir())
+}
+
+const INACTIVE_MARKER: &str = ".usagi-inactive";
+
+pub(crate) fn profile_is_marked(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(INACTIVE_MARKER)).is_ok()
+}
+
+pub(crate) fn fallback_profile_available(dir: &Path) -> bool {
+    dir.is_dir() && !profile_is_marked(dir)
+}
+
+/// Fresh or discarded sign-ins may not supply credentials to other cards.
+pub(crate) fn mark_profile_inactive(dir: &Path) -> std::io::Result<bool> {
+    validate_managed_profile(dir)?;
+    match std::fs::File::create_new(dir.join(INACTIVE_MARKER)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn unmark_profile(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(INACTIVE_MARKER));
+}
+
+pub(crate) fn managed_profiles(root: &Path) -> Vec<PathBuf> {
+    if !plain_directory(root).unwrap_or(false) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut paths: Vec<_> = entries.filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            name.to_str().and_then(|name| name.split_once('-')).is_some_and(|(provider, suffix)| {
+                matches!(provider, "claude" | "codex") && suffix.bytes().all(|b| b.is_ascii_digit())
+                    && suffix.parse::<u64>().is_ok_and(|number| number > 0)
+            })
+        })
+        .map(|entry| entry.path())
+        .filter(|path| plain_directory(path).unwrap_or(false))
+        .collect();
+    paths.sort();
+    paths
+}
+
 /// 이미 있는 프로필 폴더도 이 사용자 전용으로 (앱 시작 때 한 번)
-pub fn protect_profiles() {
+pub fn protect_profiles() -> std::io::Result<()> {
     let base = profiles_dir();
-    if base.is_dir() {
-        crate::private_dir::make_private(&base);
+    match plain_directory(&base) {
+        Ok(true) if crate::private_dir::make_private(&base) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(_) => Err(std::io::ErrorKind::PermissionDenied.into()),
     }
 }
 
@@ -105,14 +268,25 @@ pub fn protect_profiles() {
 pub fn create_profile(provider: &str, existing: &[Account]) -> std::io::Result<Account> {
     let base = profiles_dir();
     std::fs::create_dir_all(&base)?;
+    if !plain_directory(&base)? {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
     // 공식 CLI의 로그인 파일이 들어갈 자리: 이 사용자만 접근 (상위 폴더 권한을 물려받지 않게)
-    crate::private_dir::make_private(&base);
+    protect_profiles()?;
     let id = new_id(provider, existing);
     let dir = base.join(&id);
     std::fs::create_dir(&dir)?;
+    if let Err(e) = mark_profile_inactive(&dir) {
+        let _ = std::fs::remove_dir(&dir);
+        return Err(e);
+    }
     #[cfg(unix)]
-    crate::private_dir::make_private(&dir);
-    Ok(Account { id, provider: provider.into(), dir: dir.to_string_lossy().into(), label: String::new(), show: true, chain: None })
+    if !crate::private_dir::make_private(&dir) {
+        let _ = std::fs::remove_file(dir.join(INACTIVE_MARKER));
+        let _ = std::fs::remove_dir(&dir);
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    Ok(Account { id, provider: provider.into(), dir: dir.to_string_lossy().into(), label: String::new(), show: true, chain: None, revision: new_revision(), statusline_original: None, identity: None })
 }
 
 pub fn new_id(provider: &str, existing: &[Account]) -> String {
@@ -145,6 +319,18 @@ pub fn linkable(exe: &Path) -> bool {
 
 pub fn is_our_command(cmd: &str) -> bool {
     cmd.contains("statusline --account")
+}
+
+fn statusline_command(map: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    map.get("statusLine")?.get("command")?.as_str()
+}
+
+fn owns_statusline(cmd: &str, acc: &Account) -> bool {
+    cmd.rsplit_once(" statusline --account ").is_some_and(|(exe, id)| {
+        let same = id == acc.id || id.strip_prefix(acc.id.as_str()).and_then(|tail| tail.strip_prefix("-r"))
+            .is_some_and(|revision| revision.parse::<u64>().is_ok());
+        same && exe.starts_with(['"', '\'']) && exe.ends_with(['"', '\''])
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,8 +386,7 @@ pub fn link_state(acc: &Account) -> Link {
     }
     match read_settings(&settings_path(acc)) {
         Ok(map) => {
-            let cmd = map.get("statusLine").and_then(|s| s.get("command")).and_then(|c| c.as_str());
-            if cmd.is_some_and(is_our_command) {
+            if statusline_command(&map).is_some_and(|cmd| owns_statusline(cmd, acc)) {
                 Link::Linked
             } else {
                 Link::NotLinked
@@ -211,14 +396,13 @@ pub fn link_state(acc: &Account) -> Link {
     }
 }
 
-/// 실시간 연결(상태 표시줄 브리지)을 걸어야 하는지: 아직 없거나, 다른 위치의 usAgI(옮기기 전 경로)를 가리킬 때.
-/// 폴더가 없거나 settings.json을 읽을 수 없으면 건드리지 않음.
+/// 이미 켜 둔 실시간 연결의 실행 파일 경로를 갱신해야 하는지.
 pub fn needs_link(acc: &Account, exe: &Path) -> bool {
     if !acc.is_claude() || !acc.path().is_dir() || !linkable(exe) {
         return false;
     }
     match read_settings(&settings_path(acc)) {
-        Ok(map) => map.get("statusLine").and_then(|s| s.get("command")).and_then(|c| c.as_str()) != Some(bridge_command(exe, &acc.id).as_str()),
+        Ok(map) => statusline_command(&map).is_some_and(|cmd| owns_statusline(cmd, acc) && cmd != bridge_command(exe, &acc.usage_key())),
         Err(_) => false,
     }
 }
@@ -234,39 +418,80 @@ pub fn link(acc: &mut Account, exe: &Path) -> std::io::Result<()> {
     if path.exists() && !backup.exists() {
         std::fs::copy(&path, &backup)?;
     }
-    if let Some(old) = map.get("statusLine").and_then(|s| s.get("command")).and_then(|c| c.as_str()) {
-        if !is_our_command(old) {
-            acc.chain = Some(old.to_string());
-        }
+    let original = (!statusline_command(&map).is_some_and(|cmd| owns_statusline(cmd, acc)))
+        .then(|| {
+            let value = map.get("statusLine").cloned().map_or(StatuslineBackup::Missing, StatuslineBackup::Present);
+            (value, statusline_command(&map).map(str::to_owned))
+        });
+    if statusline_command(&map).is_some_and(|cmd| is_our_command(cmd) && !owns_statusline(cmd, acc)) {
+        return Err(std::io::Error::other(crate::tr!("다른 usAgI 계정의 실시간 연결 사용 중", "Live link in use by another usAgI account")));
     }
     map.insert(
         "statusLine".into(),
-        serde_json::json!({ "type": "command", "command": bridge_command(exe, &acc.id), "padding": 0 }),
+        serde_json::json!({ "type": "command", "command": bridge_command(exe, &acc.usage_key()), "padding": 0 }),
     );
-    write_settings(&path, &map)
+    write_settings(&path, &map)?;
+    if let Some((original, command)) = original {
+        acc.statusline_original = Some(original);
+        acc.chain = command;
+    }
+    Ok(())
 }
 
 /// 연결 해제: 원래 상태 표시줄로 되돌리거나 항목을 지웁니다.
 pub fn unlink(acc: &mut Account) -> std::io::Result<()> {
+    unlink_with_backup(acc).map(|_| ())
+}
+
+pub(crate) struct UnlinkedStatusline {
+    bridge: serde_json::Value,
+    restored: Option<serde_json::Value>,
+}
+
+pub(crate) fn unlink_with_backup(acc: &mut Account) -> std::io::Result<Option<UnlinkedStatusline>> {
     let path = settings_path(acc);
     let mut map = read_settings(&path)?;
-    let ours = map
-        .get("statusLine")
-        .and_then(|s| s.get("command"))
-        .and_then(|c| c.as_str())
-        .is_some_and(is_our_command);
-    if ours {
-        match acc.chain.take() {
-            Some(old) => {
-                map.insert("statusLine".into(), serde_json::json!({ "type": "command", "command": old }));
-            }
-            None => {
-                map.remove("statusLine");
-            }
+    let backup = if statusline_command(&map).is_some_and(|cmd| owns_statusline(cmd, acc)) {
+        let bridge = map["statusLine"].clone();
+        let restored = original_statusline(acc);
+        if let Some(value) = &restored {
+            map.insert("statusLine".into(), value.clone());
+        } else {
+            map.remove("statusLine");
         }
         write_settings(&path, &map)?;
+        Some(UnlinkedStatusline { bridge, restored })
+    } else {
+        None
+    };
+    acc.chain = None;
+    acc.statusline_original = None;
+    Ok(backup)
+}
+
+impl UnlinkedStatusline {
+    pub(crate) fn rollback(self, acc: &Account) -> std::io::Result<()> {
+        let path = settings_path(acc);
+        let mut map = read_settings(&path)?;
+        if map.get("statusLine") != self.restored.as_ref() {
+            return Err(std::io::Error::other(crate::tr!("상태 표시줄 설정이 별도로 변경됨", "Status line settings changed separately")));
+        }
+        map.insert("statusLine".into(), self.bridge);
+        write_settings(&path, &map)
     }
-    Ok(())
+}
+
+fn original_statusline(acc: &Account) -> Option<serde_json::Value> {
+    if let Some(original) = &acc.statusline_original {
+        return match original {
+            StatuslineBackup::Present(value) => Some(value.clone()),
+            StatuslineBackup::Missing => None,
+        };
+    }
+    let backup = read_settings(&acc.path().join("settings.json.usagi-backup")).ok();
+    backup.and_then(|mut map| {
+        (statusline_command(&map) == acc.chain.as_deref()).then(|| map.remove("statusLine")).flatten()
+    }).or_else(|| acc.chain.as_ref().map(|command| serde_json::json!({ "type": "command", "command": command })))
 }
 
 #[cfg(test)]
@@ -274,8 +499,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_and_legacy_entries_survive_a_valid_account_edit() {
+        use serde_json::json;
+        let invalid = json!({"id": "claude-2", "dir": 123});
+        let legacy = json!({"id": "browser-1", "provider": "claude", "dir": ""});
+        let mut state = State::default();
+        state.0.insert("accounts".into(), json!([
+            {"id": "claude-1", "provider": "claude", "dir": "fixture"},
+            invalid, legacy
+        ]));
+        let mut list = load(&state);
+        assert_eq!(list.len(), 1);
+        list[0].label = "Edited".into();
+        save(&mut state, &list).unwrap();
+        let rows = state.0["accounts"].as_array().unwrap();
+        assert!(rows.contains(&invalid));
+        assert!(rows.contains(&legacy));
+        assert_eq!(load(&state)[0].label, "Edited");
+    }
+
+    #[test]
     fn managed_means_direct_child_of_profiles_dir() {
-        let acc = |dir: PathBuf| Account { id: "codex-2".into(), provider: "codex".into(), dir: dir.to_string_lossy().into(), label: String::new(), show: true, chain: None };
+        let acc = |dir: PathBuf| Account { id: "codex-2".into(), provider: "codex".into(), dir: dir.to_string_lossy().into(), label: String::new(), show: true, chain: None, revision: 0, statusline_original: None, identity: None };
         let base = profiles_dir();
         assert!(is_managed(&acc(base.join("codex-2"))));
         assert!(!is_managed(&acc(base.clone())), "프로필 폴더 자체");
@@ -285,6 +530,20 @@ mod tests {
         let sibling = PathBuf::from(format!("{}2", base.to_string_lossy())).join("x");
         assert!(!is_managed(&acc(sibling)), "이름만 비슷한 옆 폴더");
         assert!(!is_managed(&acc(PathBuf::from("relative"))));
+    }
+
+    #[test]
+    fn explicit_delete_only_removes_the_managed_profile() {
+        let root = profiles_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let managed = tempfile::tempdir_in(&root).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(managed.path().join("history"), "test").unwrap();
+        std::fs::write(external.path().join("history"), "keep").unwrap();
+        assert!(delete_managed_profile(external.path()).is_err());
+        assert!(external.path().join("history").exists());
+        delete_managed_profile(managed.path()).unwrap();
+        assert!(!managed.path().exists());
     }
 
     #[test]
@@ -324,6 +583,9 @@ mod tests {
             label: String::new(),
             show: true,
             chain: None,
+            revision: 0,
+            statusline_original: None,
+            identity: None,
         };
         assert_eq!(link_state(&acc), Link::NotLinked);
         link(&mut acc, Path::new(if cfg!(windows) { r"C:\Apps\usagi.exe" } else { "/Apps/usagi" })).unwrap();

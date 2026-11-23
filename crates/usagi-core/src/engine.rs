@@ -1,23 +1,25 @@
 //! 백그라운드 엔진: 정확한 값 받기 → 공급자별 미터 → 토끼 상태 → 알림.
 //!
 //! 추정은 하지 않습니다. 화면에 나오는 숫자는 모두 서버가 준 값입니다.
-//! - Claude: 공식 CLI의 아주 작은 확인 요청(rate_limit_event) 또는 상태 표시줄 연결(rate_limits).
-//!           5시간 창은 첫 요청부터 시작하므로 창이 닫혀 있으면 자동 확인 요청을 보내지 않습니다.
-//! - Codex:  공식 CLI `app-server`의 account/rateLimits/read (토큰 소모 없음) + Codex 로그.
+//! - Claude: 파일 세션으로 HTTPS 사용량 조회, 필요하면 공식 CLI의 `/usage`.
+//!           Claude Code 사용 중에는 상태 표시줄(rate_limits)에서도 값을 받습니다.
+//! - Codex:  HTTPS 사용량 또는 CLI app-server 조회 (토큰 소모 없음) + Codex 로그.
 //! - 로컬 Claude 기록: 쓰는 중인지(토끼 뛰기)와 한도 거절 메시지(낮잠)만.
 
 use crate::accounts::{self, Account};
-use crate::bridge::{self, BridgeFile};
+use crate::bridge::{self, BridgeFile, BridgeWindow};
 use crate::usage_cmd;
+use crate::usage_retry::{self, UsageError};
 use crate::codex::{self, CodexReader, CodexSnapshot};
 use crate::config::{self, Config, State};
-use crate::login::{self, LoginStatus};
+use crate::fallback;
+use crate::login::LoginStatus;
 use crate::logs::LogReader;
 
 use crate::texts;
 use crate::time::{self, DAY, HOUR};
 use crate::tracker::{apply_exact, forecast_from, mood_of, Forecast, ForecastKind, Reading, Status, Tracker};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -87,6 +89,7 @@ pub struct ProviderView {
     pub show: bool,
     /// 계정 이메일·플랜 (Codex는 app-server가 알려 줌)
     pub email: Option<String>,
+    pub workspace_id: Option<String>,
     pub plan: Option<String>,
     /// Codex 크레딧·리필권
     pub credits: Option<codex::Credits>,
@@ -101,18 +104,40 @@ pub struct Snapshot {
     /// 토끼(귀·기분)를 움직이는 Claude 상태 (위젯에 보이는 첫 Claude 계정)
     pub claude: Option<Status>,
     pub providers: Vec<ProviderView>,
-    /// 계정별 로그인 상태 (공식 CLI로 확인)
+    /// 계정별 로그인 상태 (로컬 파일 또는 공식 CLI로 확인)
     pub logins: HashMap<String, LoginStatus>,
     /// 계정별 사용량 확인 상태
     pub probes: HashMap<String, ProbeState>,
+    pub(crate) revisions: HashMap<String, u64>,
+    pub(crate) claude_statuses: HashMap<String, Status>,
 }
 
 impl Snapshot {
+    pub(crate) fn retain_current(&mut self, list: &[Account]) {
+        let previous_rabbit = self.providers.iter()
+            .filter(|p| p.id == ProviderId::Claude)
+            .min_by_key(|p| !p.show)
+            .map(|p| p.account_id.clone());
+        self.revisions.retain(|id, revision| list.iter().any(|a| &a.id == id && a.revision == *revision));
+        self.providers.retain(|p| self.revisions.contains_key(&p.account_id));
+        self.logins.retain(|id, _| self.revisions.contains_key(id));
+        self.probes.retain(|id, _| self.revisions.contains_key(id));
+        self.claude_statuses.retain(|id, _| self.revisions.contains_key(id));
+        if previous_rabbit.is_some_and(|id| !self.revisions.contains_key(&id)) {
+            self.claude = None;
+        }
+    }
+
     pub fn provider(&self, id: ProviderId) -> Option<&ProviderView> {
         self.providers.iter().find(|p| p.id == id)
     }
     pub fn visible(&self) -> impl Iterator<Item = &ProviderView> {
         self.providers.iter().filter(|p| p.show)
+    }
+
+    /// 공식 CLI가 로그아웃이라고 한 계정 (확인 실패로 모를 때는 false)
+    pub fn logged_out(&self, account_id: &str) -> bool {
+        self.logins.get(account_id).and_then(|l| l.logged_in) == Some(false)
     }
 }
 
@@ -122,7 +147,22 @@ pub struct ProbeState {
     pub running: bool,
     /// 마지막으로 시도한 시각 (성공/실패 무관)
     pub tried_at: Option<f64>,
+    pub retry_at: Option<f64>,
+    pub next_at: Option<f64>,
     pub error: Option<String>,
+}
+
+impl ProbeState {
+    fn finished(&mut self, result: Result<(), UsageError>, now: f64, retry_at: Option<f64>) {
+        self.running = false;
+        self.retry_at = retry_at;
+        if result.as_ref().err().is_none_or(UsageError::attempted) {
+            self.tried_at = Some(now);
+            self.error = result.err().map(|error| error.to_string());
+        } else if matches!(result, Err(UsageError::Deferred)) {
+            self.error = Some(UsageError::Deferred.to_string());
+        }
+    }
 }
 
 /// 갱신 주기(분)
@@ -135,10 +175,15 @@ pub fn refresh_minutes(state: &State) -> f64 {
 /// - `live_at`: 상태 표시줄(Claude)·실행 기록(Codex)으로 마지막 값이 들어온 시각
 /// 마지막 확인 뒤에 쓰는 중인 값이 따로 들어왔으면 이미 최신이므로 간격을 늘림.
 pub fn usage_due(tried: Option<f64>, live_at: Option<f64>, interval_min: f64, now: f64) -> bool {
-    let Some(tried) = tried else { return true }; // 처음 한 번
+    tried.is_none_or(|tried| now >= next_usage_at(tried, live_at, interval_min))
+}
+
+fn next_usage_at(tried: f64, live_at: Option<f64>, interval_min: f64) -> f64 {
     let gap = interval_min * 60.0;
-    let live = live_at.is_some_and(|at| at > tried + 5.0 && now - at < gap);
-    now - tried >= if live { gap * LIVE_STRETCH } else { gap } - 5.0
+    let regular = tried + gap - 5.0;
+    live_at.filter(|at| *at > tried + 5.0).map_or(regular, |at| {
+        regular.max((tried + gap * LIVE_STRETCH - 5.0).min(at + gap))
+    })
 }
 
 /// Claude 확인 요청을 보낼지. 5시간 창은 첫 요청부터 시작하므로 창이 닫혀 있으면 자동으로 보내지 않음
@@ -178,21 +223,27 @@ fn updated_note(secs: f64) -> String {
     crate::tr!(format!("{age} 기준"), format!("Updated {age}"))
 }
 
-pub fn claude_view(acc: &Account, st: &Status, updated_at: Option<f64>) -> ProviderView {
-    let exact = st.exact;
+pub fn claude_view(acc: &Account, st: &Status, file: Option<&BridgeFile>) -> ProviderView {
+    let current = |window: Option<BridgeWindow>| window.is_some_and(|w| w.resets_at.is_none_or(|r| r > st.now));
+    let session_known = st.nap_kind == Some(crate::logs::LimitKind::Session)
+        || current(file.and_then(|b| b.five_hour));
+    let weekly_known = st.nap_kind == Some(crate::logs::LimitKind::Weekly)
+        || file.is_some_and(|b| !b.weekly_unavailable && current(b.seven_day));
+    let updated_at = file.map(|b| b.updated_at);
     ProviderView {
         id: ProviderId::Claude,
         account_id: acc.id.clone(),
         name: display_name(ProviderId::Claude, acc),
         meters: vec![
-            Meter { label: "5시간".into(), ratio: st.session_pct, resets_at: st.session_reset_at, exact },
-            Meter { label: "주간".into(), ratio: st.weekly_pct, resets_at: st.weekly_reset_at, exact },
+            Meter { label: "5시간".into(), ratio: st.session_pct, resets_at: st.session_reset_at.filter(|_| session_known), exact: session_known },
+            Meter { label: "주간".into(), ratio: st.weekly_pct, resets_at: st.weekly_reset_at.filter(|_| weekly_known), exact: weekly_known },
         ],
         updated_at,
         note: updated_at.map(|t| updated_note(st.now - t)),
-        forecast: if exact { Some(texts::forecast_line(st)).filter(|f| !f.is_empty()) } else { None },
+        forecast: if st.exact { Some(texts::forecast_line(st)).filter(|f| !f.is_empty()) } else { None },
         show: acc.show,
         email: None,
+        workspace_id: None,
         plan: None,
         credits: None,
         refills: None,
@@ -216,7 +267,7 @@ pub fn codex_view(acc: &Account, s: &CodexSnapshot, now: f64) -> ProviderView {
                 label: codex::window_label(w.minutes),
                 ratio: w.ratio_at(now),
                 resets_at: w.next_reset(now),
-                exact: true,
+                exact: w.resets_at.is_none_or(|r| r > now),
             })
             .collect(),
         updated_at: Some(s.ts),
@@ -224,6 +275,7 @@ pub fn codex_view(acc: &Account, s: &CodexSnapshot, now: f64) -> ProviderView {
         forecast: None,
         show: acc.show,
         email: s.email.clone(),
+        workspace_id: s.workspace_id.clone(),
         plan: s.plan.clone(),
         credits: s.credits.clone(),
         refills: s.refills.clone(),
@@ -327,46 +379,79 @@ impl Notices {
         }
         let mut out = Vec::new();
         let mut dirty = false;
-        // 기본은 아무 알림도 없음: 한도 도달·리셋, 로그인 만료는 사용자가 켜야 알림
+        // 한도 도달·리셋은 선택 사항. 로그인 만료 알림은 기본으로 켬.
         let nap_on = self.state.pref_bool("napNotify", false);
-        let login_on = self.state.pref_bool("loginNotify", false);
-        let prev_nap = prev.and_then(|p| p.claude.as_ref()).is_some_and(|s| s.nap_kind.is_some());
-        if let Some(st) = snap.claude.as_ref().filter(|_| nap_on) {
+        let login_on = self.state.pref_bool("loginNotify", true);
+        for (id, st) in snap.claude_statuses.iter().filter(|_| nap_on) {
+            let Some(provider) = snap.providers.iter().find(|p| p.account_id == *id) else { continue };
+            let state_key = format!("nap:{id}");
             if let (Some(kind), Some(wake)) = (st.nap_kind, st.wake_at) {
-                let key = format!("{kind:?}:{}", wake as i64);
-                if self.state.get_str("nap") != Some(key.as_str()) {
-                    self.state.set_str("nap", &key);
+                let key = format!("{}:{kind:?}:{}", snap.revisions.get(id).copied().unwrap_or(0), wake as i64);
+                if self.state.get_str(&state_key) != Some(key.as_str()) {
+                    self.state.set_str(&state_key, &key);
                     dirty = true;
-                    out.push(texts::nap_notice(st));
+                    let (title, body) = texts::nap_notice(st);
+                    out.push((title, format!("{} · {body}", provider.name)));
                 }
-            } else if prev_nap {
-                out.push(texts::wake_notice());
+            } else if prev.is_some_and(|previous| {
+                previous.revisions.get(id) == snap.revisions.get(id)
+                    && previous.claude_statuses.get(id).and_then(|status| status.wake_at)
+                        .is_some_and(|wake| wake <= snap.now)
+            }) {
+                let (title, body) = texts::wake_notice();
+                out.push((title, format!("{} · {body}", provider.name)));
             }
         }
-        // 로그인 만료: 계정마다 한 번 알리고, 다시 로그인하면 초기화
+        // Warn once per login. If no advance warning was sent, notify on expiry.
         for (id, l) in snap.logins.iter().filter(|_| login_on) {
             let key = format!("login:{id}");
+            let warning_key = format!("login-expiry:{id}");
+            let revision = snap.revisions.get(id).copied().unwrap_or(0);
+            let warned_expiry = self.state.get_str(&warning_key)
+                .and_then(|stamp| stamp.split_once(':'))
+                .filter(|(rev, _)| rev.parse::<u64>().ok() == Some(revision))
+                .and_then(|(_, at)| at.parse::<i64>().ok());
+            let already_warned = warned_expiry.is_some_and(|at| {
+                // Renewing outside usAgI can leave the revision unchanged. A newer
+                // end time identifies the new login, while a shortened end time
+                // on the same login does not cause a second warning.
+                l.sign_in_expiry.is_none_or(|expiry| expiry.expires_at <= at as f64 + 60.0)
+            });
+            let name = || snap.providers.iter().find(|p| &p.account_id == id)
+                .map(|p| p.name.as_str())
+                .unwrap_or_else(|| if id.starts_with("codex") { "Codex" } else { "Claude" });
             match l.logged_in {
                 Some(false) if self.state.get_str(&key) != Some("expired") => {
                     self.state.set_str(&key, "expired");
                     dirty = true;
-                    let name = snap
-                        .providers
-                        .iter()
-                        .find(|p| &p.account_id == id)
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| if id.starts_with("codex") { "Codex".into() } else { "Claude".into() });
-                    out.push((
-                        crate::tr!("로그인 필요", "Sign-in required").into(),
-                        crate::tr!(
-                            format!("{name} 계정 로그인 만료. usAgI 설정에서 다시 로그인 필요."),
-                            format!("{name} sign-in expired. Sign in again in usAgI settings.")
-                        ),
-                    ));
+                    if !already_warned {
+                        let name = name();
+                        out.push((
+                            crate::tr!("로그인 필요", "Sign-in required").into(),
+                            crate::tr!(
+                                format!("{name} 로그인 만료 · usAgI 설정에서 다시 연결"),
+                                format!("{name} sign-in expired. Reconnect in usAgI settings.")
+                            ),
+                        ));
+                    }
                 }
-                Some(true) if self.state.get_str(&key).is_some() => {
-                    self.state.0.remove(&key);
-                    dirty = true;
+                Some(true) => {
+                    dirty |= self.state.0.remove(&key).is_some();
+                    if !already_warned {
+                        dirty |= self.state.0.remove(&warning_key).is_some();
+                        if let Some(expiry) = l.sign_in_expiry.filter(|expiry| expiry.warning_due(snap.now)) {
+                            self.state.set_str(&warning_key, &format!("{revision}:{}", expiry.expires_at as i64));
+                            dirty = true;
+                            let (name, end) = (name(), texts::fmt_clock(expiry.expires_at, snap.now));
+                            out.push((
+                                crate::tr!("로그인 만료 임박", "Sign-in expiring soon").into(),
+                                crate::tr!(
+                                    format!("{name} 로그인 만료 예정 ({end}) · 설정에서 다시 연결"),
+                                    format!("{name} sign-in ends by {end}. Reconnect in settings.")
+                                ),
+                            ));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -393,11 +478,11 @@ impl Notices {
             ));
         }
         // 사용량별 알림: 넘은 기준 중 가장 높은 것 하나만, 창마다 한 번
-        for p in snap.providers.iter().filter(|p| p.show) {
+        for p in &snap.providers {
             for m in p.meters.iter().filter(|m| m.exact) {
                 let key = alert_key(&p.account_id, &m.label);
                 let (on, thresholds) = alert_rule(&self.state, &key);
-                if !on || m.ratio >= 1.0 {
+                if !on {
                     continue;
                 }
                 let Some(&hit) = thresholds.iter().rev().find(|&&t| m.ratio >= t / 100.0) else { continue };
@@ -411,13 +496,13 @@ impl Notices {
                 if !already {
                     self.state.set_str(&seen_key, &format!("{bucket}:{hit}"));
                     dirty = true;
-                    let st = if p.id == ProviderId::Claude { snap.claude.as_ref() } else { None };
+                    let st = snap.claude_statuses.get(&p.account_id);
                     out.push(texts::tired_notice(&p.name, &m.label, m.ratio, st));
                 }
             }
         }
         // 리셋 임박: 켜 둔 시점 중 지금 맞는 가장 작은 것 하나만, 창마다 한 번
-        for p in snap.providers.iter().filter(|p| p.show) {
+        for p in &snap.providers {
             for m in p.meters.iter().filter(|m| m.exact && m.ratio > 0.0) {
                 let Some(reset) = m.resets_at.filter(|&r| r > snap.now) else { continue };
                 let key = alert_key(&p.account_id, &m.label);
@@ -470,20 +555,45 @@ struct Sources {
     codex: Vec<CodexSource>,
     /// 설정 화면에서 정한 계정 순서 (위젯·메뉴 막대도 이 순서)
     order: Vec<String>,
+    accounts: Vec<Account>,
 }
 
 impl Sources {
-    fn build(cfg: &Config, accounts: &[Account]) -> Self {
+    fn reconfigure(&mut self, cfg: &Config, accounts: &[Account], active: &HashMap<String, PathBuf>) {
+        let mut updated = Self::build(cfg, accounts, active);
+        let mut claude: HashMap<_, _> = std::mem::take(&mut self.claude).into_iter()
+            .map(|source| (source.acc.usage_key(), source)).collect();
+        let mut codex: HashMap<_, _> = std::mem::take(&mut self.codex).into_iter()
+            .map(|source| (source.acc.usage_key(), source)).collect();
+        for source in &mut updated.claude {
+            if let Some(previous) = claude.remove(&source.acc.usage_key()).filter(|p| p.reader.roots == source.reader.roots) {
+                *source = ClaudeSource { acc: source.acc.clone(), ..previous };
+            }
+        }
+        for source in &mut updated.codex {
+            if let Some(previous) = codex.remove(&source.acc.usage_key()).filter(|p| p.reader.roots == source.reader.roots) {
+                source.reader = previous.reader;
+            }
+        }
+        *self = updated;
+    }
+
+    /// active: 연결별로 주 폴더 대신 쓰는 폴더.
+    fn build(cfg: &Config, accounts: &[Account], active: &HashMap<String, PathBuf>) -> Self {
         let mut claude = Vec::new();
         let mut codex = Vec::new();
         for acc in accounts {
+            let extra = active.get(&acc.usage_key()).filter(|dir| accounts::fallback_profile_available(dir));
             match acc.provider.as_str() {
                 "claude" if cfg.providers.iter().any(|p| p == "claude") => {
+                    // 대체 폴더는 조회 때만 사용합니다. 로컬 기록에는 계정 식별자가 없습니다.
                     let mut roots = vec![acc.path().join("projects")];
-                    roots.extend(cfg.claude_dirs.iter().map(PathBuf::from));
+                    if crate::login::same_dir(&acc.path(), accounts::default_claude_dir()) {
+                        roots.extend(cfg.claude_dirs.iter().map(PathBuf::from));
+                    }
                     claude.push(ClaudeSource {
                         acc: acc.clone(),
-                        reader: LogReader::new(roots),
+                        reader: LogReader::for_connection(roots, acc.revision),
                         tracker: Tracker::new(),
                         need_update: true,
                         five: Vec::new(),
@@ -493,18 +603,27 @@ impl Sources {
                 }
                 "codex" if cfg.providers.iter().any(|p| p == "codex") => codex.push(CodexSource {
                     acc: acc.clone(),
-                    reader: CodexReader::new(vec![acc.path().join("sessions"), acc.path().join("archived_sessions")]),
+                    reader: CodexReader::for_connection(
+                        if extra.is_some() {
+                            // 대체 폴더의 로그에는 워크스페이스 정보가 없어 내려받은 값만 표시.
+                            Vec::new()
+                        } else {
+                            vec![acc.path().join("sessions"), acc.path().join("archived_sessions")]
+                        },
+                        acc.revision,
+                    ),
                 }),
                 _ => {}
             }
         }
-        Sources { claude, codex, order: accounts.iter().map(|a| a.id.clone()).collect() }
+        Sources { claude, codex, order: accounts.iter().map(|a| a.id.clone()).collect(), accounts: accounts.to_vec() }
     }
 
     fn snapshot(&mut self, cfg: &Config) -> Snapshot {
         let now = time::now();
         let tired = cfg.tired_percent / 100.0;
         let mut providers = Vec::new();
+        let mut claude_statuses = HashMap::new();
         let mut rabbit: Option<(bool, Status)> = None;
         for src in &mut self.claude {
             if src.reader.poll() || src.need_update {
@@ -513,7 +632,7 @@ impl Sources {
                 src.need_update = false;
             }
             let mut st = src.tracker.status(now);
-            let file = bridge::read(&src.acc.id);
+            let file = bridge::read(&src.acc.usage_key());
             if let Some(b) = &file {
                 apply_exact(&mut st, b, tired);
                 // 새 값이 들어오면 예보용 기록에 추가 (최근 8시간)
@@ -534,19 +653,20 @@ impl Sources {
                 );
                 st.mood = mood_of(&st, tired);
             }
-            let mut view = claude_view(&src.acc, &st, file.as_ref().map(|b| b.updated_at));
+            let mut view = claude_view(&src.acc, &st, file.as_ref());
             view.extra = file.as_ref().and_then(|b| b.spend.as_ref().map(|s| s.label()).or_else(|| b.extra.clone()));
             if let Some(b) = file.as_ref().filter(|_| st.exact) {
                 for m in &b.models {
                     view.meters.push(Meter {
                         label: format!("{} 주간", m.name),
                         ratio: m.window.ratio_at(now),
-                        resets_at: m.window.live_reset(now).or_else(|| b.weekly_reset(now)),
-                        exact: true,
+                        resets_at: m.window.live_reset(now),
+                        exact: m.window.resets_at.is_none_or(|r| r > now),
                     });
                 }
             }
             providers.push(view);
+            claude_statuses.insert(src.acc.id.clone(), st.clone());
             // 토끼는 위젯에 보이는 첫 Claude 계정을 따라감
             let better = match &rabbit {
                 None => true,
@@ -558,12 +678,13 @@ impl Sources {
         }
         for src in &mut self.codex {
             src.reader.poll();
-            // 로그 값과 app-server 값 중 최신
-            let live = codex::load(&src.acc.id);
+            // 로그 값과 직접 조회 값 중 최신
+            let live = codex::load(&src.acc.usage_key());
             let best = match (&src.reader.snapshot, &live) {
                 (Some(a), Some(b)) if a.ts >= b.ts => {
                     let mut s = a.clone();
                     s.email = s.email.or(b.email.clone());
+                    s.workspace_id = s.workspace_id.or(b.workspace_id.clone());
                     s.plan = s.plan.or(b.plan.clone());
                     s.credits = s.credits.or(b.credits.clone());
                     s.refills = s.refills.or(b.refills.clone());
@@ -577,7 +698,29 @@ impl Sources {
             }
         }
         sort_by_order(&mut providers, &self.order);
-        Snapshot { now, claude: rabbit.map(|(_, st)| st), providers, logins: HashMap::new(), probes: HashMap::new() }
+        let revisions = self.accounts.iter().map(|a| (a.id.clone(), a.revision)).collect();
+        Snapshot { now, claude: rabbit.map(|(_, st)| st), providers, logins: HashMap::new(), probes: HashMap::new(), revisions, claude_statuses }
+    }
+}
+
+/// 공식 CLI가 로그아웃이라고 한 계정: 예전에 받아 둔 값은 지금 사용량이 아니므로 그래프·추가 사용·크레딧·리필권을 비움.
+/// 위젯·메뉴 막대·설정 창·알림에서 모두 빠지고, 다시 로그인하면 새로 받은 값부터 표시.
+/// (확인 실패처럼 상태를 모를 때는 그대로 둠)
+pub fn hide_logged_out(snap: &mut Snapshot) {
+    let out: Vec<String> = snap.providers.iter().filter(|p| snap.logged_out(&p.account_id)).map(|p| p.account_id.clone()).collect();
+    for p in snap.providers.iter_mut().filter(|p| out.contains(&p.account_id)) {
+        p.meters.clear();
+        p.extra = None;
+        p.credits = None;
+        p.refills = None;
+        p.forecast = None;
+    }
+    snap.claude_statuses.retain(|id, _| !out.contains(id));
+    // 토끼(예보·낮잠)는 위젯에 보이는 첫 Claude 계정을 따름: 그 계정이 로그아웃이면 예전 값으로 예보하지 않음
+    let claude = || snap.providers.iter().filter(|p| p.id == ProviderId::Claude);
+    let rabbit = claude().find(|p| p.show).or_else(|| claude().next()).map(|p| p.account_id.clone());
+    if rabbit.is_some_and(|id| snap.logged_out(&id)) {
+        snap.claude = None;
     }
 }
 
@@ -596,16 +739,21 @@ enum Cmd {
     Stop,
 }
 
+enum ProbeCommand {
+    Request(Option<String>),
+    Finished(String, Result<(), UsageError>, Option<f64>, f64),
+    Stop,
+}
+
 pub struct Engine {
     tx: Sender<Cmd>,
     cfg: Arc<Mutex<Config>>,
     login_tx: Sender<()>,
     /// Some(계정) = 그 계정만, None = 모든 계정을 지금 확인
-    probe_tx: Sender<Option<String>>,
+    probe_tx: Sender<ProbeCommand>,
 }
 
 /// 로컬 기록은 서버 요청이 아니므로 짧게(3초) 다시 읽음
-const LOCAL_POLL: Duration = Duration::from_secs(3);
 /// 바뀐 게 없어도 이 간격으로는 화면에 알림 (남은 시간 글자 갱신용)
 const QUIET_SECS: f64 = 30.0;
 
@@ -616,6 +764,7 @@ struct Shown {
     logins: HashMap<String, LoginStatus>,
     probes: HashMap<String, ProbeState>,
     rabbit: Option<String>,
+    revisions: HashMap<String, u64>,
 }
 
 impl Shown {
@@ -627,7 +776,7 @@ impl Shown {
                 s.long_idle()
             )
         });
-        Shown { providers: snap.providers.clone(), logins: snap.logins.clone(), probes: snap.probes.clone(), rabbit }
+        Shown { providers: snap.providers.clone(), logins: snap.logins.clone(), probes: snap.probes.clone(), rabbit, revisions: snap.revisions.clone() }
     }
 }
 
@@ -639,25 +788,81 @@ impl Engine {
         let cfg = Arc::new(Mutex::new(config::load()));
         let (tx, rx) = mpsc::channel();
 
-        // 로그인 상태: 한 시간마다(또는 요청 시) 공식 CLI로 확인
+        // 로그인 상태: 한 시간마다(또는 요청 시) 유효한 파일을 먼저 확인.
+        // 주 폴더 로그인이 끊겼으면 같은 계정으로 로그인된 다른 폴더를 대신 씀 (fallback 모듈)
         let logins: Arc<Mutex<HashMap<String, LoginStatus>>> = Arc::new(Mutex::new(HashMap::new()));
+        let active: Arc<Mutex<HashMap<String, PathBuf>>> = Arc::new(Mutex::new(HashMap::new()));
         let (login_tx, login_rx) = mpsc::channel::<()>();
         {
             let logins = logins.clone();
+            let active = active.clone();
             let poke = tx.clone();
             std::thread::Builder::new()
                 .name("usagi-login".into())
-                .spawn(move || loop {
-                    for acc in accounts::load(&State::load()) {
-                        let st = login::status(&acc);
-                        if let Ok(mut g) = logins.lock() {
-                            g.insert(acc.id.clone(), st);
+                .spawn(move || {
+                    let mut pending_checks: HashMap<String, f64> = HashMap::new();
+                    let mut regular_at = 0.0;
+                    loop {
+                        let list = accounts::load(&State::load());
+                        let keys: HashSet<_> = list.iter().map(Account::usage_key).collect();
+                        pending_checks.retain(|key, _| keys.contains(key));
+                        let now = time::now();
+                        let regular = regular_at <= now;
+                        if regular {
+                            regular_at = now + LOGIN_CHECK.as_secs_f64();
                         }
-                    }
-                    let _ = poke.send(Cmd::Poke);
-                    match login_rx.recv_timeout(LOGIN_CHECK) {
-                        Ok(()) | Err(RecvTimeoutError::Timeout) => while login_rx.try_recv().is_ok() {},
-                        Err(RecvTimeoutError::Disconnected) => break,
+                        let mut moved = false;
+                        let mut checked = false;
+                        for acc in &list {
+                            let key = acc.usage_key();
+                            if !regular && pending_checks.get(&key).is_none_or(|at| *at > now) {
+                                continue;
+                            }
+                            if pending_checks.contains_key(&key) && usage_retry::is_running(&key) {
+                                pending_checks.insert(key, now + 1.0);
+                                continue;
+                            }
+                            pending_checks.remove(&key);
+                            let (st, dir, pending) = fallback::resolve(acc, &list);
+                            checked = true;
+                            if let Ok(mut g) = logins.lock() {
+                                if pending.is_none() || g.get(&key).is_none_or(|old| old.logged_in != Some(true)) {
+                                    g.insert(key.clone(), st);
+                                }
+                            }
+                            if let Some(at) = pending {
+                                pending_checks.insert(key, at);
+                                continue;
+                            }
+                            if let Ok(mut g) = active.lock() {
+                                let before = g.get(&key).cloned();
+                                match &dir {
+                                    Some(d) => g.insert(key, d.clone()),
+                                    None => g.remove(&key),
+                                };
+                                moved |= before != dir;
+                            }
+                        }
+                        if let Ok(mut g) = active.lock() {
+                            g.retain(|key, _| keys.contains(key));
+                        }
+                        if let Ok(mut g) = logins.lock() {
+                            g.retain(|key, _| keys.contains(key));
+                        }
+                        // 쓰는 폴더가 바뀌면 기록 읽기도 다시 구성
+                        if checked {
+                            let _ = poke.send(if moved { Cmd::Refresh } else { Cmd::Poke });
+                        }
+                        let next = pending_checks.values().copied().fold(regular_at, f64::min);
+                        let wait = Duration::from_secs_f64((next - time::now()).clamp(1.0, LOGIN_CHECK.as_secs_f64()));
+                        match login_rx.recv_timeout(wait) {
+                            Ok(()) => {
+                                regular_at = 0.0;
+                                while login_rx.try_recv().is_ok() {}
+                            }
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
                     }
                 })
                 .expect("spawn login thread");
@@ -667,73 +872,162 @@ impl Engine {
         let probes: Arc<Mutex<HashMap<String, ProbeState>>> = Arc::new(Mutex::new(HashMap::new()));
         // Codex 실행 기록에서 마지막으로 새 값을 읽은 시각 (계정별, 기록을 읽는 쪽이 채움)
         let live: Arc<Mutex<HashMap<String, f64>>> = Arc::new(Mutex::new(HashMap::new()));
-        let (probe_tx, probe_rx) = mpsc::channel::<Option<String>>();
+        let (probe_tx, probe_rx) = mpsc::channel::<ProbeCommand>();
         {
             let probes = probes.clone();
             let logins = logins.clone();
             let live = live.clone();
+            let active = active.clone();
+            let recheck = login_tx.clone();
             let poke = tx.clone();
+            let completed = probe_tx.clone();
             std::thread::Builder::new()
                 .name("usagi-probe".into())
                 .spawn(move || {
                     let mut wait = Duration::from_secs(5); // 처음엔 로그인 상태 확인만 기다렸다가 바로
+                    let mut auth_rechecks = HashMap::new();
+                    let mut running = HashSet::new();
+                    let mut forced = Vec::new();
+                    let mut force_all = false;
                     loop {
-                        let forced: Option<Option<String>> = match probe_rx.recv_timeout(wait) {
-                            Ok(x) => Some(x),
+                        let first = match probe_rx.recv_timeout(wait) {
+                            Ok(command) => Some(command),
                             Err(RecvTimeoutError::Timeout) => None,
                             Err(RecvTimeoutError::Disconnected) => break,
                         };
-                        wait = Duration::from_secs(30);
+                        for command in first.into_iter().chain(probe_rx.try_iter()) {
+                            match command {
+                                ProbeCommand::Stop => return,
+                                ProbeCommand::Request(None) => force_all = true,
+                                ProbeCommand::Request(Some(id)) if !forced.contains(&id) => forced.push(id),
+                                ProbeCommand::Request(Some(_)) => {}
+                                ProbeCommand::Finished(key, result, live_at, interval) => {
+                                    running.remove(&key);
+                                    let logged_in = logins.lock().ok().and_then(|g| g.get(&key).and_then(|l| l.logged_in));
+                                    if matches!(result, Err(UsageError::ProfileChanged | UsageError::IdentityChanged))
+                                        || (result.is_ok() && logged_in != Some(true))
+                                    {
+                                        let _ = recheck.send(());
+                                    } else if result.as_ref().err().is_some_and(UsageError::auth_recheck) {
+                                        let last = auth_rechecks.entry(key.clone()).or_insert(0.0);
+                                        if time::now() - *last > 600.0 {
+                                            *last = time::now();
+                                            let _ = recheck.send(());
+                                        }
+                                    }
+                                    let now = time::now();
+                                    let retry = usage_retry::deadline(&key).filter(|at| *at > now)
+                                        .or_else(|| matches!(result, Err(UsageError::Busy)).then_some(now + 1.0));
+                                    if let Ok(mut states) = probes.lock() {
+                                        if let Some(probe) = states.get_mut(&key) {
+                                            probe.finished(result, now, retry);
+                                            probe.next_at = probe.tried_at.map(|at| next_usage_at(at, live_at, interval));
+                                        }
+                                    }
+                                    let _ = poke.send(Cmd::Poke);
+                                }
+                            }
+                        }
+                        let mut next_retry = f64::INFINITY;
                         let state = State::load();
                         let interval = refresh_minutes(&state);
-                        for acc in accounts::load(&state) {
-                            let force = matches!(&forced, Some(None)) || matches!(&forced, Some(Some(id)) if *id == acc.id);
-                            let logged_out =
-                                logins.lock().ok().and_then(|g| g.get(&acc.id).and_then(|l| l.logged_in)) == Some(false);
-                            if !force && logged_out {
+                        let mut list = accounts::load(&state);
+                        if std::mem::take(&mut force_all) {
+                            for account in &list {
+                                if !forced.contains(&account.id) { forced.push(account.id.clone()); }
+                            }
+                        }
+                        forced.retain(|id| list.iter().any(|account| &account.id == id));
+                        let keys: HashSet<_> = list.iter().map(Account::usage_key).collect();
+                        auth_rechecks.retain(|key, _| keys.contains(key));
+                        if let Ok(mut g) = probes.lock() {
+                            g.retain(|key, _| keys.contains(key));
+                        }
+                        list.sort_by_key(|a| forced.iter().position(|id| id == &a.id).unwrap_or(usize::MAX));
+                        for primary in list {
+                            let key = primary.usage_key();
+                            if running.len() >= 3 { break; }
+                            let force = forced.iter().position(|id| *id == primary.id)
+                                .map(|i| forced.remove(i)).is_some();
+                            if running.contains(&key) { continue; }
+                            // 주 폴더 로그인이 끊겨 다른 폴더를 쓰는 중이면 그 폴더로 조회 (id는 그대로)
+                            let fallback = active.lock().ok().and_then(|g| g.get(&key).cloned())
+                                .filter(|dir| accounts::fallback_profile_available(dir))
+                                .map(|dir| fallback::at(&primary, &dir));
+                            let acc = fallback.as_ref().unwrap_or(&primary);
+                            let login = logins.lock().ok().and_then(|g| g.get(&key).cloned());
+                            let logged_out = login.as_ref().and_then(|status| status.logged_in) == Some(false);
+                            let retry_at = usage_retry::deadline(&key).or_else(|| {
+                                probes.lock().ok().and_then(|g| g.get(&key)?.retry_at)
+                            });
+                            if !force && logged_out && retry_at.is_none()
+                                && !crate::login::has_file_session(&acc.provider, &acc.path())
+                            {
                                 continue;
                             }
                             let now = time::now();
-                            let tried = probes.lock().ok().and_then(|g| g.get(&acc.id).and_then(|p| p.tried_at));
-                            let due = match acc.provider.as_str() {
-                                // /usage는 토큰을 쓰지 않고 창도 열지 않음. 상태 표시줄로 값이 들어오는 중이면 덜 자주
-                                "claude" if usage_cmd::supported(&acc.id) => {
-                                    usage_due(tried, bridge::read(&acc.id).map(|b| b.updated_at), interval, now)
+                            if let Some(at) = retry_at.filter(|at| *at > now) {
+                                next_retry = next_retry.min(at);
+                                let changed = probes.lock().ok().is_some_and(|mut g| {
+                                    let p = g.entry(key.clone()).or_default();
+                                    if p.retry_at == Some(at) { return false; }
+                                    p.retry_at = Some(at);
+                                    p.error = Some(UsageError::Deferred.to_string());
+                                    true
+                                });
+                                if changed {
+                                    let _ = poke.send(Cmd::Poke);
                                 }
-                                // Codex 읽기도 토큰 0. Codex를 쓰는 중이면 실행 기록에 값이 남으므로 덜 자주
-                                "codex" => usage_due(tried, live.lock().ok().and_then(|g| g.get(&acc.id).copied()), interval, now),
-                                _ => false,
-                            };
-                            if !force && !due {
                                 continue;
                             }
-                            if let Ok(mut g) = probes.lock() {
-                                g.entry(acc.id.clone()).or_default().running = true;
-                            }
-                            let _ = poke.send(Cmd::Poke);
-                            let result = match acc.provider.as_str() {
-                                "claude" if !usage_cmd::supported(&acc.id) => Err(crate::tr!(
-                                    "설치된 Claude Code 버전은 사용량 조회 미지원. Claude Code 업데이트 필요",
-                                    "This Claude Code version does not support usage checks. Update Claude Code."
-                                )
-                                .into()),
-                                "claude" => match usage_cmd::run(&acc) {
-                                    Ok(file) => {
-                                        bridge::save(&acc.id, file);
-                                        Ok(())
-                                    }
-                                    Err(e) => Err(e),
-                                },
-                                _ => codex::read_via_app_server(&acc).map(|s| codex::save(&acc.id, &s)),
+                            let tried = probes.lock().ok().and_then(|g| g.get(&key).and_then(|p| p.tried_at));
+                            let live_at = match acc.provider.as_str() {
+                                // 파일 로그인이나 /usage로 읽음. 상태 표시줄에서 새 값이 오면 덜 자주 확인.
+                                "claude" if usage_cmd::available(acc) => {
+                                    bridge::read(&key).map(|b| b.updated_at)
+                                }
+                                // Codex 읽기도 토큰 0. Codex를 쓰는 중이면 실행 기록에 값이 남으므로 덜 자주
+                                "codex" => live.lock().ok().and_then(|g| g.get(&key).copied()),
+                                _ if force || retry_at.is_some() => None,
+                                _ => continue,
                             };
+                            if !force && retry_at.is_none() {
+                                if let Some(at) = tried.map(|tried| next_usage_at(tried, live_at, interval)).filter(|at| *at > now) {
+                                    next_retry = next_retry.min(at);
+                                    let changed = probes.lock().ok().is_some_and(|mut g| {
+                                        let p = g.entry(key.clone()).or_default();
+                                        if p.next_at == Some(at) { return false; }
+                                        p.next_at = Some(at);
+                                        true
+                                    });
+                                    if changed {
+                                        let _ = poke.send(Cmd::Poke);
+                                    }
+                                    continue;
+                                }
+                            }
                             if let Ok(mut g) = probes.lock() {
-                                let p = g.entry(acc.id.clone()).or_default();
-                                p.running = false;
-                                p.tried_at = Some(time::now());
-                                p.error = result.err();
+                                g.entry(key.clone()).or_default().running = true;
                             }
                             let _ = poke.send(Cmd::Poke);
+                            running.insert(key.clone());
+                            let send = completed.clone();
+                            let worker_key = key.clone();
+                            if let Err(error) = std::thread::Builder::new().name("usagi-usage".into()).spawn(move || {
+                                let target = fallback.as_ref().unwrap_or(&primary);
+                                let result = if target.is_claude() {
+                                    fallback::claude_usage(&primary, target, login.as_ref())
+                                        .and_then(|file| primary.commit_usage(|| bridge::save(&worker_key, file)))
+                                } else {
+                                    fallback::codex_usage(&primary, target)
+                                        .and_then(|snapshot| primary.commit_usage(|| codex::save(&worker_key, &snapshot)))
+                                };
+                                let _ = send.send(ProbeCommand::Finished(worker_key, result, live_at, interval));
+                            }) {
+                                let _ = completed.send(ProbeCommand::Finished(key, Err(UsageError::Failed(error.to_string())), live_at, interval));
+                            }
                         }
+                        wait = Duration::from_secs_f64((next_retry - time::now()).clamp(0.0, 30.0));
                     }
                 })
                 .expect("spawn probe thread");
@@ -746,7 +1040,8 @@ impl Engine {
                 let mut c = shared.lock().map(|g| g.clone()).unwrap_or_default();
                 let state = State::load();
                 config::apply_prefs(&mut c, &state);
-                let mut sources = Sources::build(&c, &accounts::load(&state));
+                let active_now = || active.lock().map(|g| g.clone()).unwrap_or_default();
+                let mut sources = Sources::build(&c, &accounts::load(&state), &active_now());
                 // 바뀐 게 없으면 화면 쪽(위젯·설정 창)을 깨우지 않음. 요청(새로고침·확인 끝)이 오면 바로 보냄.
                 let mut last: Option<Shown> = None;
                 let mut last_sent = 0.0;
@@ -754,17 +1049,27 @@ impl Engine {
                 loop {
                     let mut snap = sources.snapshot(&c);
                     if let Ok(mut g) = live.lock() {
+                        g.retain(|key, _| sources.codex.iter().any(|src| src.acc.usage_key() == *key));
                         for src in &sources.codex {
                             if let Some(s) = &src.reader.snapshot {
-                                g.insert(src.acc.id.clone(), s.ts);
+                                g.insert(src.acc.usage_key(), s.ts);
                             }
                         }
                     }
                     if let Ok(g) = logins.lock() {
-                        for (id, login) in g.iter() { snap.logins.entry(id.clone()).or_insert_with(|| login.clone()); }
+                        for acc in &sources.accounts {
+                            if let Some(login) = g.get(&acc.usage_key()) {
+                                snap.logins.insert(acc.id.clone(), login.clone());
+                            }
+                        }
                     }
+                    hide_logged_out(&mut snap);
                     if let Ok(g) = probes.lock() {
-                        for (id, probe) in g.iter() { snap.probes.entry(id.clone()).or_insert_with(|| probe.clone()); }
+                        for acc in &sources.accounts {
+                            if let Some(probe) = g.get(&acc.usage_key()) {
+                                snap.probes.insert(acc.id.clone(), probe.clone());
+                            }
+                        }
                     }
                     let shown = Shown::of(&snap);
                     if force || last.as_ref() != Some(&shown) || snap.now - last_sent >= QUIET_SECS {
@@ -773,7 +1078,7 @@ impl Engine {
                         on_snapshot(snap);
                     }
                     force = false;
-                    match rx.recv_timeout(LOCAL_POLL) {
+                    match rx.recv_timeout(Duration::from_secs_f64(c.poll_seconds)) {
                         Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                         Ok(Cmd::Poke) => force = true,
                         Ok(Cmd::Refresh) => {
@@ -784,7 +1089,7 @@ impl Engine {
                             if let Ok(mut g) = shared.lock() {
                                 *g = c.clone();
                             }
-                            sources = Sources::build(&c, &accounts::load(&state));
+                            sources.reconfigure(&c, &accounts::load(&state), &active_now());
                         }
                         Err(RecvTimeoutError::Timeout) => {}
                     }
@@ -796,7 +1101,7 @@ impl Engine {
 
     /// 사용량을 지금 확인 (None = 모든 계정)
     pub fn probe_now(&self, account_id: Option<String>) {
-        let _ = self.probe_tx.send(account_id);
+        let _ = self.probe_tx.send(ProbeCommand::Request(account_id));
     }
 
     /// 로그인 상태를 곧바로 다시 확인
@@ -810,6 +1115,7 @@ impl Engine {
     }
 
     pub fn stop(&self) {
+        let _ = self.probe_tx.send(ProbeCommand::Stop);
         let _ = self.tx.send(Cmd::Stop);
     }
 
@@ -832,7 +1138,7 @@ pub fn snapshot_once() -> Snapshot {
     let state = State::load();
     state.apply_locale();
     let c = config::load();
-    Sources::build(&c, &accounts::load(&state)).snapshot(&c)
+    Sources::build(&c, &accounts::load(&state), &HashMap::new()).snapshot(&c)
 }
 
 #[cfg(test)]
@@ -897,6 +1203,7 @@ mod tests {
                 forecast: None,
                 show: true,
                 email: None,
+                workspace_id: None,
                 plan: None,
                 credits: None,
                 refills: None,
@@ -904,6 +1211,7 @@ mod tests {
             }],
             logins: HashMap::new(),
             probes: HashMap::new(),
+            claude_statuses: HashMap::new(), revisions: HashMap::new(),
         };
         let cfg = Config::default();
         assert_eq!(n.check(None, &mk(0.4), &cfg).len(), 0);
@@ -954,6 +1262,7 @@ mod tests {
                 forecast: None,
                 show: true,
                 email: None,
+                workspace_id: None,
                 plan: None,
                 credits: None,
                 refills: None,
@@ -961,6 +1270,7 @@ mod tests {
             }],
             logins: HashMap::new(),
             probes: HashMap::new(),
+            claude_statuses: HashMap::new(), revisions: HashMap::new(),
         }
     }
 
@@ -1014,26 +1324,156 @@ mod tests {
     }
 
     #[test]
+    fn hiding_the_widget_does_not_disable_usage_or_reset_alerts() {
+        let now = time::now();
+        let mut snap = reset_snap(now, now + 300.0, 0.8);
+        snap.providers[0].show = false;
+        let mut notices = Notices { state: State::default() };
+        notices.state.0.insert("alerts".into(), serde_json::json!({ "claude-1:5시간": { "at": [50], "before": [10] } }));
+        assert_eq!(notices.check(None, &snap, &Config::default()).len(), 2);
+    }
+
+    #[test]
+    fn late_snapshot_from_a_previous_connection_is_ignored() {
+        let now = time::now();
+        let mut snap = reset_snap(now, now + 300.0, 0.8);
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "id": "claude-1", "provider": "claude", "dir": "profile", "revision": 2
+        })).unwrap();
+        snap.revisions.insert(account.id.clone(), 1);
+        snap.logins.insert(account.id.clone(), LoginStatus { logged_in: Some(true), ..Default::default() });
+        snap.probes.insert(account.id.clone(), ProbeState { tried_at: Some(now), ..Default::default() });
+        snap.retain_current(&[account]);
+        assert!(snap.providers.is_empty());
+        assert!(snap.logins.is_empty());
+        assert!(snap.probes.is_empty());
+    }
+
+    #[test]
     fn login_expiry_notice_only_when_turned_on() {
         let mut n = Notices { state: State::default() };
-        let mut snap = Snapshot { now: time::now(), claude: None, providers: vec![], logins: HashMap::new(), probes: HashMap::new() };
+        let mut snap = Snapshot { now: time::now(), claude: None, providers: vec![], logins: HashMap::new(), probes: HashMap::new(), claude_statuses: HashMap::new(), revisions: HashMap::new() };
         snap.logins.insert("claude-1".into(), LoginStatus { logged_in: Some(false), ..Default::default() });
         let cfg = Config::default();
-        assert!(n.check(None, &snap, &cfg).is_empty(), "기본은 로그인 만료 알림 없음");
+        n.state.set_pref("loginNotify", serde_json::json!(false));
+        assert!(n.check(None, &snap, &cfg).is_empty(), "설정에서 껐으면 로그인 만료 알림 없음");
         n.state.set_pref("loginNotify", serde_json::json!(true));
         assert_eq!(n.check(None, &snap, &cfg).len(), 1);
         assert!(n.check(None, &snap, &cfg).is_empty(), "한 번만");
     }
 
     #[test]
+    fn login_warning_survives_restart_and_rearms_after_reconnect() {
+        let expiry = time::parse_iso("2026-12-20T12:00:00Z").unwrap();
+        let mut snap = reset_snap(expiry - 4.0 * DAY, expiry, 0.0);
+        snap.revisions.insert("claude-1".into(), 1);
+        snap.logins.insert("claude-1".into(), crate::login::parse_claude(
+            "Sign-in ends: 2026-12-20T12:00:00Z",
+        ));
+        let cfg = Config::default();
+        let mut notices = Notices { state: State::default() };
+        assert!(notices.check(None, &snap, &cfg).is_empty());
+
+        snap.now = expiry - 3.0 * DAY;
+        assert_eq!(notices.check(None, &snap, &cfg).len(), 1);
+        let mut notices = Notices::load();
+        assert!(notices.check(None, &snap, &cfg).is_empty());
+
+        snap.now = expiry + DAY;
+        snap.logins.insert("claude-1".into(), LoginStatus { logged_in: Some(false), ..Default::default() });
+        assert!(notices.check(None, &snap, &cfg).is_empty(), "no second alert on expiry");
+
+        snap.revisions.insert("claude-1".into(), 2);
+        snap.now = time::parse_iso("2027-01-18T12:00:00Z").unwrap();
+        snap.logins.insert("claude-1".into(), crate::login::parse_claude(
+            "Sign-in ends: 2027-01-20T12:00:00Z",
+        ));
+        assert_eq!(notices.check(None, &snap, &cfg).len(), 1);
+    }
+
+    #[test]
+    fn logged_out_accounts_show_no_old_values() {
+        let now = time::now();
+        let view = |id: &str| ProviderView {
+            id: ProviderId::Claude,
+            account_id: id.into(),
+            name: "Claude".into(),
+            meters: vec![Meter { label: "5시간".into(), ratio: 0.55, resets_at: Some(now + 3600.0), exact: true }],
+            updated_at: Some(now - 10.0 * HOUR),
+            note: None,
+            forecast: None,
+            show: true,
+            email: None,
+            workspace_id: None,
+            plan: None,
+            credits: None,
+            refills: None,
+            extra: Some("추가 사용 $12.30 / $50 · 월".into()),
+        };
+        let st = Tracker::new().status(now);
+        let mut snap = Snapshot { now, claude: Some(st.clone()), providers: vec![view("claude-1"), view("claude-2"), view("claude-3")], logins: HashMap::new(), probes: HashMap::new(), claude_statuses: HashMap::new(), revisions: HashMap::new() };
+        snap.logins.insert("claude-1".into(), LoginStatus { logged_in: Some(false), ..Default::default() });
+        snap.logins.insert("claude-2".into(), LoginStatus { logged_in: Some(true), ..Default::default() });
+        // claude-3: 확인 실패 (상태 모름)
+        snap.logins.insert("claude-3".into(), LoginStatus { logged_in: None, error: Some("timeout".into()), ..Default::default() });
+        hide_logged_out(&mut snap);
+        assert!(snap.providers[0].meters.is_empty(), "로그아웃: 예전 값 숨김");
+        assert!(snap.providers[0].extra.is_none(), "로그아웃: 예전 추가 사용 금액도 숨김");
+        assert_eq!(snap.providers[1].meters.len(), 1, "로그인됨: 그대로");
+        assert!(snap.providers[1].extra.is_some());
+        assert_eq!(snap.providers[2].meters.len(), 1, "상태 모름: 그대로");
+        assert!(snap.claude.is_none(), "토끼가 따르는 첫 Claude 계정이 로그아웃: 예보 없음");
+        // 첫 계정을 위젯에서 숨기면 토끼는 다음 계정(로그인됨)을 따르므로 그대로
+        let mut snap2 = Snapshot { now, claude: Some(st), providers: vec![view("claude-1"), view("claude-2")], logins: snap.logins.clone(), probes: HashMap::new(), claude_statuses: HashMap::new(), revisions: HashMap::new() };
+        snap2.providers[0].show = false;
+        hide_logged_out(&mut snap2);
+        assert!(snap2.claude.is_some());
+        // 숨긴 계정은 사용량 알림도 없음
+        let mut n = Notices { state: State::default() };
+        n.state.set_pref("loginNotify", serde_json::json!(false));
+        n.state.0.insert("alerts".into(), serde_json::json!({ "claude-1:5시간": { "at": [50] } }));
+        assert!(n.check(None, &snap, &Config::default()).is_empty());
+    }
+
+    #[test]
     fn claude_view_hides_values_without_exact() {
         let t = Tracker::new();
         let st = t.status(time::now());
-        let acc = Account { id: "claude-1".into(), provider: "claude".into(), dir: ".".into(), label: "회사".into(), show: true, chain: None };
+        let acc = Account { id: "claude-1".into(), provider: "claude".into(), dir: ".".into(), label: "회사".into(), show: true, chain: None, revision: 0, statusline_original: None, identity: None };
         let v = claude_view(&acc, &st, None);
         assert_eq!(v.name, "Claude (회사)");
         assert!(v.meters.iter().all(|m| !m.exact));
         assert!(v.forecast.is_none());
         assert_eq!(st.mood, Mood::Rest);
+    }
+
+    #[test]
+    fn claude_view_keeps_missing_weekly_quota_unknown() {
+        let mut st = Tracker::new().status(1_000_000.0);
+        let file = BridgeFile {
+            five_hour: Some(BridgeWindow { used_percentage: 12.0, resets_at: None }),
+            weekly_unavailable: true,
+            weekly_anchor: Some(st.now + HOUR),
+            ..Default::default()
+        };
+        apply_exact(&mut st, &file, 0.8);
+        let acc = Account { id: "claude-1".into(), provider: "claude".into(), dir: ".".into(), label: String::new(), show: true, chain: None, revision: 0, statusline_original: None, identity: None };
+        let view = claude_view(&acc, &st, Some(&file));
+        assert!(view.meters[0].exact);
+        assert!(!view.meters[1].exact);
+        assert!(view.meters[1].resets_at.is_none());
+    }
+
+    #[test]
+    fn cooldown_keeps_the_time_of_the_last_actual_request() {
+        let mut probe = ProbeState { running: true, ..ProbeState::default() };
+        probe.finished(Err(UsageError::RateLimited(120.0)), 100.0, Some(120.0));
+        probe.finished(Err(UsageError::Deferred), 110.0, Some(120.0));
+        assert_eq!(probe.tried_at, Some(100.0));
+        assert_eq!(probe.retry_at, Some(120.0));
+        probe.finished(Ok(()), 121.0, None);
+        assert_eq!(probe.tried_at, Some(121.0));
+        assert!(probe.retry_at.is_none());
+        assert!(probe.error.is_none());
     }
 }

@@ -90,6 +90,8 @@ pub struct HostInfo {
     pub bar_range: Option<(f64, f64, f64)>,
     /// 작업 표시줄이 밝은지 (Windows 모드). 설정 창의 작업 표시줄 아이콘 색을 고름. 모르면 None
     pub taskbar_light: Option<bool>,
+    /// 위젯 미리 보기 (Windows가 지금 설정대로 그린 그림: {w, h, scale, light, rgba}). 바뀌지 않았으면 {keep: true}, 보일 게 없으면 None
+    pub widget_preview: Option<Value>,
 }
 
 #[derive(Default)]
@@ -97,6 +99,7 @@ struct UpdateState {
     busy: Option<&'static str>,
     latest: Option<Release>,
     staged: Option<PathBuf>,
+    manual_install: bool,
     checked_at: Option<f64>,
     error: Option<String>,
 }
@@ -107,20 +110,22 @@ pub struct Controller {
     pub snap: Option<Snapshot>,
     pub platform: Platform,
     last_error: Option<String>,
+    install_help: Option<String>,
     /// 콘솔 없이 돌고 있는 공식 로그인 (한 번에 하나)
     login: Option<LoginSession>,
     connecting: Option<Connection>,
-    /// 마지막으로 화면에 보낸 연결 준비 문구
-    connect_message: String,
     login_finished_at: Option<f64>,
     last_login_poll: f64,
     login_rechecks: u32,
     next_recheck: f64,
     /// "추가"로 만들어 공식 로그인 중인, 아직 등록 전인 프로필
     pending_new: Option<Account>,
+    inactive_profiles: Vec<PathBuf>,
+    deleted_profiles: Vec<(PathBuf, std::sync::mpsc::Receiver<std::io::Result<()>>)>,
     update: UpdateState,
     next_update_check: f64,
     settings_open: bool,
+    widget_preview_open: bool,
 }
 
 impl Controller {
@@ -136,17 +141,20 @@ impl Controller {
             snap: None,
             platform,
             last_error: None,
+            install_help: None,
             login: None,
             connecting: None,
-            connect_message: String::new(),
             login_finished_at: None,
             last_login_poll: 0.0,
             login_rechecks: 0,
             next_recheck: 0.0,
             pending_new: None,
+            inactive_profiles: Vec::new(),
+            deleted_profiles: Vec::new(),
             update: UpdateState::default(),
             next_update_check: time::now() + UPDATE_FIRST_SECS,
             settings_open: false,
+            widget_preview_open: false,
         }
     }
 
@@ -161,6 +169,17 @@ impl Controller {
 
     pub fn set_error(&mut self, e: impl Into<String>) {
         self.last_error = Some(e.into());
+    }
+
+    fn save_settings(&mut self, previous: State) -> bool {
+        match self.notices.state.try_save() {
+            Ok(()) => true,
+            Err(error) => {
+                self.notices.state = previous;
+                self.set_error(storage_error(&error));
+                false
+            }
+        }
     }
 
     pub fn effective_config(&self) -> Config {
@@ -184,11 +203,17 @@ impl Controller {
     pub fn startup(&mut self) -> Vec<Effect> {
         let mut fx = Vec::new();
         self.ensure_links();
-        self.drop_legacy_accounts();
-        std::thread::spawn(|| {
-            remove_legacy_data();
-            accounts::protect_profiles();
-        });
+        if accounts::has_unread_accounts(&self.notices.state) {
+            self.set_error(crate::tr!(
+                "일부 계정 정보 읽기 실패 · 기존 데이터 보관",
+                "Some account entries could not be read · Existing data preserved"
+            ));
+        }
+        if let Err(error) = accounts::protect_profiles() {
+            let message = storage_error(&error);
+            self.set_error(message.clone());
+            fx.push(Effect::Notify(crate::tr!("프로필 권한 설정 실패", "Could not protect profile folders").into(), message));
+        }
         if let Some(err) = self.engine.config().error {
             fx.push(Effect::Notify(crate::tr!("usAgI 설정 오류", "usAgI config error").into(), err));
         }
@@ -207,7 +232,23 @@ impl Controller {
     }
 
     /// 엔진이 새 사용량을 보냄 → 알림 판단
-    pub fn apply_snapshot(&mut self, snap: Snapshot) -> Vec<Effect> {
+    pub fn apply_snapshot(&mut self, mut snap: Snapshot) -> Vec<Effect> {
+        let mut accounts = accounts::load(&self.notices.state);
+        snap.retain_current(&accounts);
+        let mut changed = false;
+        for account in accounts.iter_mut().filter(|account| account.identity.is_none()) {
+            let from_status = || snap.logins.get(&account.id).filter(|status| status.logged_in == Some(true))
+                .and_then(login::Identity::from_status);
+            account.identity = if account.is_claude() {
+                from_status()
+            } else {
+                crate::codex::load(&account.usage_key()).as_ref().and_then(login::Identity::from_codex).or_else(from_status)
+            };
+            changed |= account.identity.is_some();
+        }
+        if changed {
+            self.store_accounts(&accounts);
+        }
         let cfg = self.effective_config();
         let mut fx: Vec<Effect> = self.notices.check(self.snap.as_ref(), &snap, &cfg).into_iter().map(|(t, m)| Effect::Notify(t, m)).collect();
         self.snap = Some(snap);
@@ -221,6 +262,9 @@ impl Controller {
         let now = time::now();
         let mut fx = Vec::new();
         self.poll_connection(&mut fx);
+        if self.poll_profile_deletions() {
+            fx.push(Effect::Push);
+        }
         if self.login.is_some() && now - self.last_login_poll >= LOGIN_POLL_SECS {
             self.last_login_poll = now;
             if self.poll_login(now) {
@@ -241,6 +285,9 @@ impl Controller {
                 fx.extend(self.check_update(false));
             }
         }
+        if let Some(effect) = self.apply_staged_when_ready(false) {
+            fx.push(effect);
+        }
         fx
     }
 
@@ -251,16 +298,19 @@ impl Controller {
 
     pub fn settings_opened(&mut self) {
         self.settings_open = true;
+        self.reload_inactive_profiles();
         self.engine.check_logins();
+    }
+
+    pub fn wants_widget_preview(&self) -> bool {
+        self.widget_preview_open
     }
 
     /// 설정 창을 닫음 → 받아 둔 업데이트가 있으면 이제 적용
     pub fn settings_closed(&mut self) -> Vec<Effect> {
         self.settings_open = false;
-        match &self.update.staged {
-            Some(p) if self.auto_update() => vec![Effect::ApplyUpdate(p.clone())],
-            _ => Vec::new(),
-        }
+        self.widget_preview_open = false;
+        self.apply_staged_when_ready(false).into_iter().collect()
     }
 
     /// 모든 계정 다시 확인 (메뉴의 "지금 새로고침")
@@ -303,12 +353,15 @@ impl Controller {
                 "barMin": host.bar_range.map(|r| r.0),
                 "barDefault": host.bar_range.map(|r| r.1),
                 "barMax": host.bar_range.map(|r| r.2),
+                // 위젯에 막대를 그릴지 (끄면 라벨과 값만)
+                "bars": st.pref_bool("bars", true),
                 "basis": st.pref_str("basis", "used"),
                 "refresh": engine::refresh_minutes(st),
                 "rabbit": st.pref_bool("rabbit", true),
                 "notify": cfg.notify,
                 "napNotify": st.pref_bool("napNotify", false),
-                "loginNotify": st.pref_bool("loginNotify", false),
+                "loginNotify": st.pref_bool("loginNotify", true),
+                "loginWarningDays": login::SIGN_IN_WARNING_DAYS,
                 "refillNotify": st.pref_bool("refillNotify", false),
                 "refillLead": st.pref_f64("refillLead").unwrap_or(engine::DEFAULT_REFILL_LEAD_MIN),
                 "urgent": st.pref_bool("urgent", true),
@@ -320,8 +373,14 @@ impl Controller {
             },
             "monitors": host.monitors,
             "taskbarLight": host.taskbar_light,
+            "widgetPreview": host.widget_preview,
             "accounts": ui::accounts_json(st, self.snap.as_ref(), self.login_rechecks > 0, now),
+            "inactiveProfiles": self.inactive_profiles.iter()
+                .filter(|path| !self.is_fallback_profile(path))
+                .filter_map(|path| path.file_name()?.to_str())
+                .collect::<Vec<_>>(),
             "error": self.last_error,
+            "installHelp": self.install_help,
             "loginSession": self.connecting.as_ref().map(|connection| json!({
                 "id": connection.account_id.as_deref().unwrap_or(connection.provider),
                 "message": connection.message(),
@@ -361,12 +420,21 @@ impl Controller {
     pub fn handle_ipc(&mut self, raw: &str) -> Vec<Effect> {
         let Ok(msg) = serde_json::from_str::<Value>(raw) else { return Vec::new() };
         let cmd = msg.get("cmd").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        if cmd == "widgetPreview" {
+            self.widget_preview_open = msg["visible"].as_bool().unwrap_or(false);
+            return vec![Effect::Push];
+        }
         let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let provider = msg.get("provider").and_then(|p| p.as_str()).unwrap_or("").to_string();
-        if cmd != "ready" {
+        if cmd != "ready" && cmd != "openInstall" {
             self.last_error = None;
+            self.install_help = None;
         }
+        let previous = self.notices.state.clone();
         if ui::apply_meter_ipc(&mut self.notices.state, &cmd, &msg) {
+            if self.notices.state.0 != previous.0 && !self.save_settings(previous) {
+                return vec![Effect::Push];
+            }
             return vec![Effect::Redraw, Effect::Push];
         }
         let mut fx = Vec::new();
@@ -400,7 +468,7 @@ impl Controller {
                         }
                     }
                 }
-                st.save();
+                self.save_settings(previous);
             }
             "login" => self.login_account(&id),
             "addNew" => match provider.as_str() {
@@ -408,6 +476,13 @@ impl Controller {
                 "codex" => self.connect("codex", None),
                 _ => {}
             },
+            "openInstall" => {
+                match self.install_help.as_deref() {
+                    Some("claude") => fx.push(Effect::Open("https://code.claude.com/docs/en/setup#install-claude-code".into())),
+                    Some("codex") => fx.push(Effect::Open("https://developers.openai.com/codex/cli".into())),
+                    _ => {}
+                }
+            }
             "loginCode" => {
                 let code = msg.get("code").and_then(|c| c.as_str()).unwrap_or("").to_string();
                 if let Some(s) = self.login.as_mut() {
@@ -446,9 +521,14 @@ impl Controller {
                 });
                 fx.push(Effect::Redraw);
             }
-            "remove" => {
-                self.remove_account(&id);
+            "remove" | "removeProfile" => {
+                self.remove_account(&id, cmd == "removeProfile", accounts::save);
                 fx.push(Effect::Redraw);
+            }
+            "removeInactiveProfile" => self.remove_inactive_profile(&id),
+            "restoreInactiveProfile" => self.restore_inactive_profile(&id),
+            "linkStatusline" | "unlinkStatusline" => {
+                self.change_statusline(&id, cmd == "linkStatusline");
             }
             "reorder" => {
                 // 끌어서 바꾼 계정 순서 (위젯·메뉴 막대·알림 화면도 이 순서)
@@ -457,11 +537,12 @@ impl Controller {
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
                     .unwrap_or_default();
-                if !ids.is_empty() {
-                    self.edit_accounts(|list| {
+                if !ids.is_empty()
+                    && self.edit_accounts(|list| {
                         reorder(list, &ids);
                         Ok(())
-                    });
+                    })
+                {
                     if let Some(snap) = self.snap.as_mut() {
                         engine::sort_by_order(&mut snap.providers, &ids);
                     }
@@ -491,6 +572,10 @@ impl Controller {
                 Err(e) => self.last_error = Some(crate::tr!(format!("설정 파일 만들기 실패: {e}"), format!("Failed to create the config file: {e}"))),
             },
             "openNotifySettings" => fx.push(Effect::OpenNotifySettings),
+            // macOS 집중 모드 설정 (허용된 앱에 usAgI 추가)
+            "openFocusSettings" if self.platform.name == "mac" => {
+                fx.push(Effect::Open("x-apple.systempreferences:com.apple.Focus-Settings.extension".into()))
+            }
             "checkUpdate" => fx.extend(self.check_update(true)),
             "installUpdate" => fx.extend(self.install_update()),
             "openRelease" => {
@@ -511,6 +596,23 @@ impl Controller {
 
     /// 설정 하나 바꾸기 (값 확인 후 저장)
     pub fn set_pref(&mut self, key: &str, value: Value) -> Vec<Effect> {
+        let previous = self.notices.state.clone();
+        let effects = self.set_pref_inner(key, value);
+        if self.notices.state.0 != previous.0 {
+            if !self.save_settings(previous) {
+                return vec![Effect::Push];
+            }
+            if matches!(key, "refresh" | "poll") {
+                self.engine.refresh();
+            }
+            if key == "locale" {
+                self.notices.state.apply_locale();
+            }
+        }
+        effects
+    }
+
+    fn set_pref_inner(&mut self, key: &str, value: Value) -> Vec<Effect> {
         let st = &mut self.notices.state;
         let one_of = |v: &Value, allowed: &[&str]| v.as_str().filter(|s| allowed.contains(s)).map(|s| json!(s));
         match key {
@@ -519,11 +621,9 @@ impl Controller {
                 let m = value.as_f64().unwrap_or(5.0);
                 let m = [1.0, 3.0, 5.0, 10.0, 15.0].into_iter().min_by(|a, b| (a - m).abs().total_cmp(&(b - m).abs())).unwrap_or(5.0);
                 st.set_pref("refresh_minutes", json!(m));
-                self.engine.refresh();
             }
             "poll" => {
                 st.set_pref("poll", json!(value.as_f64().unwrap_or(3.0).clamp(1.0, 60.0)));
-                self.engine.refresh();
             }
             // 위젯 막대 길이 (논리 px, 남은 시간 표시일 때의 길이). "default"·null이면 기본(예전 고정 길이)으로
             "barPx" => {
@@ -533,7 +633,6 @@ impl Controller {
                         if let Some(p) = st.0.get_mut("prefs").and_then(|p| p.as_object_mut()) {
                             p.remove(key);
                         }
-                        st.save();
                     }
                 }
                 return vec![Effect::PlatformPref(key.into()), Effect::Redraw, Effect::Push];
@@ -541,7 +640,6 @@ impl Controller {
             // 언어: 시스템(기본) / 한국어 / 영어. 위젯·메뉴·알림 문구도 바뀌므로 다시 그림
             "locale" => {
                 if let Some(v) = one_of(&value, &["system", "ko", "en"]) {
-                    crate::i18n::set(crate::i18n::resolve(v.as_str().unwrap_or("system")));
                     st.set_pref(key, v);
                     return vec![Effect::PlatformPref(key.into()), Effect::Redraw, Effect::Push];
                 }
@@ -591,7 +689,7 @@ impl Controller {
                 }
             }
             // 플랫폼 전용 (Windows 위젯 위치·모니터, 중요 알림)
-            "widget" | "urgent" => {
+            "widget" | "urgent" | "bars" => {
                 if let Some(v) = value.as_bool() {
                     st.set_pref(key, json!(v));
                     return vec![Effect::PlatformPref(key.into()), Effect::Redraw, Effect::Push];
@@ -611,18 +709,60 @@ impl Controller {
 
     // -------------------------------------------------------------- 계정·로그인
 
-    fn edit_accounts(&mut self, f: impl FnOnce(&mut Vec<Account>) -> Result<(), String>) {
+    fn edit_accounts(&mut self, f: impl FnOnce(&mut Vec<Account>) -> Result<(), String>) -> bool {
         let mut list = accounts::load(&self.notices.state);
         if let Err(e) = f(&mut list) {
             self.last_error = Some(e);
+            return false;
         }
-        accounts::save(&mut self.notices.state, &list);
+        if !self.store_accounts(&list) {
+            return false;
+        }
         self.engine.refresh();
+        true
     }
 
-    /// Claude 계정은 기본으로 실시간 연결: Claude Code 상태 표시줄에 usAgI 브리지를 걸어 메시지마다 사용량이 갱신되게 함.
-    /// 이미 걸려 있으면 아무것도 하지 않고, 앱 위치가 바뀌었으면 새 위치로 다시 검.
-    /// 원래 쓰던 상태 표시줄은 기억해 두고 그 출력을 그대로 보여 줌 (계정을 지울 때 되돌림).
+    fn store_accounts(&mut self, list: &[Account]) -> bool {
+        match accounts::save(&mut self.notices.state, list) {
+            Ok(()) => true,
+            Err(e) => {
+                self.set_error(account_save_error(&e));
+                false
+            }
+        }
+    }
+
+    fn change_statusline(&mut self, id: &str, enable: bool) {
+        let mut list = accounts::load(&self.notices.state);
+        let Some(index) = list.iter().position(|a| a.id == id && a.is_claude()) else { return };
+        let account = &mut list[index];
+        let was_linked = accounts::link_state(account) == Link::Linked;
+        let change = if enable {
+            std::env::current_exe().and_then(|exe| accounts::link(account, &exe)).map(|()| None)
+        } else {
+            accounts::unlink_with_backup(account)
+        };
+        let backup = match change {
+            Ok(backup) => backup,
+            Err(error) => { self.set_error(error.to_string()); return; }
+        };
+        if self.store_accounts(&list) {
+            self.engine.refresh();
+            return;
+        }
+        let account = &mut list[index];
+        let rollback = if let Some(backup) = backup {
+            backup.rollback(account)
+        } else if enable && !was_linked {
+            accounts::unlink(account)
+        } else { Ok(()) };
+        if let Err(error) = rollback {
+            let prior = self.last_error.as_deref().unwrap_or_default();
+            self.set_error(format!("{prior} · {error}"));
+        }
+    }
+
+    /// 명시적으로 켠 Claude 실시간 연결의 명령만 갱신.
     fn ensure_links(&mut self) {
         let Ok(exe) = std::env::current_exe() else { return };
         let mut list = accounts::load(&self.notices.state);
@@ -636,16 +776,7 @@ impl Controller {
             }
         }
         if changed {
-            accounts::save(&mut self.notices.state, &list);
-        }
-    }
-
-    /// 예전 브라우저 연결 계정(프로필 폴더 없음)을 저장된 목록에서도 지움
-    fn drop_legacy_accounts(&mut self) {
-        let stored = self.notices.state.0.get("accounts").and_then(|v| v.as_array()).map_or(0, Vec::len);
-        let list = accounts::load(&self.notices.state);
-        if list.len() != stored {
-            accounts::save(&mut self.notices.state, &list);
+            self.store_accounts(&list);
         }
     }
 
@@ -662,6 +793,9 @@ impl Controller {
 
     fn cancel_connection(&mut self) {
         self.connecting = None;
+        // Signing in may have finished just before the user clicked cancel.
+        // Process a successful exit before deciding which profile to discard.
+        self.poll_login(time::now());
         if let Some(mut login) = self.login.take() {
             login.cancel();
         }
@@ -669,20 +803,14 @@ impl Controller {
 
     fn poll_connection(&mut self, effects: &mut Vec<Effect>) {
         let Some(connection) = self.connecting.as_ref() else { return };
-        let Some(result) = connection.next() else {
-            // 설치가 시작되면 화면 문구도 바꿈
-            let message = connection.message();
-            if message != self.connect_message {
-                self.connect_message = message;
-                effects.push(Effect::Push);
-            }
-            return;
-        };
+        let Some(result) = connection.next() else { return };
         let attempt = self.connecting.take().expect("connection attempt");
-        self.connect_message.clear();
         match result {
             Ok(destination) => self.finish_connection(attempt.provider, attempt.account_id.as_deref(), destination),
             Err(error) => self.set_error(error),
+        }
+        if self.login.is_none() {
+            self.drop_unfinished_new();
         }
         effects.extend([Effect::Redraw, Effect::Push]);
     }
@@ -691,25 +819,53 @@ impl Controller {
         let mut list = accounts::load(&self.notices.state);
         let program = match destination {
             Destination::Existing { profile, program } => {
-                login::remember_program(provider, program);
+                if let Some(program) = program {
+                    login::remember_program(provider, program);
+                }
+                if list.iter().any(|account| login::same_dir(&account.path(), Some(profile.clone()))) {
+                    return;
+                }
+                let archived_id = profile.file_name().and_then(|name| name.to_str()).filter(|name| {
+                    !list.iter().any(|account| account.id == *name)
+                        && self.inactive_profiles.contains(&profile)
+                        && accounts::validate_managed_profile(&profile).is_ok()
+                });
+                let identity = login::file_status(provider, &profile).as_ref().and_then(login::Identity::from_status);
                 let acc = Account {
-                    id: accounts::new_id(provider, &list),
+                    id: archived_id.map(str::to_owned).unwrap_or_else(|| accounts::new_id(provider, &list)),
                     provider: provider.into(),
                     dir: profile.to_string_lossy().into(),
                     label: String::new(),
                     show: true,
                     chain: None,
+                    revision: accounts::new_revision(),
+                    statusline_original: None,
+                    identity,
                 };
                 let id = acc.id.clone();
                 list.push(acc);
-                accounts::save(&mut self.notices.state, &list);
-                self.ensure_links();
+                if !self.store_accounts(&list) {
+                    return;
+                }
+                if archived_id.is_some() {
+                    accounts::unmark_profile(&profile);
+                }
+                self.reload_inactive_profiles();
                 self.engine.check_logins();
                 self.engine.refresh();
                 self.engine.probe_now(Some(id));
                 return;
             }
             Destination::SignIn(program) => program,
+            Destination::NeedsCli => {
+                let cli = login::cli_name(provider);
+                self.set_error(crate::tr!(
+                    format!("{cli} 설치 필요 · 설치 후 다시 연결"),
+                    format!("{cli} required · Install it, then reconnect")
+                ));
+                self.install_help = Some(provider.to_owned());
+                return;
+            }
         };
         let fresh = target.is_none();
         let acc = if let Some(id) = target {
@@ -724,6 +880,17 @@ impl Controller {
                 }
             }
         };
+        if accounts::is_managed(&acc) {
+            let protection = accounts::validate_managed_profile(&acc.path()).and_then(|()| accounts::protect_profiles());
+            if let Err(error) = protection {
+                self.set_error(crate::tr!(
+                    format!("프로필 권한 설정 실패 ({error})"),
+                    format!("Could not protect profile folder ({error})")
+                ));
+                if fresh { self.delete_profile_async(acc.path()); }
+                return;
+            }
+        }
         match LoginSession::start_with(&acc, &program) {
             Ok(session) => {
                 login::remember_program(provider, program);
@@ -737,7 +904,7 @@ impl Controller {
             Err(e) => {
                 self.set_error(crate::tr!(format!("공식 로그인 시작 실패: {e}"), format!("Failed to start the official sign-in: {e}")));
                 if fresh {
-                    let _ = std::fs::remove_dir(acc.path());
+                    self.delete_profile_async(acc.path());
                 }
             }
         }
@@ -759,19 +926,50 @@ impl Controller {
         let Some(s) = self.login.as_mut() else { return false };
         let before = s.view().clone();
         let view = s.poll().clone();
+        let identity = s.verified_status.as_ref().and_then(login::Identity::from_status);
         let mut linked = false;
         if view.done.is_some() && self.login_finished_at.is_none() {
             self.login_finished_at = Some(now);
             if view.done == Some(true) {
-                if let Some(account) = self.pending_new.take() {
-                    self.edit_accounts(|accounts| {
+                if let Some(mut account) = self.pending_new.take() {
+                    account.identity = identity;
+                    let path = account.path();
+                    if !self.edit_accounts(|accounts| {
                         accounts.push(account);
                         Ok(())
-                    });
+                    }) {
+                        self.login = None;
+                        self.reload_inactive_profiles();
+                        return true;
+                    }
+                    accounts::unmark_profile(&path);
+                    self.reload_inactive_profiles();
+                } else {
+                    let _guard = accounts::lock_changes();
+                    let mut previous = None;
+                    if !self.edit_accounts(|list| {
+                        if let Some(account) = list.iter_mut().find(|a| a.id == view.account_id) {
+                            previous = Some(account.clone());
+                            account.revision = accounts::new_revision();
+                            account.identity = identity;
+                        }
+                        Ok(())
+                    }) {
+                        self.login = None;
+                        return true;
+                    }
+                    if let Some(account) = &previous {
+                        ui::clear_usage(account);
+                    }
+                    if let Some(snap) = self.snap.as_mut() {
+                        snap.retain_current(&accounts::load(&self.notices.state));
+                    }
                 }
-                // 로그인한 계정의 사용량을 바로 받아 옴 (Codex는 토큰을 쓰지 않음)
+                // 로그인한 계정의 사용량을 바로 받아 옴
                 self.engine.probe_now(Some(view.account_id.clone()));
                 linked = true;
+            } else {
+                self.drop_unfinished_new();
             }
             self.engine.check_logins();
             self.login_rechecks = LOGIN_RECHECKS;
@@ -789,14 +987,123 @@ impl Controller {
         view != before
     }
 
-    /// "추가"로 만든 계정을 로그인하지 않은 채 닫으면 지움 (빈 카드가 남지 않게)
+    /// 등록까지 가지 않은 신규 로그인 프로필만 정리.
     fn drop_unfinished_new(&mut self) {
         if let Some(a) = self.pending_new.take() {
-            ui::forget_account(&mut self.notices.state, &a);
+            self.delete_profile_async(a.path());
         }
     }
 
-    fn remove_account(&mut self, id: &str) {
+    fn is_fallback_profile(&self, path: &std::path::Path) -> bool {
+        self.snap.as_ref().is_some_and(|snap| snap.logins.values().any(|login| {
+            login.fallback.as_ref().is_some_and(|dir| login::same_dir(path, Some(PathBuf::from(dir))))
+        }))
+    }
+
+    fn reload_inactive_profiles(&mut self) {
+        let registered = accounts::load(&self.notices.state);
+        self.inactive_profiles = accounts::managed_profiles(&accounts::profiles_dir()).into_iter().filter(|dir| {
+            !registered.iter().chain(self.pending_new.iter()).any(|a| login::same_dir(dir, Some(a.path())))
+                && !self.deleted_profiles.iter().any(|(path, _)| path == dir)
+        }).collect();
+    }
+
+    fn remove_inactive_profile(&mut self, name: &str) {
+        if self.connecting.is_some() { return; }
+        self.reload_inactive_profiles();
+        let Some(path) = self.inactive_profiles.iter().find(|dir| dir.file_name().and_then(|name| name.to_str()) == Some(name)).cloned()
+        else { return };
+        if self.is_fallback_profile(&path) {
+            self.set_error(crate::tr!("다른 계정에서 사용 중인 프로필", "Profile in use by another account"));
+            return;
+        }
+        self.delete_profile_async(path);
+    }
+
+    fn restore_inactive_profile(&mut self, name: &str) {
+        if self.busy() { return; }
+        self.reload_inactive_profiles();
+        let Some(path) = self.inactive_profiles.iter().find(|dir| dir.file_name().and_then(|n| n.to_str()) == Some(name)).cloned()
+        else { return };
+        let provider = if name.starts_with("claude-") { "claude" } else { "codex" };
+        match Connection::restore(provider, path) {
+            Ok(connection) => self.connecting = Some(connection),
+            Err(error) => self.set_error(error.to_string()),
+        }
+    }
+
+    fn delete_profile_async(&mut self, path: PathBuf) {
+        if let Err(e) = accounts::mark_profile_inactive(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                self.set_profile_delete_error(&path, &e);
+            }
+            self.reload_inactive_profiles();
+            return;
+        }
+        self.queue_profile_deletion(path);
+    }
+
+    fn queue_profile_deletion(&mut self, path: PathBuf) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.deleted_profiles.push((path.clone(), rx));
+        self.reload_inactive_profiles();
+        std::thread::spawn(move || {
+            let delete = || accounts::delete_managed_profile(&path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound && !path.exists() { Ok(()) } else { Err(e) }
+            });
+            let mut result = delete();
+            for millis in [40, 160, 500] {
+                if !cfg!(windows) || !result.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(5 | 32 | 33 | 145))) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(millis));
+                result = delete();
+            }
+            if result.is_err() {
+                let _ = accounts::mark_profile_inactive(&path);
+            }
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_profile_deletions(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let mut error = None;
+        let before = self.deleted_profiles.len();
+        self.deleted_profiles.retain(|(path, result)| match result.try_recv() {
+            Ok(Ok(())) => false,
+            Ok(Err(e)) => { error = Some((path.clone(), e)); false }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+        if let Some((path, e)) = error {
+            self.set_profile_delete_error(&path, &e);
+        }
+        if self.deleted_profiles.len() != before {
+            self.reload_inactive_profiles();
+            return true;
+        }
+        false
+    }
+
+    fn set_profile_delete_error(&mut self, path: &std::path::Path, e: &std::io::Error) {
+        let path = path.display();
+        self.set_error(crate::tr!(
+            format!("프로필·로컬 기록 삭제 실패 ({path}: {e})"),
+            format!("Could not delete the profile and local history ({path}: {e})")
+        ));
+    }
+
+    fn remove_account(&mut self, id: &str, delete_profile: bool, persist: impl FnOnce(&mut State, &[Account]) -> std::io::Result<()>) {
+        let mut list = accounts::load(&self.notices.state);
+        let Some(index) = list.iter().position(|a| a.id == id) else { return };
+        let mut a = list.remove(index);
+        if delete_profile {
+            if let Err(e) = accounts::validate_managed_profile(&a.path()) {
+                self.set_error(crate::tr!(format!("프로필 삭제 경로 확인 실패 ({e})"), format!("Could not verify the profile deletion path ({e})")));
+                return;
+            }
+        }
         if self.connecting.as_ref().is_some_and(|c| c.account_id.as_deref() == Some(id)) {
             self.connecting = None;
         }
@@ -805,23 +1112,60 @@ impl Controller {
                 s.cancel();
             }
         }
-        if self.pending_new.as_ref().is_some_and(|a| a.id == id) {
-            self.drop_unfinished_new();
+        let marked = if delete_profile {
+            match accounts::mark_profile_inactive(&a.path()) {
+                Ok(created) => created,
+                Err(e) => {
+                    self.set_profile_delete_error(&a.path(), &e);
+                    return;
+                }
+            }
+        } else {
+            false
+        };
+        let backup = if a.is_claude() && accounts::link_state(&a) == Link::Linked {
+            match accounts::unlink_with_backup(&mut a) {
+                Ok(backup) => backup,
+                Err(e) => {
+                    if marked {
+                        accounts::unmark_profile(&a.path());
+                    }
+                    self.set_error(crate::tr!(format!("Claude 상태 표시줄 복원 실패 ({e})"), format!("Could not restore the Claude status line ({e})")));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let mut updated = self.notices.state.clone();
+        ui::forget_account_settings(&mut updated, &a);
+        let result = {
+            let _guard = accounts::lock_changes();
+            persist(&mut updated, &list).map(|()| {
+                self.notices.state = updated;
+                ui::clear_usage(&a);
+            })
+        };
+        if let Err(e) = result {
+            if marked {
+                accounts::unmark_profile(&a.path());
+            }
+            let mut message = account_save_error(&e);
+            if let Some(Err(e)) = backup.map(|backup| backup.rollback(&a)) {
+                message.push_str(&crate::tr!(format!(" · Claude 상태 표시줄 재연결 실패 ({e})"), format!(" · Could not restore the live status line ({e})")));
+            }
+            self.set_error(message);
             return;
         }
-        let mut removed: Option<Account> = None;
-        self.edit_accounts(|list| {
-            if let Some(i) = list.iter().position(|a| a.id == id) {
-                let mut a = list.remove(i);
-                if a.is_claude() && accounts::link_state(&a) == Link::Linked {
-                    let _ = accounts::unlink(&mut a);
-                }
-                removed = Some(a);
-            }
-            Ok(())
-        });
-        if let Some(a) = removed {
-            ui::forget_account(&mut self.notices.state, &a);
+        if let Some(snap) = self.snap.as_mut() {
+            snap.retain_current(&list);
+        }
+        self.engine.refresh();
+        self.engine.check_logins();
+        if delete_profile {
+            self.queue_profile_deletion(a.path());
+        } else {
+            self.reload_inactive_profiles();
         }
     }
 
@@ -829,11 +1173,12 @@ impl Controller {
 
     /// 설정 초기화: 계정·로그인은 그대로, 나머지 설정과 그래프별 알림 기준을 기본값으로
     pub fn reset_settings(&mut self) -> Vec<Effect> {
+        let previous = self.notices.state.clone();
         let st = &mut self.notices.state;
         st.0.remove("prefs");
         st.0.remove("alerts");
         st.0.remove("refill_rules");
-        st.save();
+        if !self.save_settings(previous) { return vec![Effect::Push]; }
         crate::i18n::set(crate::i18n::resolve("system"));
         self.engine.refresh();
         // 위젯(표시·위치·모니터·막대), 로고 색, 언어를 플랫폼이 다시 맞춤
@@ -851,8 +1196,9 @@ impl Controller {
     /// - alerts: 알림 켜기·끄기, 리필권 알림(계정별 포함), 그래프별 알림 기준
     /// - general: 화면 테마·언어·로고 색·갱신 주기
     pub fn reset_scope(&mut self, scope: &str) -> Vec<Effect> {
+        let previous = self.notices.state.clone();
         let keys: &[&str] = match scope {
-            "widget" => &["widget", "side", "monitor", "mode", "barPx"],
+            "widget" => &["widget", "side", "monitor", "mode", "barPx", "bars"],
             "alerts" => &["notify", "napNotify", "loginNotify", "refillNotify", "refillLead", "urgent"],
             "general" => &["theme", "locale", "logo", "refresh_minutes", "poll"],
             _ => return Vec::new(),
@@ -867,7 +1213,7 @@ impl Controller {
             st.0.remove("alerts");
             st.0.remove("refill_rules");
         }
-        st.save();
+        if !self.save_settings(previous) { return vec![Effect::Push]; }
         let mut fx = match scope {
             "widget" => vec![Effect::PlatformPref("widget".into())],
             "alerts" => vec![Effect::PlatformPref("urgent".into())],
@@ -906,10 +1252,24 @@ impl Controller {
     }
 
     fn install_update(&mut self) -> Vec<Effect> {
-        match &self.update.staged {
-            Some(p) => vec![Effect::ApplyUpdate(p.clone())],
-            None => self.download_update(true),
+        self.update.manual_install = true;
+        if self.update.staged.is_some() {
+            return self.apply_staged_when_ready(true).into_iter().collect();
         }
+        self.download_update(true)
+    }
+
+    fn apply_staged_when_ready(&mut self, from_button: bool) -> Option<Effect> {
+        if self.update.busy.is_some() || self.platform.managed_update.is_some()
+            || self.busy() || (self.settings_open && !from_button)
+            || !(self.update.manual_install || self.auto_update())
+        {
+            return None;
+        }
+        let path = self.update.staged.take()?;
+        self.update.manual_install = false;
+        self.update.busy = Some("installing");
+        Some(Effect::ApplyUpdate(path))
     }
 
     /// 업데이트 확인 결과 (manual = 사용자가 눌러서 확인)
@@ -922,7 +1282,7 @@ impl Controller {
                 let ver = rel.version.clone();
                 let first = self.update.latest.as_ref().map(|x| &x.version) != Some(&ver);
                 self.update.latest = Some(rel);
-                if self.auto_update() {
+                if self.auto_update() && self.update.staged.is_none() {
                     fx.extend(self.download_update(true));
                 } else if first || manual {
                     let how = self.managed_hint().unwrap_or_else(|| crate::tr!("설정 → 정보에서 업데이트 가능.", "Update from Settings → About.").into());
@@ -948,11 +1308,14 @@ impl Controller {
                 self.update.staged = Some(path.clone());
                 self.update.latest = Some(release);
                 // 설정 창을 보고 있으면 끊지 않고 기다림 (닫을 때 적용)
-                if install && !self.settings_open {
-                    fx.push(Effect::ApplyUpdate(path));
+                if install {
+                    fx.extend(self.apply_staged_when_ready(false));
                 }
             }
-            Err(e) => self.update.error = Some(e),
+            Err(e) => {
+                self.update.manual_install = false;
+                self.update.error = Some(e);
+            }
         }
         fx.push(Effect::Push);
         fx
@@ -960,26 +1323,19 @@ impl Controller {
 
     pub fn update_apply_failed(&mut self, e: String) -> Vec<Effect> {
         self.update.staged = None;
+        self.update.busy = None;
+        self.update.manual_install = false;
         self.update.error = Some(e);
         vec![Effect::Push]
     }
 }
 
-/// 더 쓰지 않는 예전 데이터 정리: 브라우저 연결용 프로필·사용량 파일, 예전 설정 창(WebView2) 데이터
-fn remove_legacy_data() {
-    let dir = config::config_dir();
-    for name in ["browser-profiles", "webview"] {
-        let _ = std::fs::remove_dir_all(dir.join(name));
-    }
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("browser-usage-") && name.ends_with(".json") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
+fn account_save_error(error: &std::io::Error) -> String {
+    crate::tr!(format!("계정 설정 저장 실패 ({error})"), format!("Could not save account settings ({error})"))
+}
+
+fn storage_error(error: &std::io::Error) -> String {
+    crate::tr!(format!("설정 저장 실패 ({error})"), format!("Could not save settings ({error})"))
 }
 
 /// 계정 목록을 ids 순서대로 (ids에 없는 계정은 뒤에, 원래 순서 유지)
@@ -1001,9 +1357,9 @@ mod tests {
     fn seed(c: &mut Controller, ids: &[&str]) {
         let list: Vec<Account> = ids
             .iter()
-            .map(|id| Account { id: id.to_string(), provider: if id.starts_with("codex") { "codex" } else { "claude" }.into(), dir: format!("x/{id}"), label: String::new(), show: true, chain: None })
+            .map(|id| Account { id: id.to_string(), provider: if id.starts_with("codex") { "codex" } else { "claude" }.into(), dir: format!("x/{id}"), label: String::new(), show: true, chain: None, revision: 0, statusline_original: None, identity: None })
             .collect();
-        accounts::save(&mut c.notices.state, &list);
+        accounts::save(&mut c.notices.state, &list).unwrap();
     }
 
     #[test]
@@ -1091,6 +1447,7 @@ mod tests {
                 forecast: None,
                 show: true,
                 email: None,
+                workspace_id: None,
                 plan: None,
                 credits: None,
                 refills: None,
@@ -1098,6 +1455,8 @@ mod tests {
             }],
             logins: Default::default(),
             probes: Default::default(),
+            revisions: Default::default(),
+            claude_statuses: Default::default(),
         };
         let mk = "codex-1:주간";
         ipc(&mut c, json!({"cmd":"threshold","key":mk,"op":"add","new":60}));
@@ -1117,8 +1476,24 @@ mod tests {
         c.handle_ipc(&v.to_string())
     }
 
+    #[test]
+    fn widget_preview_is_requested_only_while_page_is_open() {
+        let mut c = ctl("windows", None);
+        assert!(!c.wants_widget_preview());
+        ipc(&mut c, json!({"cmd":"widgetPreview","visible":true}));
+        assert!(c.wants_widget_preview());
+        ipc(&mut c, json!({"cmd":"widgetPreview","visible":false}));
+        assert!(!c.wants_widget_preview());
+        ipc(&mut c, json!({"cmd":"widgetPreview","visible":true}));
+        c.settings_closed();
+        assert!(!c.wants_widget_preview());
+    }
+
     fn rel(v: &str) -> Release {
-        Release { version: v.into(), page: format!("https://github.com/o/r/releases/tag/v{v}"), notes: String::new(), asset_url: "https://x/a".into(), sha_url: "https://x/a.sha256".into(), sig_url: None }
+        Release {
+            version: v.into(), page: format!("https://github.com/o/r/releases/tag/v{v}"), notes: String::new(), asset_url: "https://x/a".into(),
+            verification: crate::update::Verification::Attachments { sha_url: "https://x/a.sha256".into(), sig_url: None },
+        }
     }
 
     #[test]
@@ -1126,7 +1501,7 @@ mod tests {
         let mut c = ctl("mac", None);
         let st = c.settings_state(&HostInfo::default());
         assert_eq!(st["prefs"]["napNotify"], false, "한도 도달·리셋 알림 기본 꺼짐");
-        assert_eq!(st["prefs"]["loginNotify"], false, "로그인 만료 알림 기본 꺼짐");
+        assert_eq!(st["prefs"]["loginNotify"], true, "로그인 만료 알림 기본 켜짐");
         ipc(&mut c, json!({"cmd": "pref", "key": "napNotify", "value": true}));
         assert_eq!(c.settings_state(&HostInfo::default())["prefs"]["napNotify"], true);
         assert!(accounts::load(c.state()).is_empty(), "처음엔 연결된 계정이 없음");
@@ -1135,32 +1510,99 @@ mod tests {
     }
 
     #[test]
-    fn claude_accounts_are_linked_by_default() {
-        let dir = std::env::temp_dir().join(format!("usagi-autolink-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.json"), r#"{"model":"opus","statusLine":{"type":"command","command":"mine.sh"}}"#).unwrap();
+    fn claude_live_updates_are_opt_in_and_disconnect_preserves_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = json!({"model":"opus","statusLine":{"type":"command","command":"mine.sh","padding":7}});
+        std::fs::write(&path, original.to_string()).unwrap();
+        let local_history = dir.path().join("local-history");
+        std::fs::write(&local_history, "keep").unwrap();
         let mut c = ctl("windows", None);
-        // 실제 폴더가 있는 Claude 계정 하나, 폴더가 없는 가짜 계정들
         seed(&mut c, &["claude-9", "codex-1"]);
         let mut list = accounts::load(c.state());
-        list[0].dir = dir.to_string_lossy().into();
-        accounts::save(&mut c.notices.state, &list);
+        list[0].dir = dir.path().to_string_lossy().into();
+        accounts::save(&mut c.notices.state, &list).unwrap();
         c.startup();
-        let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original.to_string());
+        ipc(&mut c, json!({"cmd": "linkStatusline", "id": "claude-9"}));
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("statusline --account claude-9"), "{text}");
-        assert!(text.contains("\"model\""), "다른 설정은 그대로");
-        let acc = accounts::load(c.state()).into_iter().find(|a| a.id == "claude-9").unwrap();
-        assert_eq!(acc.chain.as_deref(), Some("mine.sh"), "원래 상태 표시줄은 기억");
-        // 화면에서 보내는 연결·해제 명령은 더는 없음
-        let before = std::fs::read_to_string(dir.join("settings.json")).unwrap();
-        ipc(&mut c, json!({"cmd": "unlink", "id": "claude-9"}));
-        assert_eq!(std::fs::read_to_string(dir.join("settings.json")).unwrap(), before);
-        // 계정을 지우면 원래 상태 표시줄로 되돌림
+        ipc(&mut c, json!({"cmd": "unlinkStatusline", "id": "claude-9"}));
+        let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read(), original);
+        ipc(&mut c, json!({"cmd": "removeProfile", "id": "claude-9"}));
+        assert!(accounts::load(c.state()).iter().any(|a| a.id == "claude-9"));
+        ipc(&mut c, json!({"cmd": "linkStatusline", "id": "claude-9"}));
         ipc(&mut c, json!({"cmd": "remove", "id": "claude-9"}));
-        let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
-        assert!(text.contains("mine.sh") && !text.contains("statusline --account"), "{text}");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read(), original);
+        assert_eq!(std::fs::read_to_string(&local_history).unwrap(), "keep");
+        assert!(!accounts::load(c.state()).iter().any(|a| a.id == "claude-9"));
+    }
+
+    #[test]
+    fn cancel_removes_a_nonempty_pending_profile_and_saved_profiles_can_be_cleaned_up() {
+        let mut c = ctl("windows", None);
+        let saved = accounts::create_profile("codex", &[]).unwrap();
+        let pending = accounts::create_profile("codex", std::slice::from_ref(&saved)).unwrap();
+        accounts::unmark_profile(&saved.path());
+        for acc in [&saved, &pending] {
+            std::fs::write(acc.path().join("history.json"), "fixture").unwrap();
+        }
+        c.pending_new = Some(pending.clone());
+        c.settings_opened();
+        let listed = |c: &Controller, acc: &Account| c.settings_state(&HostInfo::default())["inactiveProfiles"]
+            .as_array().unwrap().iter().any(|name| name.as_str() == Some(&acc.id));
+        let wait_for_cleanup = |c: &mut Controller| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !c.deleted_profiles.is_empty() && std::time::Instant::now() < end {
+                c.poll_profile_deletions();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(c.deleted_profiles.is_empty());
+        };
+        assert!(!listed(&c, &pending));
+        assert!(listed(&c, &saved));
+        assert!(accounts::profile_is_marked(&pending.path()));
+        let primary = Account { dir: "fixture-primary".into(), ..saved.clone() };
+        let candidates = crate::fallback::candidates(&primary, &[]);
+        assert!(candidates.contains(&saved.path()));
+        assert!(!candidates.contains(&pending.path()));
+        ipc(&mut c, json!({"cmd":"removeInactiveProfile", "id":pending.id}));
+        assert!(pending.path().exists());
+
+        ipc(&mut c, json!({"cmd":"loginCancel"}));
+        wait_for_cleanup(&mut c);
+        assert!(!pending.path().exists());
+        assert!(saved.path().join("history.json").exists());
+        assert!(listed(&c, &saved));
+
+        ipc(&mut c, json!({"cmd":"removeInactiveProfile", "id":saved.id}));
+        wait_for_cleanup(&mut c);
+        assert!(!saved.path().exists());
+        assert!(!listed(&c, &saved));
+    }
+
+    #[test]
+    fn profile_deletion_stops_and_restores_the_live_link_if_account_save_fails() {
+        let mut c = ctl("windows", None);
+        let mut a = accounts::create_profile("claude", &[]).unwrap();
+        let dir = a.path();
+        accounts::unmark_profile(&dir);
+        std::fs::write(dir.join("history.json"), "keep").unwrap();
+        let settings = dir.join("settings.json");
+        std::fs::write(&settings, r#"{"statusLine":{"type":"command","command":"use-local","padding":9}}"#).unwrap();
+        accounts::link(&mut a, &std::env::current_exe().unwrap()).unwrap();
+        let linked = std::fs::read_to_string(&settings).unwrap();
+        accounts::save(&mut c.notices.state, std::slice::from_ref(&a)).unwrap();
+
+        c.remove_account(&a.id, true, |_, _| Err(std::io::ErrorKind::PermissionDenied.into()));
+        assert!(c.error().is_some());
+        assert!(c.deleted_profiles.is_empty());
+        assert_eq!(accounts::load(c.state()), vec![a]);
+        assert_eq!(std::fs::read_to_string(dir.join("history.json")).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(settings).unwrap(), linked);
+        assert!(!accounts::profile_is_marked(&dir));
+        accounts::delete_managed_profile(&dir).unwrap();
     }
 
     #[test]
@@ -1276,6 +1718,20 @@ mod tests {
     }
 
     #[test]
+    fn widget_bars_can_be_turned_off() {
+        let mut c = ctl("windows", None);
+        let host = HostInfo { widget_preview: Some(json!({"keep": true})), ..HostInfo::default() };
+        assert_eq!(c.settings_state(&host)["prefs"]["bars"], true, "기본은 막대 표시");
+        assert_eq!(c.settings_state(&host)["widgetPreview"]["keep"], true, "미리 보기는 그대로 전달");
+        let fx = ipc(&mut c, json!({"cmd": "pref", "key": "bars", "value": false}));
+        assert!(fx.contains(&Effect::PlatformPref("bars".into())) && fx.contains(&Effect::Push));
+        assert_eq!(c.settings_state(&host)["prefs"]["bars"], false);
+        // 위젯 페이지 초기화로 되돌아옴
+        ipc(&mut c, json!({"cmd": "resetPrefs", "scope": "widget"}));
+        assert_eq!(c.settings_state(&host)["prefs"]["bars"], true);
+    }
+
+    #[test]
     fn bar_length_is_pixels_with_a_default() {
         let mut c = ctl("windows", None);
         let host = HostInfo { bar_range: Some((75.0, 77.0, 240.0)), ..HostInfo::default() };
@@ -1354,7 +1810,7 @@ mod tests {
 
     #[test]
     fn same_state_shape_on_every_platform() {
-        let win = ctl("windows", None).settings_state(&HostInfo { autostart: true, urgent_supported: true, urgent_allowed: Some(false), monitors: vec![json!({"id": "D1", "label": "모니터 1"})], taskbar_light: Some(true), bar_range: None });
+        let win = ctl("windows", None).settings_state(&HostInfo { autostart: true, urgent_supported: true, urgent_allowed: Some(false), monitors: vec![json!({"id": "D1", "label": "모니터 1"})], taskbar_light: Some(true), bar_range: None, widget_preview: None });
         assert_eq!(win["taskbarLight"], true);
         let mac = ctl("mac", None).settings_state(&HostInfo::default());
         assert_eq!(win["platform"], "windows");
@@ -1380,6 +1836,17 @@ mod tests {
         assert_eq!(c.settings_closed(), vec![Effect::ApplyUpdate(PathBuf::from("new"))]);
         c.update_apply_failed("x".into());
         assert_eq!(c.settings_state(&HostInfo::default())["update"]["status"], "error");
+    }
+
+    #[test]
+    fn auto_update_respects_changes_after_download_started() {
+        let mut c = ctl("windows", None);
+        c.update_checked(Ok(Some(rel("9.0.0"))), false);
+        c.set_pref("autoUpdate", json!(false));
+        let effects = c.update_downloaded(rel("9.0.0"), Ok(PathBuf::from("new")), true);
+        assert!(!effects.iter().any(|e| matches!(e, Effect::ApplyUpdate(_))));
+        let effects = ipc(&mut c, json!({"cmd": "installUpdate"}));
+        assert!(effects.contains(&Effect::ApplyUpdate(PathBuf::from("new"))));
     }
 
     #[test]

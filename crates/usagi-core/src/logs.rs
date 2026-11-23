@@ -275,12 +275,15 @@ fn fnv(parts: &[&[u8]]) -> u64 {
     h
 }
 
-const CHUNK: usize = 8 * 1024 * 1024;
+const CHUNK: usize = 64 * 1024;
+const MAX_LINE: usize = 8 * 1024 * 1024;
 
 pub struct LogReader {
     pub roots: Vec<PathBuf>,
     pub history_days: f64,
     offsets: HashMap<PathBuf, u64>,
+    discarding: std::collections::HashSet<PathBuf>,
+    connected_at: f64,
     index: HashMap<u64, usize>,
     events: Vec<UsageEvent>,
     limits: HashMap<(i64, LimitKind), LimitEvent>,
@@ -296,8 +299,10 @@ impl LogReader {
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Self {
             roots,
-            history_days: 60.0,
+            history_days: 8.0,
             offsets: HashMap::new(),
+            discarding: Default::default(),
+            connected_at: 0.0,
             index: HashMap::new(),
             events: Vec::new(),
             limits: HashMap::new(),
@@ -308,10 +313,15 @@ impl LogReader {
         }
     }
 
+    pub(crate) fn for_connection(roots: Vec<PathBuf>, revision: u64) -> Self {
+        Self { connected_at: revision as f64 / 1_000_000.0, ..Self::new(roots) }
+    }
+
     /// 새 줄을 읽습니다. 새 데이터가 있었으면 true.
     pub fn poll(&mut self) -> bool {
         let now = time::now();
-        let cutoff = now - self.history_days * DAY;
+        let cutoff = (now - self.history_days * DAY).max(self.connected_at);
+        let activity_cutoff = now - crate::tracker::LONG_IDLE;
         // 폴더 전체는 가끔만 훑고, 그 사이엔 최근에 바뀐 파일만 확인
         let full = now - self.last_full >= FULL_SCAN_SECS;
         let files = if full {
@@ -319,6 +329,9 @@ impl LogReader {
             for root in &self.roots {
                 walk_files(root, "jsonl", &mut files);
             }
+            let present: std::collections::HashSet<_> = files.iter().collect();
+            self.offsets.retain(|path, _| present.contains(path));
+            self.discarding.retain(|path| present.contains(path));
             self.last_full = now;
             self.hot.clear();
             files
@@ -334,28 +347,28 @@ impl LogReader {
                 self.hot.push(path.clone());
             }
             let known = self.offsets.get(&path).copied();
-            if known.is_none() {
-                if mtime < cutoff {
-                    self.offsets.insert(path, size); // 오래된 파일은 건너뜀
-                    continue;
-                }
+            if known.is_none() && mtime < cutoff {
+                continue;
             }
             let mut offset = known.unwrap_or(0);
             if size < offset {
                 offset = 0; // 파일이 다시 쓰였음
+                self.discarding.remove(&path);
             }
             if size == offset {
                 continue;
             }
-            let new_offset = self.read_from(&path, offset, cutoff);
+            let new_offset = self.read_from(&path, offset, cutoff, activity_cutoff);
             if new_offset != offset {
                 self.offsets.insert(path, new_offset);
                 changed = true;
             }
         }
+        if full {
+            changed |= self.prune(cutoff, activity_cutoff);
+        }
         if changed {
             self.dirty = true;
-            self.prune(cutoff);
         }
         changed
     }
@@ -375,12 +388,14 @@ impl LogReader {
         v
     }
 
-    fn read_from(&mut self, path: &Path, offset: u64, cutoff: f64) -> u64 {
+    fn read_from(&mut self, path: &Path, offset: u64, cutoff: f64, activity_cutoff: f64) -> u64 {
         let Ok(mut f) = File::open(path) else { return offset };
         if f.seek(SeekFrom::Start(offset)).is_err() {
             return offset;
         }
-        let mut pos = offset; // 완전한 줄까지만 소비한 위치
+        let mut pos = offset;
+        let mut read_at = offset;
+        let mut discard = self.discarding.contains(path);
         let mut pending: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; CHUNK];
         loop {
@@ -388,20 +403,32 @@ impl LogReader {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            pending.extend_from_slice(&buf[..n]);
-            let Some(last_nl) = memchr::memrchr(b'\n', &pending) else { continue };
-            for line in pending[..last_nl].split(|&b| b == b'\n') {
-                if !line.is_empty() {
-                    self.handle_line(line, cutoff);
+            for piece in buf[..n].split_inclusive(|&b| b == b'\n') {
+                read_at += piece.len() as u64;
+                let complete = piece.last() == Some(&b'\n');
+                if !discard && pending.len() + piece.len() <= MAX_LINE {
+                    pending.extend_from_slice(piece);
+                    if complete {
+                        self.handle_line(&pending[..pending.len() - 1], cutoff, activity_cutoff);
+                    }
+                } else {
+                    discard = true;
+                    pending.clear();
+                }
+                if complete || discard {
+                    pos = read_at;
+                }
+                if complete {
+                    pending.clear();
+                    discard = false;
                 }
             }
-            pos += (last_nl + 1) as u64;
-            pending.drain(..=last_nl);
         }
+        if discard { self.discarding.insert(path.to_owned()); } else { self.discarding.remove(path); }
         pos // 덜 쓰인 마지막 줄은 다음 poll에서 다시 읽음
     }
 
-    fn handle_line(&mut self, line: &[u8], cutoff: f64) {
+    fn handle_line(&mut self, line: &[u8], cutoff: f64, activity_cutoff: f64) {
         if memmem::find(line, b"\"assistant\"").is_none() {
             return;
         }
@@ -441,8 +468,11 @@ impl LogReader {
             }
         }
 
+        if ts < activity_cutoff { return; }
         let Some(usage) = msg.usage else { return };
-        let tokens = usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0) + usage.cache_creation_input_tokens.unwrap_or(0);
+        let tokens = usage.input_tokens.unwrap_or(0)
+            .saturating_add(usage.output_tokens.unwrap_or(0))
+            .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
         if tokens == 0 {
             return;
         }
@@ -467,22 +497,24 @@ impl LogReader {
         }
     }
 
-    fn prune(&mut self, cutoff: f64) {
-        if self.events.len() < 50_000 {
-            return;
+    fn prune(&mut self, cutoff: f64, activity_cutoff: f64) -> bool {
+        let before = self.limits.len();
+        self.limits.retain(|_, l| l.ts >= cutoff);
+        if self.events.iter().all(|event| event.ts >= activity_cutoff) {
+            return before != self.limits.len();
         }
         let mut keep = Vec::with_capacity(self.events.len());
         let mut remap = HashMap::new();
         for (key, &i) in &self.index {
             let e = self.events[i];
-            if e.ts >= cutoff {
+            if e.ts >= activity_cutoff {
                 remap.insert(*key, keep.len());
                 keep.push(e);
             }
         }
         self.events = keep;
         self.index = remap;
-        self.limits.retain(|_, l| l.ts >= cutoff);
+        true
     }
 }
 
@@ -531,8 +563,8 @@ mod tests {
 
     #[test]
     fn incremental_dedup_partial_and_limits() {
-        let dir = std::env::temp_dir().join(format!("usagi-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let fixture = tempfile::tempdir().unwrap();
+        let dir = fixture.path().to_path_buf();
         std::fs::create_dir_all(dir.join("proj")).unwrap();
         let p = dir.join("proj").join("s.jsonl");
         let now = time::now();
@@ -568,6 +600,5 @@ mod tests {
         assert_eq!(limits[0].kind, LimitKind::Session);
         assert!(limits[0].reset_at.is_some());
         assert_eq!(r.usage_events().len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
