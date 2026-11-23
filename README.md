@@ -54,10 +54,10 @@ curl -fsSL https://raw.githubusercontent.com/Ba-koD/usAgI/main/scripts/install-m
 
 | 측정 환경 | 다운로드 크기¹ | 앱 메모리 부담² | 전체 상주 메모리³ | 대기 CPU 시간⁴ |
 | --- | ---: | ---: | ---: | ---: |
-| Windows 11 · 작업 표시줄 위젯 | **약 14.1 MB** | **3.72 MB** | 23.21 MB | 335 ms/분 |
-| macOS · 메뉴 막대 | **약 23.5 MB** | **16.55 MB** | 79.79 MB | 1.57 ms/분 |
+| Windows 11 · 작업 표시줄 위젯 | **약 10.3 MB** | **3.72 MB** | 23.21 MB | 335 ms/분 |
+| macOS · 메뉴 막대 | **약 17.6 MB** | **16.55 MB** | 79.79 MB | 1.57 ms/분 |
 
-¹ **작을수록 다운로드 부담이 적습니다.** 출시용 형식으로 묶은 테스트 빌드의 크기입니다. Windows는 `usagi.exe`, macOS는 Apple Silicon과 Intel을 모두 포함한 `usAgI-mac.zip`입니다.
+¹ **작을수록 다운로드 부담이 적습니다.** 0.4.1 릴리스 첨부 파일 기준입니다. Windows는 `usagi.exe`, macOS는 Apple Silicon과 Intel을 모두 포함한 `usAgI-mac.zip`입니다.
 
 ² **작을수록 앱의 메모리 부담이 적습니다.** Windows는 **전용 작업 집합**, macOS는 **Physical Footprint**입니다.
 
@@ -65,7 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/Ba-koD/usAgI/main/scripts/install-m
 
 ⁴ **같은 기기와 조건에서 작을수록 좋습니다.** 본체 프로세스가 사용한 CPU 시간을 1분 기준으로 환산했습니다.
 
-대기 수치는 설정 창을 닫고 위젯 또는 메뉴 막대를 켠 상태에서, 같은 테스트 계정 2개와 로그 3,001개로 130초씩 두 번 측정했습니다. 정기 사용량 조회와 업데이트 확인은 대기시켰으며, 메모리는 1초 간격 샘플의 중앙값입니다.
+대기 수치는 0.4.0 테스트 빌드에서 측정했습니다. 설정 창을 닫고 위젯 또는 메뉴 막대를 켠 상태에서, 같은 테스트 계정 2개와 로그 3,001개로 130초씩 두 번 측정했습니다. 정기 사용량 조회와 업데이트 확인은 대기시켰으며, 메모리는 1초 간격 샘플의 중앙값입니다.
 
 ## 사용량 갱신과 업데이트
 
