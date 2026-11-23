@@ -9,12 +9,27 @@ mod title;
 #[cfg(target_os = "macos")]
 mod updater;
 
+#[cfg(target_os = "macos")]
+fn settings_program() -> std::io::Result<usagi_core::settings_window::SettingsProgram> {
+    let exe = std::env::current_exe()?.with_file_name("usagi-settings");
+    Ok(usagi_core::settings_window::SettingsProgram::new(exe))
+}
+
 fn main() {
     #[cfg(target_os = "macos")]
     {
         let args: Vec<String> = std::env::args().collect();
         match args.get(1).map(String::as_str) {
-            Some(usagi_settings::SETTINGS_ARG) => usagi_settings::main_window(),
+            Some("--settings-ui") => {
+                match settings_program().and_then(usagi_core::settings_window::SettingsProgram::run) {
+                    Ok(status) if !status.success() => std::process::exit(status.code().unwrap_or(1)),
+                    Ok(_) => {}
+                    Err(error) => {
+                        println!("{}", serde_json::json!({"cmd":"settingsError","error":error.to_string()}));
+                        std::process::exit(1);
+                    }
+                }
+            }
             // Claude Code 상태 표시줄 (실시간 연결)
             Some("statusline") => statusline(&args),
             // 빌드 스크립트용: 앱 아이콘(.iconset) PNG 만들기

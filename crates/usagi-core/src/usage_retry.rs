@@ -11,12 +11,19 @@ const DEFAULT_DELAY: Duration = Duration::from_secs(5 * 60);
 const MAX_DELAY: Duration = Duration::from_secs(60 * 60);
 const RETRY_FILE: &str = "usage-retries.json";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageMode {
+    WithCli,
+    ApiOnly,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum UsageError {
     Failed(String),
     RateLimited(f64),
     Deferred,
     Busy,
+    NoApiSession,
     ProfileChanged,
     IdentityChanged,
 }
@@ -27,7 +34,7 @@ impl UsageError {
     }
 
     pub fn attempted(&self) -> bool {
-        !matches!(self, Self::Deferred | Self::Busy)
+        !matches!(self, Self::Deferred | Self::Busy | Self::NoApiSession)
     }
 
     pub fn auth_recheck(&self) -> bool {
@@ -44,6 +51,7 @@ impl fmt::Display for UsageError {
                 "Usage checks are rate limited"
             ),
             Self::Busy => crate::tr!("사용량 확인 중", "Usage check in progress"),
+            Self::NoApiSession => crate::tr!("사용량 API 로그인 없음", "No usage API session"),
             Self::ProfileChanged => crate::tr!("Claude 대체 프로필 인증 변경 · 다시 확인 중", "Claude backup profile sign-in changed · Rechecking"),
             Self::IdentityChanged => crate::tr!("프로필 계정 변경 · 다시 연결 필요", "Profile account changed · Reconnect required"),
         })

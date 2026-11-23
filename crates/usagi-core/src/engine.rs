@@ -9,11 +9,12 @@
 use crate::accounts::{self, Account};
 use crate::bridge::{self, BridgeFile, BridgeWindow};
 use crate::usage_cmd;
-use crate::usage_retry::{self, UsageError};
+use crate::usage_retry::{self, UsageError, UsageMode};
 use crate::codex::{self, CodexReader, CodexSnapshot};
 use crate::config::{self, Config, State};
 use crate::fallback;
 use crate::login::LoginStatus;
+use crate::log_watch::{self, Changes, Interests, LogWatch};
 use crate::logs::LogReader;
 
 use crate::texts;
@@ -23,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 기본 갱신 주기(분). 설정: 1 / 3 / 5 / 10 / 15
 pub const DEFAULT_REFRESH_MIN: f64 = 5.0;
@@ -184,6 +185,46 @@ fn next_usage_at(tried: f64, live_at: Option<f64>, interval_min: f64) -> f64 {
     live_at.filter(|at| *at > tried + 5.0).map_or(regular, |at| {
         regular.max((tried + gap * LIVE_STRETCH - 5.0).min(at + gap))
     })
+}
+
+fn scheduled_usage_at(
+    regular_at: f64,
+    resets: &[f64],
+    checked_through: f64,
+    now: f64,
+) -> (f64, UsageMode) {
+    let reset_at = resets.iter().copied()
+        .filter(|at| at.is_finite() && *at > checked_through)
+        .fold(f64::INFINITY, f64::min);
+    if regular_at > now && reset_at < regular_at {
+        (reset_at, UsageMode::ApiOnly)
+    } else {
+        (regular_at, UsageMode::WithCli)
+    }
+}
+
+fn checked_quota_through(
+    started: f64,
+    finished: f64,
+    mut reported_resets: impl Iterator<Item = f64>,
+) -> f64 {
+    // A request that straddled a reset may still return the expired window.
+    if reported_resets.any(|at| at > started && at <= finished) {
+        started
+    } else {
+        finished
+    }
+}
+
+fn claude_reset_times(file: &BridgeFile) -> impl Iterator<Item = f64> + '_ {
+    file.five_hour.into_iter()
+        .chain(file.seven_day.filter(|_| !file.weekly_unavailable))
+        .chain(file.models.iter().map(|model| model.window))
+        .filter_map(|window| window.resets_at)
+}
+
+fn codex_reset_times(snapshot: &CodexSnapshot) -> impl Iterator<Item = f64> + '_ {
+    snapshot.windows.iter().filter_map(|window| window.resets_at)
 }
 
 /// Claude 확인 요청을 보낼지. 5시간 창은 첫 요청부터 시작하므로 창이 닫혀 있으면 자동으로 보내지 않음
@@ -551,8 +592,9 @@ impl Notices {
 struct ClaudeSource {
     acc: Account,
     reader: LogReader,
+    usage_path: PathBuf,
+    usage: Option<BridgeFile>,
     tracker: Tracker,
-    need_update: bool,
     /// 정확한 값 기록 (낮잠 예보용)
     five: Vec<Reading>,
     seven: Vec<Reading>,
@@ -562,6 +604,15 @@ struct ClaudeSource {
 struct CodexSource {
     acc: Account,
     reader: CodexReader,
+    usage_path: PathBuf,
+    usage: Option<CodexSnapshot>,
+}
+
+impl CodexSource {
+    fn latest(&self) -> Option<&CodexSnapshot> {
+        // The execution log wins when its timestamp matches the saved API response.
+        self.usage.iter().chain(self.reader.snapshot.iter()).max_by(|a, b| a.ts.total_cmp(&b.ts))
+    }
 }
 
 struct Sources {
@@ -607,9 +658,10 @@ impl Sources {
                     }
                     claude.push(ClaudeSource {
                         acc: acc.clone(),
-                        reader: LogReader::for_connection(roots, acc.revision),
+                        reader: LogReader::for_connection(roots.into_iter().map(log_watch::watch_path).collect(), acc.revision),
+                        usage_path: log_watch::watch_path(bridge::path(&acc.usage_key())),
+                        usage: None,
                         tracker: Tracker::new(),
-                        need_update: true,
                         five: Vec::new(),
                         seven: Vec::new(),
                         last_seen: 0.0,
@@ -622,15 +674,81 @@ impl Sources {
                             // 대체 폴더의 로그에는 워크스페이스 정보가 없어 내려받은 값만 표시.
                             Vec::new()
                         } else {
-                            vec![acc.path().join("sessions"), acc.path().join("archived_sessions")]
+                            ["sessions", "archived_sessions"].into_iter()
+                                .map(|sub| log_watch::watch_path(acc.path().join(sub))).collect()
                         },
                         acc.revision,
                     ),
+                    usage_path: log_watch::watch_path(codex::saved_path(&acc.usage_key())),
+                    usage: None,
                 }),
                 _ => {}
             }
         }
         Sources { claude, codex, order: accounts.iter().map(|a| a.id.clone()).collect(), accounts: accounts.to_vec() }
+    }
+
+    fn watch_interests(&self) -> Interests {
+        Interests {
+            logs: self.claude.iter().flat_map(|s| &s.reader.roots)
+                .chain(self.codex.iter().flat_map(|s| &s.reader.roots)).cloned().collect(),
+            usage: self.claude.iter().map(|s| &s.usage_path)
+                .chain(self.codex.iter().map(|s| &s.usage_path)).cloned().collect(),
+        }
+    }
+
+    fn read_changes(&mut self, changes: &Changes) {
+        for src in &mut self.claude {
+            let paths = changes.log_paths(&src.reader.roots);
+            let mut changed = !paths.is_empty() && src.reader.update_paths(paths);
+            if changes.needs_scan(&src.reader.roots) {
+                changed |= src.reader.rescan();
+            }
+            if changed {
+                let limits = src.reader.limit_events();
+                src.tracker.update(src.reader.usage_events(), limits);
+            }
+            if changes.rescan || changes.paths.contains_key(&src.usage_path) {
+                src.usage = bridge::read(&src.acc.usage_key());
+            }
+        }
+        for src in &mut self.codex {
+            let paths = changes.log_paths(&src.reader.roots);
+            if !paths.is_empty() {
+                src.reader.update_paths(paths);
+            }
+            if changes.needs_scan(&src.reader.roots) {
+                src.reader.rescan();
+            }
+            if changes.rescan || changes.paths.contains_key(&src.usage_path) {
+                src.usage = codex::load(&src.acc.usage_key());
+            }
+        }
+    }
+
+    fn rescan(&mut self) {
+        self.read_changes(&Changes { rescan: true, ..Changes::default() });
+    }
+
+    fn usage_saved(&mut self, key: &str) {
+        for src in self.claude.iter_mut().filter(|s| s.acc.usage_key() == key) {
+            src.usage = bridge::read(key);
+        }
+        for src in self.codex.iter_mut().filter(|s| s.acc.usage_key() == key) {
+            src.usage = codex::load(key);
+        }
+    }
+
+    fn reset_times(&self) -> HashMap<String, Vec<f64>> {
+        let claude = self.claude.iter().filter_map(|src| {
+            let file = src.usage.as_ref()?;
+            Some((src.acc.usage_key(), claude_reset_times(file).collect()))
+        });
+        let codex = self.codex.iter().filter_map(|src| {
+            let latest = src.latest()?;
+            Some((src.acc.usage_key(), codex_reset_times(latest).collect()))
+        });
+        claude.chain(codex).collect()
     }
 
     fn snapshot(&mut self, cfg: &Config) -> Snapshot {
@@ -640,14 +758,9 @@ impl Sources {
         let mut claude_statuses = HashMap::new();
         let mut rabbit: Option<(bool, Status)> = None;
         for src in &mut self.claude {
-            if src.reader.poll() || src.need_update {
-                let limits = src.reader.limit_events();
-                src.tracker.update(src.reader.usage_events(), limits);
-                src.need_update = false;
-            }
             let mut st = src.tracker.status(now);
-            let file = bridge::read(&src.acc.usage_key());
-            if let Some(b) = &file {
+            let file = src.usage.as_ref();
+            if let Some(b) = file {
                 apply_exact(&mut st, b, tired);
                 // 새 값이 들어오면 예보용 기록에 추가 (최근 8시간)
                 if b.updated_at > src.last_seen {
@@ -667,9 +780,9 @@ impl Sources {
                 );
                 st.mood = mood_of(&st, tired);
             }
-            let mut view = claude_view(&src.acc, &st, file.as_ref());
-            view.extra = file.as_ref().and_then(|b| b.spend.as_ref().map(|s| s.label()).or_else(|| b.extra.clone()));
-            if let Some(b) = file.as_ref().filter(|_| st.exact) {
+            let mut view = claude_view(&src.acc, &st, file);
+            view.extra = file.and_then(|b| b.spend.as_ref().map(|s| s.label()).or_else(|| b.extra.clone()));
+            if let Some(b) = file.filter(|_| st.exact) {
                 for m in &b.models {
                     view.meters.push(Meter {
                         label: format!("{} 주간", m.name),
@@ -690,24 +803,16 @@ impl Sources {
                 rabbit = Some((src.acc.show, st));
             }
         }
-        for src in &mut self.codex {
-            src.reader.poll();
+        for src in &self.codex {
             // 로그 값과 직접 조회 값 중 최신
-            let live = codex::load(&src.acc.usage_key());
-            let best = match (&src.reader.snapshot, &live) {
-                (Some(a), Some(b)) if a.ts >= b.ts => {
-                    let mut s = a.clone();
-                    s.email = s.email.or(b.email.clone());
-                    s.workspace_id = s.workspace_id.or(b.workspace_id.clone());
-                    s.plan = s.plan.or(b.plan.clone());
-                    s.credits = s.credits.or(b.credits.clone());
-                    s.refills = s.refills.or(b.refills.clone());
-                    Some(s)
+            if let Some(mut s) = src.latest().cloned() {
+                if let Some(cache) = &src.usage {
+                    s.email = s.email.or_else(|| cache.email.clone());
+                    s.workspace_id = s.workspace_id.or_else(|| cache.workspace_id.clone());
+                    s.plan = s.plan.or_else(|| cache.plan.clone());
+                    s.credits = s.credits.or_else(|| cache.credits.clone());
+                    s.refills = s.refills.or_else(|| cache.refills.clone());
                 }
-                (Some(_), Some(b)) => Some(b.clone()),
-                (a, b) => a.clone().or(b.clone()),
-            };
-            if let Some(s) = best {
                 providers.push(codex_view(&src.acc, &s, now));
             }
         }
@@ -750,12 +855,15 @@ enum Cmd {
     Refresh,
     /// 다시 읽지 않고 스냅숏만 곧바로 다시 계산
     Poke,
+    FilesChanged,
+    UsageSaved(String),
     Stop,
 }
 
 enum ProbeCommand {
     Request(Option<String>),
-    Finished(String, Result<(), UsageError>, Option<f64>, f64),
+    ResetTimes(HashMap<String, Vec<f64>>),
+    Finished(String, Result<f64, UsageError>, Option<f64>, f64),
     Stop,
 }
 
@@ -767,7 +875,6 @@ pub struct Engine {
     probe_tx: Sender<ProbeCommand>,
 }
 
-/// 로컬 기록은 서버 요청이 아니므로 짧게(3초) 다시 읽음
 /// 바뀐 게 없어도 이 간격으로는 화면에 알림 (남은 시간 글자 갱신용)
 const QUIET_SECS: f64 = 30.0;
 
@@ -899,6 +1006,10 @@ impl Engine {
                 .name("usagi-probe".into())
                 .spawn(move || {
                     let mut wait = Duration::from_secs(5); // 처음엔 로그인 상태 확인만 기다렸다가 바로
+                    let started = time::now();
+                    let initial_at = started + wait.as_secs_f64();
+                    let mut reset_times = HashMap::new();
+                    let mut checked_through = HashMap::new();
                     let mut auth_rechecks = HashMap::new();
                     let mut running = HashSet::new();
                     let mut forced = Vec::new();
@@ -915,8 +1026,10 @@ impl Engine {
                                 ProbeCommand::Request(None) => force_all = true,
                                 ProbeCommand::Request(Some(id)) if !forced.contains(&id) => forced.push(id),
                                 ProbeCommand::Request(Some(_)) => {}
+                                ProbeCommand::ResetTimes(times) => reset_times = times,
                                 ProbeCommand::Finished(key, result, live_at, interval) => {
                                     running.remove(&key);
+                                    let saved = result.is_ok();
                                     let logged_in = logins.lock().ok().and_then(|g| g.get(&key).and_then(|l| l.logged_in));
                                     if matches!(result, Err(UsageError::ProfileChanged | UsageError::IdentityChanged))
                                         || (result.is_ok() && logged_in != Some(true))
@@ -930,15 +1043,16 @@ impl Engine {
                                         }
                                     }
                                     let now = time::now();
+                                    checked_through.insert(key.clone(), result.as_ref().copied().unwrap_or(now));
                                     let retry = usage_retry::deadline(&key).filter(|at| *at > now)
                                         .or_else(|| matches!(result, Err(UsageError::Busy)).then_some(now + 1.0));
                                     if let Ok(mut states) = probes.lock() {
                                         if let Some(probe) = states.get_mut(&key) {
-                                            probe.finished(result, now, retry);
+                                            probe.finished(result.map(|_| ()), now, retry);
                                             probe.next_at = probe.tried_at.map(|at| next_usage_at(at, live_at, interval));
                                         }
                                     }
-                                    let _ = poke.send(Cmd::Poke);
+                                    let _ = poke.send(if saved { Cmd::UsageSaved(key) } else { Cmd::Poke });
                                 }
                             }
                         }
@@ -954,6 +1068,7 @@ impl Engine {
                         forced.retain(|id| list.iter().any(|account| &account.id == id));
                         let keys: HashSet<_> = list.iter().map(Account::usage_key).collect();
                         auth_rechecks.retain(|key, _| keys.contains(key));
+                        checked_through.retain(|key, _| keys.contains(key));
                         if let Ok(mut g) = probes.lock() {
                             g.retain(|key, _| keys.contains(key));
                         }
@@ -980,6 +1095,10 @@ impl Engine {
                                 continue;
                             }
                             let now = time::now();
+                            if !force && now < initial_at {
+                                next_retry = next_retry.min(initial_at);
+                                continue;
+                            }
                             if let Some(at) = retry_at.filter(|at| *at > now) {
                                 next_retry = next_retry.min(at);
                                 let changed = probes.lock().ok().is_some_and(|mut g| {
@@ -1005,8 +1124,15 @@ impl Engine {
                                 _ if force || retry_at.is_some() => None,
                                 _ => continue,
                             };
-                            if !force && retry_at.is_none() {
-                                if let Some(at) = tried.map(|tried| next_usage_at(tried, live_at, interval)).filter(|at| *at > now) {
+                            let mode = if !force && retry_at.is_none() {
+                                let regular_at = tried.map_or(now, |tried| next_usage_at(tried, live_at, interval));
+                                let (at, mode) = scheduled_usage_at(
+                                    regular_at,
+                                    reset_times.get(&key).map_or(&[], Vec::as_slice),
+                                    checked_through.get(&key).copied().unwrap_or(started),
+                                    now,
+                                );
+                                if at > now {
                                     next_retry = next_retry.min(at);
                                     let changed = probes.lock().ok().is_some_and(|mut g| {
                                         let p = g.entry(key.clone()).or_default();
@@ -1019,7 +1145,10 @@ impl Engine {
                                     }
                                     continue;
                                 }
-                            }
+                                mode
+                            } else {
+                                UsageMode::WithCli
+                            };
                             if let Ok(mut g) = probes.lock() {
                                 g.entry(key.clone()).or_default().running = true;
                             }
@@ -1029,12 +1158,19 @@ impl Engine {
                             let worker_key = key.clone();
                             if let Err(error) = std::thread::Builder::new().name("usagi-usage".into()).spawn(move || {
                                 let target = fallback.as_ref().unwrap_or(&primary);
+                                let started_at = time::now();
                                 let result = if target.is_claude() {
-                                    fallback::claude_usage(&primary, target, login.as_ref())
-                                        .and_then(|file| primary.commit_usage(|| bridge::save(&worker_key, file)))
+                                    fallback::claude_usage(&primary, target, login.as_ref(), mode)
+                                        .and_then(|file| {
+                                            let through = checked_quota_through(started_at, time::now(), claude_reset_times(&file));
+                                            primary.commit_usage(|| bridge::save(&worker_key, file)).map(|()| through)
+                                        })
                                 } else {
-                                    fallback::codex_usage(&primary, target)
-                                        .and_then(|snapshot| primary.commit_usage(|| codex::save(&worker_key, &snapshot)))
+                                    fallback::codex_usage(&primary, target, mode)
+                                        .and_then(|snapshot| {
+                                            let through = checked_quota_through(started_at, time::now(), codex_reset_times(&snapshot));
+                                            primary.commit_usage(|| codex::save(&worker_key, &snapshot)).map(|()| through)
+                                        })
                                 };
                                 let _ = send.send(ProbeCommand::Finished(worker_key, result, live_at, interval));
                             }) {
@@ -1048,6 +1184,8 @@ impl Engine {
         }
 
         let shared = cfg.clone();
+        let log_wake = tx.clone();
+        let schedule_tx = probe_tx.clone();
         std::thread::Builder::new()
             .name("usagi-poll".into())
             .spawn(move || {
@@ -1056,11 +1194,22 @@ impl Engine {
                 config::apply_prefs(&mut c, &state);
                 let active_now = || active.lock().map(|g| g.clone()).unwrap_or_default();
                 let mut sources = Sources::build(&c, &accounts::load(&state), &active_now());
+                let mut watch = LogWatch::new(move || { let _ = log_wake.send(Cmd::FilesChanged); });
+                let mut reconcile_at = Instant::now();
+                let mut reset_times = HashMap::new();
+                let mut schedule_dirty = true;
                 // 바뀐 게 없으면 화면 쪽(위젯·설정 창)을 깨우지 않음. 요청(새로고침·확인 끝)이 오면 바로 보냄.
                 let mut last: Option<Shown> = None;
                 let mut last_sent = 0.0;
                 let mut force = true;
                 loop {
+                    if Instant::now() >= reconcile_at {
+                        // A backend may silently drop a watch after an I/O error.
+                        let healthy = watch.sync(sources.watch_interests(), true);
+                        sources.rescan();
+                        schedule_dirty = true;
+                        reconcile_at = Instant::now() + if healthy { log_watch::RECONCILE } else { log_watch::RETRY_WATCH };
+                    }
                     let mut snap = sources.snapshot(&c);
                     if let Ok(mut g) = live.lock() {
                         g.retain(|key, _| sources.codex.iter().any(|src| src.acc.usage_key() == *key));
@@ -1068,6 +1217,13 @@ impl Engine {
                             if let Some(s) = &src.reader.snapshot {
                                 g.insert(src.acc.usage_key(), s.ts);
                             }
+                        }
+                    }
+                    if std::mem::take(&mut schedule_dirty) {
+                        let updated = sources.reset_times();
+                        if updated != reset_times {
+                            reset_times = updated;
+                            let _ = schedule_tx.send(ProbeCommand::ResetTimes(reset_times.clone()));
                         }
                     }
                     if let Ok(g) = logins.lock() {
@@ -1092,9 +1248,31 @@ impl Engine {
                         on_snapshot(snap);
                     }
                     force = false;
-                    match rx.recv_timeout(Duration::from_secs_f64(c.poll_seconds)) {
+                    let wait = Duration::from_secs_f64(c.poll_seconds)
+                        .min(reconcile_at.saturating_duration_since(Instant::now()));
+                    match rx.recv_timeout(wait) {
                         Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                         Ok(Cmd::Poke) => force = true,
+                        Ok(Cmd::UsageSaved(key)) => {
+                            sources.usage_saved(&key);
+                            schedule_dirty = true;
+                            force = true;
+                        }
+                        Ok(Cmd::FilesChanged) => {
+                            // A single write can produce several native notifications.
+                            std::thread::sleep(Duration::from_millis(80));
+                            let changes = watch.take();
+                            if changes.rescan || !changes.directories.is_empty() {
+                                let healthy = watch.sync(sources.watch_interests(), changes.rescan);
+                                if !healthy {
+                                    reconcile_at = reconcile_at.min(Instant::now() + log_watch::RETRY_WATCH);
+                                } else if changes.rescan {
+                                    reconcile_at = Instant::now() + log_watch::RECONCILE;
+                                }
+                            }
+                            sources.read_changes(&changes);
+                            schedule_dirty = true;
+                        }
                         Ok(Cmd::Refresh) => {
                             force = true;
                             c = config::load();
@@ -1104,6 +1282,7 @@ impl Engine {
                                 *g = c.clone();
                             }
                             sources.reconfigure(&c, &accounts::load(&state), &active_now());
+                            reconcile_at = Instant::now();
                         }
                         Err(RecvTimeoutError::Timeout) => {}
                     }
@@ -1152,7 +1331,9 @@ pub fn snapshot_once() -> Snapshot {
     let state = State::load();
     state.apply_locale();
     let c = config::load();
-    Sources::build(&c, &accounts::load(&state), &HashMap::new()).snapshot(&c)
+    let mut sources = Sources::build(&c, &accounts::load(&state), &HashMap::new());
+    sources.rescan();
+    sources.snapshot(&c)
 }
 
 #[cfg(test)]
@@ -1195,6 +1376,40 @@ mod tests {
         assert!(usage_due(Some(tried), Some(now - 11.0 * min), 10.0, now));
         // 우리 확인이 남긴 값은 쓰는 중 값이 아님
         assert!(usage_due(Some(tried), Some(tried + 2.0), 10.0, now));
+    }
+
+    #[test]
+    fn reset_check_is_once_per_boundary_and_keeps_regular_checks() {
+        let regular = 600.0;
+        let resets = [100.0, 100.0, 300.0];
+        assert!(matches!(scheduled_usage_at(regular, &resets, 70.0, 90.0), (100.0, UsageMode::ApiOnly)));
+        assert!(matches!(scheduled_usage_at(regular, &resets, 70.0, 100.0), (100.0, UsageMode::ApiOnly)));
+        assert!(matches!(scheduled_usage_at(regular, &resets, 102.0, 102.0), (300.0, UsageMode::ApiOnly)));
+        assert!(matches!(scheduled_usage_at(regular, &[900.0], 70.0, 100.0), (600.0, UsageMode::WithCli)));
+        assert!(matches!(scheduled_usage_at(regular, &resets, 301.0, 301.0), (600.0, UsageMode::WithCli)));
+        assert!(matches!(scheduled_usage_at(regular, &resets, 70.0, 600.0), (600.0, UsageMode::WithCli)));
+    }
+
+    #[test]
+    fn older_quota_from_a_request_spanning_reset_leaves_the_reset_due() {
+        let through = checked_quota_through(98.0, 102.0, [100.0, 300.0].into_iter());
+        assert!(matches!(scheduled_usage_at(600.0, &[100.0, 300.0], through, 102.0), (100.0, UsageMode::ApiOnly)));
+        assert_eq!(checked_quota_through(98.0, 102.0, [200.0, 300.0].into_iter()), 102.0);
+        assert_eq!(checked_quota_through(101.0, 102.0, [100.0, 300.0].into_iter()), 102.0);
+    }
+
+    #[test]
+    fn unavailable_reset_api_preserves_the_normal_check_and_its_status() {
+        let mut probe = ProbeState {
+            running: true,
+            tried_at: Some(90.0),
+            error: Some("previous error".into()),
+            ..Default::default()
+        };
+        probe.finished(Err(UsageError::NoApiSession), 100.0, None);
+        assert_eq!(probe.tried_at, Some(90.0));
+        assert_eq!(probe.error.as_deref(), Some("previous error"));
+        assert!(!probe.running);
     }
 
     #[test]

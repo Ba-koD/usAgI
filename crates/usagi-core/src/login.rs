@@ -273,7 +273,12 @@ impl Drop for ChildJob {
 }
 
 /// Run the original status line with a fixed deadline and bounded output.
-pub fn run_statusline_chain(mut command: Command, input: &str) -> Option<String> {
+pub fn run_statusline_chain(command: Command, input: &str) -> Option<String> {
+    run_bounded_command(command, input, Duration::from_secs(2))
+}
+
+/// Run a short-lived helper with bounded output and a deadline.
+pub fn run_bounded_command(mut command: Command, input: &str, timeout: Duration) -> Option<String> {
     use std::io::{Read as _, Write as _};
     let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     #[cfg(windows)]
@@ -287,7 +292,7 @@ pub fn run_statusline_chain(mut command: Command, input: &str) -> Option<String>
         (&mut stdout).take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
         (bytes.len() <= 64 * 1024).then(|| String::from_utf8_lossy(&bytes).into_owned())
     });
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if writer.is_finished() && reader.is_finished() => {

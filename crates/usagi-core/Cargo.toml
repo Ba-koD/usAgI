@@ -15,6 +15,7 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "si
 tempfile = "3"
 # 업데이트 서명 검증 (minisign, Ed25519). 의존성 없는 검증 전용
 minisign-verify = "0.3"
+notify = "8.2.0"
 
 [dev-dependencies]
 # 테스트에서 서명을 직접 만들어 검증 (앱에는 들어가지 않음)

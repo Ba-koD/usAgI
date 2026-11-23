@@ -25,7 +25,7 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("/usr/bin/curl")
         // https만 (리다이렉트도), TLS 1.2 이상
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "--max-time", "120"])
-        .args(["--max-filesize", "67108864"])
+        .arg("--max-filesize").arg(usagi_core::update::MAX_ASSET_BYTES.to_string())
         .args(["-A", &format!("usAgI/{} (macOS)", usagi_core::VERSION)])
         .args(args)
         .output()
@@ -81,23 +81,11 @@ pub fn download(rel: &Release) -> Result<PathBuf, String> {
     let zip = dir.join("usAgI-mac.zip");
     curl(&["-o", &zip.to_string_lossy(), &rel.asset_url])?;
     let verification_text = |url: &str| curl(&[url]).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    let want = rel.verification.checksum(verification_text)?;
-    use std::io::Read as _;
-    const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
-    let mut bytes = Vec::new();
-    std::fs::File::open(&zip).and_then(|file| file.take(MAX_ARCHIVE + 1).read_to_end(&mut bytes))
-        .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_ARCHIVE {
-        return Err(usagi_core::tr!("파일 크기 초과", "File too large").into());
-    }
-    if usagi_core::sha256::hex(&bytes) != want {
-        return Err(usagi_core::tr!("받은 파일 손상 (체크섬 불일치). 다시 시도 필요", "Downloaded file is damaged (checksum mismatch). Try again").into());
-    }
-    rel.verify_signature(&bytes, "usAgI-mac.zip", verification_text)?;
-    drop(bytes);
+    let file = std::fs::File::open(&zip).map_err(|error| error.to_string())?;
+    rel.verify_asset(file, "usAgI-mac.zip", verification_text)?;
     let ok = Command::new("/usr/bin/ditto").args(["-x", "-k"]).arg(&zip).arg(&dir).status().map_err(|e| e.to_string())?;
     let app = dir.join("usAgI.app");
-    if !ok.success() || !app.join("Contents/MacOS/usAgI").exists() {
+    if !ok.success() || !["usAgI", "usagi-settings"].iter().all(|name| app.join("Contents/MacOS").join(name).is_file()) {
         return Err(usagi_core::tr!("받은 압축 파일에 usAgI.app 없음", "usAgI.app not found in the downloaded archive").into());
     }
     Ok(app)
@@ -107,6 +95,12 @@ pub fn download(rel: &Release) -> Result<PathBuf, String> {
 pub fn apply(staged: &Path) -> Result<(), String> {
     let app = current_app().ok_or(usagi_core::tr!("앱 묶음(.app) 밖에서 실행 중이라 교체 불가", "Can't replace the app: not running from an .app bundle"))?;
     let old = app.with_extension("app.old");
+    if usagi_core::config::portable_dir().is_some_and(|dir| dir.starts_with(&app) || dir.starts_with(&old)) {
+        return Err(usagi_core::tr!(
+            "포터블 데이터를 앱 밖으로 옮기지 못해 업데이트를 중단했습니다. 앱 폴더의 쓰기 권한이나 옆의 .data 폴더를 확인하세요.",
+            "The update was stopped because portable data could not be moved outside the app. Check folder permissions or the .data folder next to the app."
+        ).into());
+    }
     let _ = std::fs::remove_dir_all(&old);
     std::fs::rename(&app, &old).map_err(|e| usagi_core::tr!(format!("업데이트 적용 실패 (폴더 권한 확인 필요): {e}"), format!("Couldn't apply the update (check folder permissions): {e}")))?;
     // 다른 디스크일 수 있어 rename 대신 ditto로 복사

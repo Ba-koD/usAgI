@@ -1,5 +1,4 @@
 //! Native settings view shared by the desktop hosts.
-mod session;
 mod view_state;
 
 use serde_json::{json, Value};
@@ -7,10 +6,8 @@ use slint::winit_030::WinitWindowAccessor;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use std::io::{self, BufRead, Write};
 
-pub use session::SettingsWindow;
 /// 첫 상태를 받았을 때 언어를 한 번은 꼭 적용 (Slint가 시스템 언어로 먼저 골랐을 수 있음)
 static LANG_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub const SETTINGS_ARG: &str = "--settings-ui";
 slint::include_modules!();
 
 fn send(message: Value) {

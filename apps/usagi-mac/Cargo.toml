@@ -9,16 +9,13 @@ license.workspace = true
 name = "usagi-mac"
 path = "src/main.rs"
 
-[dependencies]
+# macOS 앱에서만 사용하는 의존성
+[target.'cfg(target_os = "macos")'.dependencies]
 usagi-core = { path = "../../crates/usagi-core" }
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "png-format"] }
-
-# 맥에서만 쓰는 메뉴 막대·이벤트 루프 (Windows 빌드에는 들어가지 않음)
-[target.'cfg(target_os = "macos")'.dependencies]
 tao = "0.37"
 tray-icon = "0.26"
-usagi-settings = { path = "../../crates/usagi-settings" }
 # 메뉴 막대 글자 꾸미기 (tray-icon과 같은 objc2 버전)
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }

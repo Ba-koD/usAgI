@@ -4,7 +4,7 @@
 #   직접 설치, Homebrew, 설치 스크립트와 자동 업데이트가 같은 zip을 사용.
 #   x86_64 타깃도 설치돼 있으면 Intel+Apple Silicon 유니버설로 만듦
 #   (rustup target add x86_64-apple-darwin)
-#   ARM·Intel 바이너리 경로를 인자로 주면 빌드 없이 유니버설 앱을 묶음.
+#   ARM·Intel 바이너리 경로를 인자로 주면 옆의 usagi-settings와 함께 묶음.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,12 +14,12 @@ if [ "$#" -eq 0 ]; then
   if rustup target list --installed 2>/dev/null | grep -q '^x86_64-apple-darwin$'; then
     TARGETS+=(x86_64-apple-darwin)
   fi
-  ARGS=(--release -p usagi-mac)
+  ARGS=(--release -p usagi-mac -p usagi-settings)
   [ -n "${CI:-}" ] && ARGS+=(--locked)
   BINS=()
   for t in "${TARGETS[@]}"; do
     ARGS+=(--target "$t")
-    BINS+=("target/$t/release/usagi-mac")
+    BINS+=("${CARGO_TARGET_DIR:-target}/$t/release/usagi-mac")
   done
   cargo build "${ARGS[@]}"
 elif [ "$#" -eq 2 ]; then
@@ -29,23 +29,35 @@ else
   exit 1
 fi
 
+SETTINGS_BINS=()
 for bin in "${BINS[@]}"; do
   [ -s "$bin" ] || { echo "macOS 바이너리 없음: $bin" >&2; exit 1; }
+  settings="$(dirname "$bin")/usagi-settings"
+  [ -s "$settings" ] || { echo "macOS 설정 실행 파일 없음: $settings" >&2; exit 1; }
+  SETTINGS_BINS+=("$settings")
 done
 
 APP=dist/usAgI.app
 EXE="$APP/Contents/MacOS/usAgI"
+SETTINGS="$APP/Contents/MacOS/usagi-settings"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 if [ "${#BINS[@]}" -gt 1 ]; then
   lipo -create "${BINS[@]}" -output "$EXE"
-  lipo "$EXE" -verify_arch arm64
-  lipo "$EXE" -verify_arch x86_64
+  lipo -create "${SETTINGS_BINS[@]}" -output "$SETTINGS"
+  for bin in "$EXE" "$SETTINGS"; do
+    archs=" $(lipo -archs "$bin") "
+    [[ "$archs" == *" arm64 "* && "$archs" == *" x86_64 "* ]] || {
+      echo "macOS 유니버설 바이너리 아님: $bin ($archs)" >&2
+      exit 1
+    }
+  done
 else
   cp "${BINS[0]}" "$EXE"
+  cp "${SETTINGS_BINS[0]}" "$SETTINGS"
 fi
 # Actions 아티팩트를 내려받으면 실행 권한이 빠짐.
-chmod +x "$EXE"
+chmod +x "$EXE" "$SETTINGS"
 
 # 앱 아이콘: 앱과 같은 토끼 실루엣으로 .icns
 ICONSET="$(mktemp -d)/usAgI.iconset"
@@ -73,7 +85,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 # 서명 (개발자 인증서가 없으면 임시 서명. 처음 열 때 우클릭 → 열기 필요)
-codesign --force --deep -s "${MAC_SIGN_IDENTITY:--}" "$APP"
+codesign --force -s "${MAC_SIGN_IDENTITY:--}" "$SETTINGS"
+codesign --force -s "${MAC_SIGN_IDENTITY:--}" "$APP"
+codesign --verify --deep --strict "$APP"
 
 REL=dist/release
 mkdir -p "$REL"

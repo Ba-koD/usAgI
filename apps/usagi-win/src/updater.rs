@@ -5,13 +5,14 @@
 //! 3. 적용: 실행 중인 exe는 이름은 바꿀 수 있으므로 `usagi.exe` → `usagi.exe.old`, `.new` → `usagi.exe`로 바꾸고
 //!    새 exe를 `--after-update <pid>`로 띄운 뒤 지금 프로세스는 종료. `.old`는 복구용으로 보존.
 //!
-//! 통신은 Windows 기본 WinHTTP, 해시는 Windows 기본 BCrypt (추가 라이브러리 없음).
+//! 통신은 Windows 기본 WinHTTP. 설치 파일은 임시 파일에 내려받아 스트리밍으로 검증.
 
 use crate::win::wide;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use usagi_core::update::MAX_ASSET_BYTES;
 use windows_sys::Win32::Networking::WinHttp::*;
-use windows_sys::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
 
 /// 업데이트를 받을 저장소 ("owner/name"). 릴리스 빌드(GitHub Actions)는 자기 저장소를 넣어 빌드함.
 pub const REPO: &str = match option_env!("USAGI_UPDATE_REPO") {
@@ -32,8 +33,14 @@ impl Drop for Handle {
     }
 }
 
-/// HTTPS GET. (상태 코드, 본문). 리다이렉트는 WinHTTP가 따라감.
 fn get(url: &str, accept: &str) -> Result<(u32, Vec<u8>), String> {
+    let mut body = Vec::new();
+    let status = get_into(url, accept, &mut body)?;
+    Ok((status, body))
+}
+
+/// HTTPS GET. 리다이렉트는 WinHTTP가 따라가며 본문은 고정 크기의 버퍼로 전달.
+fn get_into(url: &str, accept: &str, body: &mut impl Write) -> Result<u32, String> {
     let rest = url.strip_prefix("https://").ok_or(usagi_core::tr!("https 주소 아님", "Not an https address"))?;
     let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap_or((rest, "/".into()));
     // 업데이트는 GitHub에서만 받음 (리다이렉트는 WinHTTP가 https 안에서만 따라감)
@@ -69,34 +76,29 @@ fn get(url: &str, accept: &str) -> Result<(u32, Vec<u8>), String> {
             &mut len,
             null_mut(),
         );
-        let mut body = Vec::new();
+        let mut remaining = MAX_ASSET_BYTES;
+        let mut buf = [0; 64 * 1024];
         loop {
-            let mut avail = 0u32;
-            if WinHttpQueryDataAvailable(req.0, &mut avail) == 0 {
+            let mut read = 0u32;
+            if WinHttpReadData(req.0, buf.as_mut_ptr().cast(), buf.len() as u32, &mut read) == 0 {
                 return Err(usagi_core::tr!("내려받는 중 연결 끊김", "Connection lost during download").into());
             }
-            if avail == 0 {
+            if read == 0 {
                 break;
             }
-            let start = body.len();
-            if avail as usize > 64 * 1024 * 1024 - start {
-                return Err(usagi_core::tr!("파일 크기 초과", "File too large").into());
-            }
-            body.resize(start + avail as usize, 0);
-            let mut read = 0u32;
-            if WinHttpReadData(req.0, body[start..].as_mut_ptr() as *mut _, avail, &mut read) == 0 {
-                return Err(usagi_core::tr!("내려받는 중 연결 끊김", "Connection lost during download").into());
-            }
-            body.truncate(start + read as usize);
+            remaining = remaining.checked_sub(u64::from(read))
+                .ok_or_else(|| usagi_core::tr!("파일 크기 초과", "File too large").to_string())?;
+            body.write_all(&buf[..read as usize]).map_err(save_error)?;
         }
-        Ok((status, body))
+        Ok(status)
     }
 }
 
-pub fn sha256_hex(data: &[u8]) -> Option<String> {
-    let mut out = [0u8; 32];
-    let st = unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, null(), 0, data.as_ptr(), data.len() as u32, out.as_mut_ptr(), 32) };
-    (st == 0).then(|| out.iter().map(|b| format!("{b:02x}")).collect())
+fn save_error(error: std::io::Error) -> String {
+    usagi_core::tr!(
+        format!("새 버전 저장 실패 (폴더 쓰기 권한 확인 필요): {error}"),
+        format!("Couldn't save the new version (check folder write permission): {error}")
+    )
 }
 
 // ------------------------------------------------------------------ 확인·받기·적용
@@ -119,18 +121,22 @@ fn exe_path() -> Result<PathBuf, String> {
 
 /// 새 exe를 받아 검증한 뒤 exe 옆 `usagi.exe.new`로 둠
 pub fn download(rel: &Release) -> Result<PathBuf, String> {
-    let (status, exe) = get(&rel.asset_url, "application/octet-stream")?;
-    if status != 200 || exe.len() < 100 * 1024 || !exe.starts_with(b"MZ") {
+    let exe = exe_path()?;
+    let parent = exe.parent().ok_or_else(|| usagi_core::tr!("앱 폴더 없음", "App folder missing").to_string())?;
+    let staged = exe.with_extension("exe.new");
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(save_error)?;
+    let file = temporary.as_file_mut();
+    let status = get_into(&rel.asset_url, "application/octet-stream", file)?;
+    file.rewind().map_err(save_error)?;
+    let mut magic = [0; 2];
+    if status != 200 || file.metadata().map_err(save_error)?.len() < 100 * 1024
+        || file.read_exact(&mut magic).is_err() || &magic != b"MZ"
+    {
         return Err(usagi_core::tr!(format!("새 버전 수신 실패 ({status})"), format!("Couldn't download the new version ({status})")));
     }
-    // 체크섬은 꼭 있어야 하고 일치해야 함
-    let want = rel.verification.checksum(verification_text)?;
-    if sha256_hex(&exe).as_deref() != Some(want.as_str()) {
-        return Err(usagi_core::tr!("받은 파일 손상 (체크섬 불일치). 다시 시도 필요", "Downloaded file is damaged (checksum mismatch). Try again").into());
-    }
-    rel.verify_signature(&exe, "usagi.exe", verification_text)?;
-    let staged = exe_path()?.with_extension("exe.new");
-    std::fs::write(&staged, &exe).map_err(|e| usagi_core::tr!(format!("새 버전 저장 실패 (폴더 쓰기 권한 확인 필요): {e}"), format!("Couldn't save the new version (check folder write permission): {e}")))?;
+    file.rewind().map_err(save_error)?;
+    rel.verify_asset(file, "usagi.exe", verification_text)?;
+    temporary.persist(&staged).map_err(|error| save_error(error.error))?;
     Ok(staged)
 }
 

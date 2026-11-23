@@ -21,8 +21,14 @@ pub(crate) fn lock_changes() -> MutexGuard<'static, ()> {
 pub(crate) fn new_revision() -> u64 {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = (crate::time::now() * 1_000_000.0) as u64;
-    let previous = LAST.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(now.max(n + 1)));
-    now.max(previous.unwrap() + 1)
+    let mut previous = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(previous + 1);
+        match LAST.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
 }
 
 fn yes() -> bool {

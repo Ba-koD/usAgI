@@ -91,6 +91,10 @@ pub fn portable_dir() -> Option<PathBuf> {
         }
         let exe = std::env::current_exe().ok()?;
         let dir = exe.parent()?;
+        #[cfg(target_os = "macos")]
+        if let Some(data) = mac_portable_dir(dir) {
+            return Some(data);
+        }
         let data = dir.join("data");
         is_portable_layout(dir).then_some(data)
     })
@@ -100,9 +104,48 @@ pub fn portable_dir() -> Option<PathBuf> {
 /// exe 폴더가 포터블 배치인지: `data\usagi.portable` 표시 파일, 예전 표시 파일(exe 옆 `usagi.portable`),
 /// 또는 이미 usAgI 데이터(`config.toml`·`state.json`)가 든 `data` 폴더. 이름만 `data`인 다른 폴더는 쓰지 않음
 fn is_portable_layout(dir: &std::path::Path) -> bool {
-    let data = dir.join("data");
-    dir.join("usagi.portable").exists()
-        || (data.is_dir() && ["usagi.portable", "config.toml", "state.json"].iter().any(|f| data.join(f).is_file()))
+    dir.join("usagi.portable").exists() || contains_portable_data(&dir.join("data"))
+}
+
+fn contains_portable_data(data: &std::path::Path) -> bool {
+    data.is_dir() && ["usagi.portable", "config.toml", "state.json"].iter().any(|file| data.join(file).is_file())
+}
+
+/// Keep portable data outside the replaceable bundle. Older updaters may
+/// already have moved the only copy into .app.old when this version starts.
+#[cfg(any(target_os = "macos", test))]
+fn mac_portable_dir(executable_dir: &std::path::Path) -> Option<PathBuf> {
+    let contents = executable_dir.parent()?;
+    let bundle = contents.parent()?;
+    if executable_dir.file_name()? != "MacOS" || contents.file_name()? != "Contents" || bundle.extension()? != "app" {
+        return None;
+    }
+    let destination = bundle.with_extension("data");
+    if contains_portable_data(&destination) {
+        return Some(destination);
+    }
+
+    let previous_dir = bundle.with_extension("app.old").join("Contents/MacOS");
+    let source = if is_portable_layout(executable_dir) {
+        executable_dir.join("data")
+    } else if is_portable_layout(&previous_dir) {
+        previous_dir.join("data")
+    } else {
+        return None;
+    };
+    if destination.symlink_metadata().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+        let ready = std::fs::create_dir_all(&source)
+            .and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(source.join("usagi.portable")).map(drop));
+        if ready.is_ok() && std::fs::rename(&source, &destination).is_ok() {
+            return Some(destination);
+        }
+        if !source.exists() && contains_portable_data(&destination) {
+            return Some(destination);
+        }
+    }
+    // Keep using the original directory if the bundle's parent is read-only
+    // or the destination is occupied by another folder.
+    Some(source)
 }
 
 pub fn is_portable() -> bool {
@@ -293,6 +336,40 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_portable_data_survives_replacement_by_an_older_updater() {
+        let root = tempfile::tempdir().unwrap();
+        let executable_dir = root.path().join("usAgI.app/Contents/MacOS");
+        let previous = root.path().join("usAgI.app.old/Contents/MacOS/data");
+        let profile = previous.join("profiles/codex-1");
+        std::fs::create_dir_all(&executable_dir).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(previous.join("state.json"), b"{\"fixture\":true}").unwrap();
+        std::fs::write(profile.join("fixture.txt"), b"existing profile").unwrap();
+
+        let destination = root.path().join("usAgI.data");
+        assert_eq!(mac_portable_dir(&executable_dir), Some(destination.clone()));
+        assert_eq!(std::fs::read(destination.join("state.json")).unwrap(), b"{\"fixture\":true}");
+        assert_eq!(std::fs::read(destination.join("profiles/codex-1/fixture.txt")).unwrap(), b"existing profile");
+        assert_eq!(mac_portable_dir(&executable_dir), Some(destination));
+    }
+
+    #[test]
+    fn mac_portable_data_stays_available_if_the_destination_is_occupied() {
+        let root = tempfile::tempdir().unwrap();
+        let executable_dir = root.path().join("usAgI.app/Contents/MacOS");
+        let source = executable_dir.join("data");
+        let destination = root.path().join("usAgI.data");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("state.json"), b"state").unwrap();
+        std::fs::write(destination.join("unrelated"), b"keep").unwrap();
+
+        assert_eq!(mac_portable_dir(&executable_dir), Some(source.clone()));
+        assert_eq!(std::fs::read(source.join("state.json")).unwrap(), b"state");
+        assert_eq!(std::fs::read(destination.join("unrelated")).unwrap(), b"keep");
+    }
 
     #[test]
     fn both_templates_have_the_same_settings() {

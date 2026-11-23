@@ -7,7 +7,11 @@
 //! 예전 버전의 서명된 파일을 새 버전인 것처럼 내놓을 수 없어요.
 
 use crate::version;
+use minisign_verify::{PublicKey, Signature};
 use serde_json::Value;
+use std::io::{self, Read};
+
+pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 새 버전 정보
 #[derive(Clone, Debug, PartialEq)]
@@ -47,9 +51,20 @@ impl Verification {
 }
 
 impl Release {
-    pub fn verify_signature(&self, data: &[u8], asset: &str, fetch: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
-        let Some(key) = signing_key() else { return Ok(()) };
-        verify_signature(key, data, &self.verification.signature(fetch)?, &self.version, asset)
+    pub fn verify_asset(
+        &self,
+        reader: impl Read,
+        asset: &str,
+        fetch: impl Fn(&str) -> Result<String, String>,
+    ) -> Result<(), String> {
+        let checksum = self.verification.checksum(&fetch)?;
+        let signed = signing_key()
+            .map(|key| {
+                let signature = self.verification.signature(&fetch)?;
+                decode_signature(key, &signature)
+            })
+            .transpose()?;
+        verify_reader(reader, &checksum, signed.as_ref(), &self.version, asset)
     }
 }
 
@@ -72,13 +87,62 @@ pub fn signed_comment(version: &str, asset: &str) -> String {
 
 /// 받은 파일의 서명 확인: 공개 키로 만든 서명이 맞고, 서명 안의 설명이 이 버전·이 파일이어야 함
 pub fn verify_signature(key_b64: &str, data: &[u8], signature: &str, version: &str, asset: &str) -> Result<(), String> {
-    use minisign_verify::{PublicKey, Signature};
-    let bad = || crate::tr!("업데이트 서명 확인 실패. 설치 중단", "Update signature check failed. Not installing").to_string();
-    let key = PublicKey::from_base64(key_b64).map_err(|_| bad())?;
-    let sig = Signature::decode(signature).map_err(|_| bad())?;
-    key.verify(data, &sig, false).map_err(|_| bad())?;
+    let (key, sig) = decode_signature(key_b64, signature)?;
+    key.verify(data, &sig, false).map_err(|_| invalid_signature())?;
+    verify_comment(&sig, version, asset)
+}
+
+fn invalid_signature() -> String {
+    crate::tr!("업데이트 서명 확인 실패. 설치 중단", "Update signature check failed. Not installing").into()
+}
+
+fn decode_signature(key_b64: &str, signature: &str) -> Result<(PublicKey, Signature), String> {
+    let key = PublicKey::from_base64(key_b64).map_err(|_| invalid_signature())?;
+    let sig = Signature::decode(signature).map_err(|_| invalid_signature())?;
+    Ok((key, sig))
+}
+
+fn verify_comment(sig: &Signature, version: &str, asset: &str) -> Result<(), String> {
     if sig.trusted_comment() != signed_comment(version, asset) {
         return Err(crate::tr!("다른 버전이나 다른 파일의 서명. 설치 중단", "The signature belongs to another version or file. Not installing").into());
+    }
+    Ok(())
+}
+
+fn verify_reader(
+    reader: impl Read,
+    checksum: &str,
+    signed: Option<&(PublicKey, Signature)>,
+    version: &str,
+    asset: &str,
+) -> Result<(), String> {
+    let mut reader = reader.take(MAX_ASSET_BYTES + 1);
+    let mut sha = crate::sha256::Sha256::default();
+    let mut signature = signed
+        .map(|(key, sig)| key.verify_stream(sig).map_err(|_| invalid_signature()))
+        .transpose()?;
+    let mut remaining = MAX_ASSET_BYTES;
+    let mut buf = [0; 64 * 1024];
+    loop {
+        let count = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        remaining = remaining.checked_sub(count as u64)
+            .ok_or_else(|| crate::tr!("파일 크기 초과", "File too large").to_string())?;
+        sha.update(&buf[..count]);
+        if let Some(verifier) = &mut signature {
+            verifier.update(&buf[..count]);
+        }
+    }
+    if sha.finish_hex() != checksum {
+        return Err(crate::tr!("받은 파일 손상 (체크섬 불일치). 다시 시도 필요", "Downloaded file is damaged (checksum mismatch). Try again").into());
+    }
+    if let (Some(mut verifier), Some((_, sig))) = (signature, signed) {
+        verifier.finalize().map_err(|_| invalid_signature())?;
+        verify_comment(sig, version, asset)?;
     }
     Ok(())
 }
@@ -371,6 +435,22 @@ mod tests {
         // 형식이 아닌 값
         assert!(verify_signature(&key, data, "<html>Not Found</html>", "0.2.1", "usagi.exe").is_err());
         assert!(verify_signature("not a key", data, &sig, "0.2.1", "usagi.exe").is_err());
+    }
+
+    #[test]
+    fn verifies_streamed_package_and_rejects_tampering() {
+        let mut data = vec![b'X'; 3 * 64 * 1024 + 63];
+        let asset = "usAgI-mac.zip";
+        let version = "0.3.1";
+        let checksum = crate::sha256::hex(&data);
+        let (key, sig) = sign_for_test(&data, &signed_comment(version, asset));
+        let signature = decode_signature(&key, &sig).unwrap();
+        assert_eq!(verify_reader(&data[..], &checksum, Some(&signature), version, asset), Ok(()));
+        assert!(verify_reader(&data[..], &checksum, Some(&signature), version, "usagi.exe").is_err());
+        data[64 * 1024] ^= 1;
+        assert!(verify_reader(&data[..], &checksum, Some(&signature), version, asset).is_err());
+        let forged_checksum = crate::sha256::hex(&data);
+        assert!(verify_reader(&data[..], &forged_checksum, Some(&signature), version, asset).is_err());
     }
 
     #[test]

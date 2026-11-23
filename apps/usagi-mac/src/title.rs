@@ -1,8 +1,7 @@
 //! 메뉴 막대 글자 꾸미기: [로고] 5h ▬▬ 53%  7d ▬▬ 64%   [로고] 7d ▬▬ 92%
 //!
-//! tray-icon의 글자는 꾸밀 수 없어서, 바탕이 되는 macOS NSStatusItem 버튼에 꾸민 글자(attributed title)를
-//! 직접 넣음. 글자는 시스템이 그려서 어떤 배율에서도 또렷하고, 밝은·어두운 메뉴 막대에 맞춰 색이 바뀜.
-//! 로고와 막대는 글자 사이에 넣는 작은 그림. 설정 창의 미리 보기는 같은 글자를 그림으로 그려서 보냄.
+//! 메뉴 막대 버튼은 AppKit이 서식 있는 텍스트로 그림. 로고와 막대는 글자 사이의 작은 첨부 이미지.
+//! 설정 창 미리 보기에서만 전체를 비트맵으로 그림.
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -13,7 +12,7 @@ use objc2_app_kit::{
     NSForegroundColorAttributeName, NSGraphicsContext, NSImage, NSTextAttachment,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSNumber, NSString, NSUserDefaults};
+use objc2_foundation::{NSAttributedString, NSDictionary, NSMutableAttributedString, NSNumber, NSString, NSUserDefaults};
 use tiny_skia::{Color, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tray_icon::TrayIcon;
 use usagi_core::engine::ProviderId;
@@ -106,9 +105,19 @@ fn styled(text: &str, font: &NSFont, color: &NSColor, baseline: f64) -> Retained
 
 /// 그림 → 글자 사이에 넣는 첨부 (크기·위치는 pt, y는 글자 기준선에서)
 fn attachment(pm: &Pixmap, w: f64, h: f64, y: f64) -> Option<Retained<NSAttributedString>> {
-    let png = pm.encode_png().ok()?;
-    let img = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(&png))?;
-    img.setSize(CGSize::new(w, h));
+    let pixel_width = pm.width() as isize;
+    let rep = rgba_bitmap(pixel_width, pm.height() as isize, pixel_width * 4)?;
+    let bitmap = rep.bitmapData();
+    if bitmap.is_null() {
+        return None;
+    }
+    // Both the pixmap and this packed AppKit bitmap use premultiplied RGBA.
+    let pixels = pm.data();
+    unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), bitmap, pixels.len()) };
+    let size = CGSize::new(w, h);
+    rep.setSize(size);
+    let img = NSImage::initWithSize(NSImage::alloc(), size);
+    img.addRepresentation(&rep);
     let att = NSTextAttachment::new();
     att.setImage(Some(&img));
     att.setBounds(CGRect::new(CGPoint::new(0.0, y), CGSize::new(w, h)));
@@ -199,15 +208,12 @@ fn compose(parts: &[Part], dark: bool, ink: &Ink) -> Retained<NSMutableAttribute
     out
 }
 
-/// 메뉴 막대 버튼에 꾸민 글자를 넣음
-pub fn apply(tray: &TrayIcon, parts: &[Part]) {
+/// 메뉴 막대 버튼에 꾸민 글자를 넣음.
+pub fn apply(tray: &TrayIcon, parts: &[Part], dark: bool) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let Some(item) = tray.ns_status_item() else { return };
     let Some(button) = item.button(mtm) else { return };
-    let dark = system_dark() || button.effectiveAppearance().name().to_string().contains("Dark");
     button.setAttributedTitle(&compose(parts, dark, &Ink::system()));
-    // 글자 너비가 바뀌면 누르는 영역도 다시 맞춤 (tray-icon은 툴팁을 바꿀 때 영역을 다시 잼)
-    let _ = tray.set_tooltip(Some("usAgI"));
 }
 
 /// 설정 창 미리 보기 그림 (실제 픽셀 크기, RGBA). 띠 색은 설정 창의 미리 보기 띠와 같음
@@ -218,13 +224,8 @@ pub struct Preview {
     pub rgba: Vec<u8>,
 }
 
-pub fn preview(parts: &[Part], dark: bool) -> Option<Preview> {
-    MainThreadMarker::new()?;
-    let text = compose(parts, dark, &Ink::fixed(dark));
-    let size = text.size();
-    let (w_pt, h_pt) = ((size.width + 2.0 * STRIP_PAD).ceil(), STRIP_H);
-    let (w, h) = ((w_pt * SCALE) as isize, (h_pt * SCALE) as isize);
-    let rep = unsafe {
+fn rgba_bitmap(w: isize, h: isize, stride: isize) -> Option<Retained<NSBitmapImageRep>> {
+    unsafe {
         NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
             NSBitmapImageRep::alloc(),
             std::ptr::null_mut(),
@@ -235,15 +236,24 @@ pub fn preview(parts: &[Part], dark: bool) -> Option<Preview> {
             true,
             false,
             NSDeviceRGBColorSpace,
-            0,
+            stride,
             0,
         )
-    }?;
-    rep.setSize(CGSize::new(w_pt, h_pt));
+    }
+}
+
+pub fn preview(parts: &[Part], dark: bool) -> Option<Preview> {
+    MainThreadMarker::new()?;
+    let text = compose(parts, dark, &Ink::fixed(dark));
+    let text_size = text.size();
+    let size = CGSize::new((text_size.width + 2.0 * STRIP_PAD).ceil(), STRIP_H);
+    let (w, h) = ((size.width * SCALE) as isize, (size.height * SCALE) as isize);
+    let rep = rgba_bitmap(w, h, 0)?;
+    rep.setSize(size);
     let ctx = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
     NSGraphicsContext::saveGraphicsState_class();
     NSGraphicsContext::setCurrentContext(Some(&ctx));
-    text.drawAtPoint(CGPoint::new(STRIP_PAD, ((h_pt - size.height) / 2.0).round()));
+    text.drawAtPoint(CGPoint::new(STRIP_PAD, ((size.height - text_size.height) / 2.0).round()));
     ctx.flushGraphics();
     NSGraphicsContext::restoreGraphicsState_class();
 
@@ -253,7 +263,7 @@ pub fn preview(parts: &[Part], dark: bool) -> Option<Preview> {
         return None;
     }
     let stride = rep.bytesPerRow() as usize;
-    let (w, h) = (w as usize, h as usize);
+    let (w, h) = (rep.pixelsWide() as usize, rep.pixelsHigh() as usize);
     let bg: [u32; 3] = if dark { [32, 32, 32] } else { [238, 238, 238] };
     let mut rgba = Vec::with_capacity(w * h * 4);
     for y in 0..h {

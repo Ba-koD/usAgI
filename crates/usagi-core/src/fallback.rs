@@ -13,7 +13,7 @@
 
 use crate::accounts::{self, Account};
 use crate::login::{self, LoginStatus};
-use crate::usage_retry::{self, UsageError};
+use crate::usage_retry::{self, UsageError, UsageMode};
 use std::path::{Path, PathBuf};
 
 /// 대신 쓸 수 있는 폴더: 이 계정 이름의 전용 프로필 → 같은 공급자의 다른 전용 프로필 → 기본 폴더.
@@ -68,16 +68,20 @@ pub(crate) fn same_claude_identity(expected: &LoginStatus, actual: &LoginStatus)
     }
 }
 
-pub(crate) fn claude_usage(primary: &Account, target: &Account, approved: Option<&LoginStatus>) -> Result<crate::bridge::BridgeFile, UsageError> {
+pub(crate) fn claude_usage(primary: &Account, target: &Account, approved: Option<&LoginStatus>, mode: UsageMode) -> Result<crate::bridge::BridgeFile, UsageError> {
+    let status = || match mode {
+        UsageMode::WithCli => Some(login::status(target)),
+        UsageMode::ApiOnly => login::file_status(&target.provider, &target.path()),
+    };
     if primary.dir == target.dir {
         if primary.identity.is_none() {
-            return crate::usage_cmd::read_usage(target);
+            return crate::usage_cmd::read_usage_for_session(target, None, mode);
         }
-        let current = login::status(target);
+        let current = status().ok_or(UsageError::NoApiSession)?;
         verify_primary(primary, login::Identity::from_status(&current))?;
         let fingerprint = current.credential_fingerprint;
-        let usage = crate::usage_cmd::read_usage_for_session(target, fingerprint)?;
-        verify_primary(primary, login::Identity::from_status(&login::status(target)))?;
+        let usage = crate::usage_cmd::read_usage_for_session(target, fingerprint, mode)?;
+        verify_primary(primary, status().as_ref().and_then(login::Identity::from_status))?;
         return Ok(usage);
     }
     let approved = approved.filter(|status| status.logged_in == Some(true) && status.fallback.as_deref() == Some(target.dir.as_str()))
@@ -87,11 +91,12 @@ pub(crate) fn claude_usage(primary: &Account, target: &Account, approved: Option
             if !accounts::fallback_profile_available(&target.path()) {
                 return false;
             }
-            let status = login::status(target);
-            status.logged_in == Some(true) && same_claude_identity(approved, &status)
-                && approved.credential_fingerprint == status.credential_fingerprint
+            status().is_some_and(|status| {
+                status.logged_in == Some(true) && same_claude_identity(approved, &status)
+                    && approved.credential_fingerprint == status.credential_fingerprint
+            })
         },
-        || crate::usage_cmd::read_usage_for_session(target, approved.credential_fingerprint),
+        || crate::usage_cmd::read_usage_for_session(target, approved.credential_fingerprint, mode),
     )
 }
 
@@ -120,10 +125,10 @@ fn codex_identity(acc: &Account) -> Option<(String, String)> {
     })
 }
 
-pub(crate) fn codex_usage(primary: &Account, target: &Account) -> Result<crate::codex::CodexSnapshot, UsageError> {
+pub(crate) fn codex_usage(primary: &Account, target: &Account, mode: UsageMode) -> Result<crate::codex::CodexSnapshot, UsageError> {
     if primary.dir == target.dir {
         verify_primary(primary, login::file_status(&target.provider, &target.path()).as_ref().and_then(login::Identity::from_status))?;
-        let usage = crate::codex::refresh_usage(target)?;
+        let usage = crate::codex::refresh_usage(target, mode)?;
         verify_primary(primary, login::Identity::from_codex(&usage))?;
         return Ok(usage);
     }
@@ -133,7 +138,7 @@ pub(crate) fn codex_usage(primary: &Account, target: &Account) -> Result<crate::
     if !same_codex_workspace(&email, &workspace, Some(&candidate_email), Some(&candidate_workspace)) {
         return Err(mismatch());
     }
-    let usage = crate::codex::refresh_usage(target)?;
+    let usage = crate::codex::refresh_usage(target, mode)?;
     if !accounts::fallback_profile_available(&target.path())
         || !same_codex_workspace(&email, &workspace, usage.email.as_deref(), usage.workspace_id.as_deref()) {
         return Err(mismatch());
@@ -182,7 +187,7 @@ pub fn resolve(acc: &Account, all: &[Account]) -> (LoginStatus, Option<PathBuf>,
             }
             cs
         } else {
-            match codex_usage(acc, &cand) {
+            match codex_usage(acc, &cand, UsageMode::WithCli) {
                 Ok(s) => {
                     let shown = LoginStatus {
                         logged_in: Some(true),
@@ -215,7 +220,7 @@ fn revive(acc: &Account) -> Option<Result<(), UsageError>> {
     let key = acc.usage_key();
     Some(match acc.provider.as_str() {
         "claude" if crate::usage_cmd::available(acc) => {
-            claude_usage(acc, acc, None).and_then(|f| acc.commit_usage(|| crate::bridge::save(&key, f)))
+            claude_usage(acc, acc, None, UsageMode::WithCli).and_then(|f| acc.commit_usage(|| crate::bridge::save(&key, f)))
         }
         "codex" => crate::codex::recover_usage(acc).and_then(|s| {
             verify_primary(acc, login::Identity::from_codex(&s))?;
@@ -231,7 +236,7 @@ fn retry_recovery(acc: &Account, error: &UsageError) -> Option<f64> {
         UsageError::Busy => Some(soon),
         UsageError::Deferred => Some(usage_retry::deadline(&acc.usage_key()).unwrap_or(soon).max(soon)),
         UsageError::RateLimited(at) => Some(at.max(soon)),
-        UsageError::Failed(_) | UsageError::ProfileChanged | UsageError::IdentityChanged => None,
+        UsageError::Failed(_) | UsageError::NoApiSession | UsageError::ProfileChanged | UsageError::IdentityChanged => None,
     }
 }
 

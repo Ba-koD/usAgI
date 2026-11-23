@@ -25,7 +25,7 @@ try {
     # 2) 테스트 + 빌드 (Cargo.lock도 갱신)
     cargo test -p usagi-core
     if ($LASTEXITCODE -ne 0) { throw "테스트 실패" }
-    cargo build --release -p usagi-win
+    cargo build --release -p usagi-win -p usagi-settings
     if ($LASTEXITCODE -ne 0) { throw "빌드 실패" }
 
     # 3) CHANGELOG에 이 버전 섹션이 있어야 함

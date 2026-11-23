@@ -16,7 +16,7 @@ use crate::accounts::Account;
 use crate::bridge::{BridgeFile, BridgeWindow, ModelWindow};
 use crate::logs::parse_reset;
 use crate::probe::run_cli;
-use crate::usage_retry::{self, UsageError};
+use crate::usage_retry::{self, UsageError, UsageMode};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -47,14 +47,13 @@ pub(crate) fn available(acc: &Account) -> bool {
     supported(&acc.usage_key()) || crate::claude_oauth::available(&acc.path())
 }
 
-pub(crate) fn read_usage(acc: &Account) -> Result<BridgeFile, UsageError> {
-    read_usage_for_session(acc, None)
-}
-
-pub(crate) fn read_usage_for_session(acc: &Account, fingerprint: Option<u64>) -> Result<BridgeFile, UsageError> {
+pub(crate) fn read_usage_for_session(acc: &Account, fingerprint: Option<u64>, mode: UsageMode) -> Result<BridgeFile, UsageError> {
     usage_retry::run(&acc.usage_key(), || {
         if let Some(usage) = crate::claude_oauth::read(acc, fingerprint)? {
             return Ok(usage);
+        }
+        if mode == UsageMode::ApiOnly {
+            return Err(UsageError::NoApiSession);
         }
         let rejected = crate::claude_oauth::file_session_rejected(&acc.path());
         let result = if supported(&acc.usage_key()) {

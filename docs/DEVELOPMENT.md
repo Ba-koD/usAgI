@@ -49,7 +49,7 @@ minisign -Vm usagi.exe -p packaging/usagi-update.pub
 - **네트워크**: Claude·Codex 사용량 조회, GitHub 업데이트 확인·내려받기
 - **업데이트**: 이 저장소의 GitHub 릴리스 파일만 허용, 체크섬과 서명 필수
 - **CLI 준비**: 유효한 파일이나 설치된 CLI를 사용. CLI가 필요한 경우 사용자 선택으로 공급자의 공식 설치 문서를 엶
-- **설정 창**: 실행 파일에 들어 있는 Slint 화면 (웹 페이지·스크립트·로컬 포트 없음)
+- **설정 창**: 별도 Slint 실행 파일을 열고 JSON 파이프로 통신. 계정·설정·알림은 본체가 읽고 저장
 - **계정 제거**: usAgI 계정·사용량·관련 설정을 제거하고 Claude 상태 표시줄 설정 복원. 프로필·기록 삭제는 usAgI 전용 폴더에 한정
 - 프로필과 캐시 삭제는 계정 목록과 알림 설정을 저장한 후 시작. 저장 실패 시 등록과 프로필 유지
 - **신규 로그인 취소**: 등록 전 프로필은 대체 프로필로 사용하지 않으며, 취소하면 해당 폴더 정리. 남은 미등록 폴더는 설정의 **일반 → 보관된 프로필**에서 정리 가능
@@ -58,11 +58,11 @@ minisign -Vm usagi.exe -p packaging/usagi-update.pub
 
 ```powershell
 cargo test -p usagi-core
-cargo build --release -p usagi-win        # target\release\usagi.exe
+cargo build --release -p usagi-win -p usagi-settings  # 개발용, 두 파일을 같은 폴더에서 실행
 scripts\package-portable.ps1              # 로컬 포터블 묶음 dist\usAgI-portable-x.y.z.zip
 ```
 
-macOS는 `bash scripts/package-mac.sh`로 `dist/release/usAgI-mac.zip` 생성.
+Windows 배포용 `dist/release/usagi.exe`는 포터블 패키지 스크립트가 설정 실행 파일을 압축해 내장함. macOS는 `bash scripts/package-mac.sh`가 본체와 설정 실행 파일을 같은 앱에 넣고 `dist/release/usAgI-mac.zip`을 생성함.
 
 `USAGI_UPDATE_REPO=owner/name`을 지정하고 빌드하면 그 저장소에서 업데이트 수신 (릴리스 빌드는 자동 지정).
 

@@ -1,124 +1,155 @@
-//! 작업 표시줄의 실제 버튼 위치 (UI 자동화).
+//! 작업 표시줄의 앱 버튼과 알림 영역 좌표.
 //!
-//! Windows 11 작업 표시줄은 XAML로 그려서, 예전 창(MSTaskListWClass·ReBarWindow32)의 위치가
-//! 실제 앱 버튼과 다를 수 있어요(특히 보조 모니터·세로 모니터). 그래서 접근성(UI Automation)으로
-//! 앱 버튼의 오른쪽 끝과 시계·알림 영역의 왼쪽 끝을 읽어, 위젯이 버튼을 가리지 않게 합니다.
-//!
-//! 다른 프로세스(explorer)에 묻는 일이라 백그라운드 스레드에서 하고, 가볍게 유지해요:
-//! - 필요한 값(위치·클래스 이름)을 캐시 요청으로 **한 번에** 받아 와요 (요소마다 따로 묻지 않음)
-//! - 평소엔 6초마다, 창이 바뀌었을 때([`poke`])만 곧바로 몇 번 더 확인해요
-//! - 위젯이 하나도 보이지 않으면([`set_active`]) 아예 묻지 않아요
+//! UI Automation은 짧게 실행되는 usagi.exe의 별도 모드에서만 사용.
+//! 본체는 좌표를 캐시하고 작업 표시줄 변경 때 다시 조회.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::io::Write;
+use std::os::windows::process::CommandExt;
+use std::process::Command;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
     AutomationElementMode_None, CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, TreeScope_Descendants, UIA_BoundingRectanglePropertyId,
     UIA_ClassNamePropertyId,
 };
 
-/// 평소 확인 간격
-const IDLE: Duration = Duration::from_secs(6);
-/// 창이 바뀐 직후(작업 표시줄 버튼이 생기거나 사라지는 중) 확인 간격과 횟수
+pub const HELPER_ARG: &str = "--taskbar-extents";
+// XAML 변경 이벤트가 빠질 수 있어 드물게 좌표를 재확인.
+const IDLE: Duration = Duration::from_secs(15);
 const QUICK: Duration = Duration::from_millis(1200);
-const QUICK_ROUNDS: u32 = 2;
-/// 변화 직후 작업 표시줄 애니메이션이 끝나길 잠깐 기다림
 const SETTLE: Duration = Duration::from_millis(250);
-/// 이보다 오래된 값은 쓰지 않음 (IDLE보다 넉넉하게)
-const FRESH: Duration = Duration::from_secs(15);
+const FRESH: Duration = Duration::from_secs(35);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Extents {
-    /// 앱 버튼들의 오른쪽 끝 (화면 픽셀)
     pub buttons_right: Option<i32>,
-    /// 시계·알림 영역의 왼쪽 끝 (화면 픽셀)
     pub tray_left: Option<i32>,
-    at: Instant,
 }
 
-static EXTENTS: Mutex<Option<HashMap<isize, Extents>>> = Mutex::new(None);
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static WAKE: OnceLock<Sender<()>> = OnceLock::new();
+#[derive(Default)]
+struct Cache {
+    targets: Vec<isize>,
+    generation: u64,
+    measured_at: Option<Instant>,
+    extents: HashMap<isize, Extents>,
+}
 
-/// 최근 값만
+static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
+static WAKE: OnceLock<SyncSender<()>> = OnceLock::new();
+
 pub fn get(taskbar: isize) -> Option<Extents> {
-    let g = EXTENTS.lock().ok()?;
-    g.as_ref()?.get(&taskbar).copied().filter(|e| e.at.elapsed() < FRESH)
+    let cache = CACHE.lock().ok()?;
+    cache.measured_at.filter(|at| at.elapsed() < FRESH)?;
+    cache.extents.get(&taskbar).copied()
 }
 
-/// 작업 표시줄 버튼이 바뀌었을 수 있음 (앞 창이 바뀜, 화면 구성이 바뀜) → 곧 다시 확인
+pub fn is_active() -> bool {
+    CACHE.lock().is_ok_and(|cache| !cache.targets.is_empty())
+}
+
 pub fn poke() {
-    if ACTIVE.load(Ordering::Relaxed) {
-        if let Some(tx) = WAKE.get() {
-            let _ = tx.send(());
-        }
+    if is_active() {
+        wake();
     }
 }
 
-/// 보이는 위젯이 있을 때만 확인
-pub fn set_active(on: bool) {
-    if ACTIVE.swap(on, Ordering::Relaxed) != on && on {
-        if WAKE.get().is_some() {
-            poke();
-        } else {
-            start();
-        }
+fn wake() {
+    if let Some(tx) = WAKE.get() {
+        let _ = tx.try_send(());
     }
 }
 
-fn start() {
-    let (tx, rx) = mpsc::channel::<()>();
-    if WAKE.set(tx).is_err() {
-        return; // 이미 시작함
-    }
-    let _ = std::thread::Builder::new().name("usagi-uia".into()).spawn(move || unsafe {
-        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+/// 오른쪽에 위젯을 배치하는 작업 표시줄만 조회.
+pub fn set_taskbars(targets: Vec<isize>) {
+    if let Ok(mut cache) = CACHE.lock() {
+        if cache.targets == targets {
             return;
         }
-        let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) else { return };
-        // 위치와 클래스 이름을 찾을 때 함께 받아 옴 (요소 참조는 받지 않음)
-        let cache = uia.CreateCacheRequest().ok().filter(|c| {
-            c.AddProperty(UIA_BoundingRectanglePropertyId).is_ok()
-                && c.AddProperty(UIA_ClassNamePropertyId).is_ok()
-                && c.SetAutomationElementMode(AutomationElementMode_None).is_ok()
-        });
-        let mut quick = QUICK_ROUNDS;
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.extents.retain(|key, _| targets.contains(key));
+        cache.targets = targets;
+    }
+    if is_active() {
+        WAKE.get_or_init(start);
+    }
+    wake();
+}
+
+fn start() -> SyncSender<()> {
+    let (tx, rx) = mpsc::sync_channel::<()>(1);
+    let _ = std::thread::Builder::new().name("usagi-taskbar".into()).spawn(move || {
+        let mut quick = true;
         loop {
-            if !ACTIVE.load(Ordering::Relaxed) {
+            let Ok((generation, targets)) = CACHE.lock().map(|cache| (cache.generation, cache.targets.clone())) else { return };
+            if targets.is_empty() {
                 if rx.recv().is_err() {
                     return;
                 }
+                quick = true;
                 continue;
             }
-            let mut found = HashMap::new();
-            for tb in crate::win::taskbars() {
-                if let Some(e) = probe(&uia, cache.as_ref(), tb.hwnd as isize) {
-                    found.insert(tb.hwnd as isize, e);
+            if let Some(extents) = helper_output(&targets) {
+                if let Ok(mut cache) = CACHE.lock() {
+                    if cache.generation == generation {
+                        cache.extents = extents;
+                        cache.measured_at = Some(Instant::now());
+                    }
                 }
             }
-            if let Ok(mut g) = EXTENTS.lock() {
-                *g = Some(found);
-            }
-            let wait = if quick > 0 {
-                quick -= 1;
-                QUICK
-            } else {
-                IDLE
-            };
-            match rx.recv_timeout(wait) {
+            let delay = if std::mem::take(&mut quick) { QUICK } else { IDLE };
+            match rx.recv_timeout(delay) {
                 Ok(()) => {
                     std::thread::sleep(SETTLE);
-                    while rx.try_recv().is_ok() {} // 몰려 온 신호는 한 번으로
-                    quick = QUICK_ROUNDS;
+                    while rx.try_recv().is_ok() {}
+                    quick = true;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     });
+    tx
+}
+
+fn helper_output(targets: &[isize]) -> Option<HashMap<isize, Extents>> {
+    let mut cmd = Command::new(std::env::current_exe().ok()?);
+    cmd.arg(HELPER_ARG).args(targets.iter().map(isize::to_string)).creation_flags(0x0800_0000);
+    let output = usagi_core::login::run_bounded_command(cmd, "", Duration::from_secs(4))?;
+    serde_json::from_str(&output).ok()
+}
+
+pub fn run_helper(args: &[String]) -> std::io::Result<()> {
+    unsafe {
+        crate::win::enable_dpi_awareness();
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(std::io::Error::other)?;
+    }
+    let result = collect_extents(args);
+    unsafe { CoUninitialize() };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    serde_json::to_writer(&mut out, &result?)?;
+    out.flush()
+}
+
+fn collect_extents(args: &[String]) -> std::io::Result<HashMap<isize, Extents>> {
+    let requested: Vec<isize> = args.iter().filter_map(|arg| arg.parse().ok()).collect();
+    // Validate current shell handles again in case Explorer restarted.
+    unsafe {
+        let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).map_err(std::io::Error::other)?;
+        let cache = uia.CreateCacheRequest().ok().filter(|c| {
+            c.AddProperty(UIA_BoundingRectanglePropertyId).is_ok()
+                && c.AddProperty(UIA_ClassNamePropertyId).is_ok()
+                && c.SetAutomationElementMode(AutomationElementMode_None).is_ok()
+        });
+        Ok(crate::win::taskbars().into_iter().filter_map(|bar| {
+            let hwnd = bar.hwnd as isize;
+            requested.contains(&hwnd).then(|| probe(&uia, cache.as_ref(), hwnd)).flatten().map(|e| (hwnd, e))
+        }).collect())
+    }
 }
 
 unsafe fn probe(uia: &IUIAutomation, cache: Option<&IUIAutomationCacheRequest>, hwnd: isize) -> Option<Extents> {
@@ -154,5 +185,5 @@ unsafe fn probe(uia: &IUIAutomation, cache: Option<&IUIAutomationCacheRequest>, 
             }
         }
     }
-    Some(Extents { buttons_right: right, tray_left: tray, at: Instant::now() })
+    Some(Extents { buttons_right: right, tray_left: tray })
 }

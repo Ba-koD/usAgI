@@ -5,10 +5,10 @@
 //! - 설정 창: Windows와 같은 Slint 화면, 화면 상태와 명령 처리도 Windows와 같은
 //!   usagi-core 컨트롤러. 이 파일은 메뉴 막대·창·알림·로그인할 때 실행·업데이트 적용만 맡음.
 
-use usagi_settings::SettingsWindow;
+use usagi_core::settings_window::SettingsWindow;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
@@ -20,11 +20,6 @@ use usagi_core::controller::{Controller, Effect, HostInfo, Platform};
 use usagi_core::engine::{alert_key, Engine, Meter, ProviderView, Snapshot};
 use usagi_core::update::Release;
 use usagi_core::{b64, texts, time, ui};
-
-/// 로그인 진행을 보고 있을 때의 확인 간격
-const FRAME: Duration = Duration::from_millis(200);
-/// 평소 간격 (할 일은 로그인 후 재확인·업데이트 확인 시각뿐이라 드물게 깨어나도 됨)
-const IDLE_FRAME: Duration = Duration::from_secs(1);
 
 pub enum UserEvent {
     Snapshot,
@@ -128,6 +123,7 @@ pub fn run() {
         exit: false,
     };
 
+    let mut scheduled_tick: Option<Instant> = None;
     event_loop.run(move |event, _, control_flow| {
         let _instance = &instance;
         match event {
@@ -140,8 +136,8 @@ pub fn run() {
                 let fx = app.ctl.startup();
                 app.run(fx);
             }
-            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-                // 로그인 진행·재확인, 업데이트 확인 시각은 컨트롤러가 스스로 셈
+            Event::NewEvents(_) if scheduled_tick.is_some_and(|at| Instant::now() >= at) => {
+                scheduled_tick = None;
                 let fx = app.ctl.tick();
                 if !fx.is_empty() {
                     app.run(fx);
@@ -171,12 +167,17 @@ pub fn run() {
             }
             _ => {}
         }
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + if app.ctl.busy() { FRAME } else { IDLE_FRAME });
         if app.exit {
             app.ctl.engine.stop();
             app.settings = None;
             app.tray = None;
             *control_flow = ControlFlow::Exit;
+        } else {
+            scheduled_tick = app.ctl.next_tick_delay(time::now()).map(|delay| {
+                let next = Instant::now() + delay;
+                scheduled_tick.map_or(next, |previous| previous.min(next))
+            });
+            *control_flow = scheduled_tick.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         }
     });
 }
@@ -323,7 +324,7 @@ impl App {
         let sig = parts.iter().map(|p| format!("{:?}{:?}{:?}", p.provider, p.items, p.note)).collect::<Vec<_>>().join("|") + if dark { "D" } else { "L" };
         if sig != self.title_sig {
             if let Some(t) = &self.tray {
-                crate::title::apply(t, &parts);
+                crate::title::apply(t, &parts, dark);
             }
             // 진단: 메뉴 막대에 보인 글자 (바뀔 때만)
             let text = parts
@@ -384,7 +385,9 @@ impl App {
             return;
         }
         let proxy = self.proxy.clone();
-        match SettingsWindow::open(move || { let _ = proxy.send_event(UserEvent::SettingsInput); }) {
+        match crate::settings_program().and_then(|program| SettingsWindow::open(program, move || {
+            let _ = proxy.send_event(UserEvent::SettingsInput);
+        })) {
             Ok(s) => {
                 self.settings = Some(s);
                 self.preview_sent.set(0);

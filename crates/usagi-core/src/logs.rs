@@ -79,17 +79,11 @@ pub fn default_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// 디렉터리 아래 확장자가 맞는 파일을 재귀로 모읍니다 (glob 크레이트 없이).
-/// 기록 폴더 전체를 훑는 간격(초). 그 사이(3초마다)에는 최근에 바뀐 파일만 확인해요.
-/// 기록 파일이 수천 개여도 평소엔 몇 개만 들여다보게 됨. 새로 생긴 파일은 다음 전체 훑기 때 잡혀요.
-pub const FULL_SCAN_SECS: f64 = 15.0;
-/// 이 시간 안에 바뀐 파일은 "최근" (매번 확인)
-pub const HOT_SECS: f64 = 15.0 * 60.0;
-
 pub fn mtime_secs(meta: &std::fs::Metadata) -> f64 {
     meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
+/// 디렉터리 아래 확장자가 맞는 파일을 재귀로 모음.
 pub fn walk_files(root: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else { return };
     for entry in entries.flatten() {
@@ -281,7 +275,7 @@ const MAX_LINE: usize = 8 * 1024 * 1024;
 pub struct LogReader {
     pub roots: Vec<PathBuf>,
     pub history_days: f64,
-    offsets: HashMap<PathBuf, u64>,
+    offsets: HashMap<PathBuf, Position>,
     discarding: std::collections::HashSet<PathBuf>,
     connected_at: f64,
     index: HashMap<u64, usize>,
@@ -289,10 +283,12 @@ pub struct LogReader {
     limits: HashMap<(i64, LimitKind), LimitEvent>,
     sorted: Vec<UsageEvent>,
     dirty: bool,
-    /// 마지막으로 폴더 전체를 훑은 시각
-    last_full: f64,
-    /// 최근에 바뀐 파일 (전체 훑기 사이에 확인)
-    hot: Vec<PathBuf>,
+}
+
+struct Position {
+    offset: u64,
+    size: u64,
+    modified: f64,
 }
 
 impl LogReader {
@@ -308,8 +304,6 @@ impl LogReader {
             limits: HashMap::new(),
             sorted: Vec::new(),
             dirty: true,
-            last_full: 0.0,
-            hot: Vec::new(),
         }
     }
 
@@ -317,59 +311,66 @@ impl LogReader {
         Self { connected_at: revision as f64 / 1_000_000.0, ..Self::new(roots) }
     }
 
-    /// 새 줄을 읽습니다. 새 데이터가 있었으면 true.
-    pub fn poll(&mut self) -> bool {
+    /// 이벤트 누락 복구. 변경된 파일만 다시 읽음.
+    pub fn rescan(&mut self) -> bool {
+        let mut paths = Vec::new();
+        for root in &self.roots {
+            walk_files(root, "jsonl", &mut paths);
+        }
+        let present: std::collections::HashSet<_> = paths.iter().collect();
+        self.offsets.retain(|path, _| present.contains(path));
+        self.discarding.retain(|path| present.contains(path));
+        let changed = self.update_paths(paths.iter().map(|path| (path.as_path(), false)));
+        let now = time::now();
+        let pruned = self.prune((now - self.history_days * DAY).max(self.connected_at), now - crate::tracker::LONG_IDLE);
+        self.dirty |= pruned;
+        changed || pruned
+    }
+
+    pub(crate) fn update_paths<'a>(&mut self, paths: impl IntoIterator<Item = (&'a Path, bool)>) -> bool {
         let now = time::now();
         let cutoff = (now - self.history_days * DAY).max(self.connected_at);
         let activity_cutoff = now - crate::tracker::LONG_IDLE;
-        // 폴더 전체는 가끔만 훑고, 그 사이엔 최근에 바뀐 파일만 확인
-        let full = now - self.last_full >= FULL_SCAN_SECS;
-        let files = if full {
-            let mut files = Vec::new();
-            for root in &self.roots {
-                walk_files(root, "jsonl", &mut files);
-            }
-            let present: std::collections::HashSet<_> = files.iter().collect();
-            self.offsets.retain(|path, _| present.contains(path));
-            self.discarding.retain(|path| present.contains(path));
-            self.last_full = now;
-            self.hot.clear();
-            files
-        } else {
-            self.hot.clone()
-        };
         let mut changed = false;
-        for path in files {
-            let Ok(meta) = std::fs::metadata(&path) else { continue };
-            let size = meta.len();
-            let mtime = mtime_secs(&meta);
-            if full && mtime >= now - HOT_SECS {
-                self.hot.push(path.clone());
+        let mut buffer = None;
+        for (path, replaced) in paths {
+            if replaced {
+                self.offsets.remove(path);
+                self.discarding.remove(path);
             }
-            let known = self.offsets.get(&path).copied();
-            if known.is_none() && mtime < cutoff {
+            let Ok(meta) = std::fs::symlink_metadata(path) else { continue };
+            if !meta.is_file() {
                 continue;
             }
-            let mut offset = known.unwrap_or(0);
-            if size < offset {
-                offset = 0; // 파일이 다시 쓰였음
-                self.discarding.remove(&path);
+            let size = meta.len();
+            let modified = mtime_secs(&meta);
+            let known = self.offsets.get(path);
+            if known.is_none() && modified < cutoff
+                || known.is_some_and(|old| old.size == size && old.modified == modified)
+            {
+                continue;
+            }
+            let offset = known.filter(|old| size > old.size).map_or(0, |old| old.offset);
+            if offset == 0 {
+                self.discarding.remove(path);
             }
             if size == offset {
-                continue;
+                self.offsets.insert(path.to_owned(), Position { offset, size, modified });
+            } else {
+                let buffer = buffer.get_or_insert_with(|| vec![0; CHUNK]);
+                match self.read_from(path, offset, cutoff, activity_cutoff, buffer) {
+                    Ok(next) => {
+                        self.offsets.insert(path.to_owned(), Position { offset: next, size, modified });
+                        changed |= next != offset;
+                    }
+                    Err(_) => {
+                        // Preserve the cursor for the retry. Some lines may have made it into the dedup index.
+                        changed = true;
+                    }
+                }
             }
-            let new_offset = self.read_from(&path, offset, cutoff, activity_cutoff);
-            if new_offset != offset {
-                self.offsets.insert(path, new_offset);
-                changed = true;
-            }
         }
-        if full {
-            changed |= self.prune(cutoff, activity_cutoff);
-        }
-        if changed {
-            self.dirty = true;
-        }
+        self.dirty |= changed;
         changed
     }
 
@@ -388,20 +389,19 @@ impl LogReader {
         v
     }
 
-    fn read_from(&mut self, path: &Path, offset: u64, cutoff: f64, activity_cutoff: f64) -> u64 {
-        let Ok(mut f) = File::open(path) else { return offset };
-        if f.seek(SeekFrom::Start(offset)).is_err() {
-            return offset;
-        }
+    fn read_from(&mut self, path: &Path, offset: u64, cutoff: f64, activity_cutoff: f64, buf: &mut [u8]) -> std::io::Result<u64> {
+        let mut f = File::open(path)?;
+        f.seek(SeekFrom::Start(offset))?;
         let mut pos = offset;
         let mut read_at = offset;
         let mut discard = self.discarding.contains(path);
         let mut pending: Vec<u8> = Vec::new();
-        let mut buf = vec![0u8; CHUNK];
         loop {
-            let n = match f.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+            let n = match f.read(buf) {
+                Ok(0) => break,
                 Ok(n) => n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             };
             for piece in buf[..n].split_inclusive(|&b| b == b'\n') {
                 read_at += piece.len() as u64;
@@ -425,7 +425,7 @@ impl LogReader {
             }
         }
         if discard { self.discarding.insert(path.to_owned()); } else { self.discarding.remove(path); }
-        pos // 덜 쓰인 마지막 줄은 다음 poll에서 다시 읽음
+        Ok(pos) // 덜 쓰인 마지막 줄은 파일이 다시 바뀌면 읽음
     }
 
     fn handle_line(&mut self, line: &[u8], cutoff: f64, activity_cutoff: f64) {
@@ -576,25 +576,25 @@ mod tests {
         };
         std::fs::write(&p, line(&iso, "a", 100) + &line(&iso, "a", 100)).unwrap();
         let mut r = LogReader::new(vec![dir.clone()]);
-        assert!(r.poll());
+        assert!(r.rescan());
         assert_eq!(r.usage_events().len(), 1);
 
         let partial = line(&iso, "b", 200);
         let (head, tail) = partial.split_at(partial.len() - 30);
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
         f.write_all(head.as_bytes()).unwrap();
-        r.poll();
+        r.update_paths([(p.as_path(), false)]);
         assert_eq!(r.usage_events().len(), 1);
         f.write_all(tail.as_bytes()).unwrap();
-        assert!(r.poll());
+        assert!(r.update_paths([(p.as_path(), false)]));
         assert_eq!(r.usage_events().len(), 2);
-        assert!(!r.poll());
+        assert!(!r.update_paths([(p.as_path(), false)]));
 
         let err = format!(
             r#"{{"type":"assistant","error":"rate_limit","isApiErrorMessage":true,"timestamp":"{iso}","message":{{"id":"x","model":"<synthetic>","content":[{{"type":"text","text":"You've hit your session limit · resets 9:40pm (Asia/Seoul)"}}],"usage":{{"input_tokens":0,"output_tokens":0}}}}}}"#
         ) + "\n";
         f.write_all(err.as_bytes()).unwrap();
-        assert!(r.poll());
+        assert!(r.update_paths([(p.as_path(), false)]));
         let limits = r.limit_events();
         assert_eq!(limits.len(), 1);
         assert_eq!(limits[0].kind, LimitKind::Session);

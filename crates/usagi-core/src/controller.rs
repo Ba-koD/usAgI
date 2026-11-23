@@ -24,6 +24,8 @@ pub const USAGE_URL_CODEX: &str = "https://chatgpt.com/codex/settings/usage";
 
 
 const LOGIN_POLL_SECS: f64 = 0.4;
+const CONNECTION_POLL_SECS: f64 = 0.2;
+const PROFILE_DELETE_POLL_SECS: f64 = 1.0;
 /// 로그인이 끝난 뒤 CLI가 상태를 쓰는 데 잠깐 걸릴 수 있어 몇 번 더 확인
 const LOGIN_RECHECKS: u32 = 4;
 const LOGIN_RECHECK_SECS: f64 = 3.0;
@@ -298,6 +300,21 @@ impl Controller {
     /// 로그인 진행을 보고 있어 tick을 자주(0.2초쯤) 불러야 하는지. 아니면 1초에 한 번이면 충분해요.
     pub fn busy(&self) -> bool {
         self.login.is_some() || self.connecting.is_some()
+    }
+
+    /// Earliest deadline for hosts that can sleep until the next controller task.
+    pub fn next_tick_delay(&self, now: f64) -> Option<std::time::Duration> {
+        [
+            self.busy().then_some(now + CONNECTION_POLL_SECS),
+            (!self.deleted_profiles.is_empty()).then_some(now + PROFILE_DELETE_POLL_SECS),
+            (self.login_rechecks > 0).then_some(self.next_recheck),
+            self.state().pref_bool("updateCheck", true).then_some(self.next_update_check),
+            (self.update.staged.is_some() && self.can_apply_update(false)).then_some(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by(f64::total_cmp)
+        .map(|at| std::time::Duration::from_secs_f64((at - now).max(0.0)))
     }
 
     pub fn settings_opened(&mut self) {
@@ -1279,16 +1296,19 @@ impl Controller {
     }
 
     fn apply_staged_when_ready(&mut self, from_button: bool) -> Option<Effect> {
-        if self.update.busy.is_some() || self.platform.managed_update.is_some()
-            || self.busy() || (self.settings_open && !from_button)
-            || !(self.update.manual_install || self.auto_update())
-        {
+        if !self.can_apply_update(from_button) {
             return None;
         }
         let path = self.update.staged.take()?;
         self.update.manual_install = false;
         self.update.busy = Some("installing");
         Some(Effect::ApplyUpdate(path))
+    }
+
+    fn can_apply_update(&self, from_button: bool) -> bool {
+        self.update.busy.is_none() && self.platform.managed_update.is_none()
+            && !self.busy() && (!self.settings_open || from_button)
+            && (self.update.manual_install || self.auto_update())
     }
 
     /// 업데이트 확인 결과 (manual = 사용자가 눌러서 확인)
@@ -1960,6 +1980,33 @@ mod tests {
         assert_eq!(win["prefs"]["urgentAllowed"], false);
         assert_eq!(mac["prefs"]["urgentAllowed"], Value::Null);
         assert_eq!(win["monitors"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schedules_controller_ticks_only_for_pending_work() {
+        let mut c = ctl("mac", None);
+        let now = 100.0;
+        let seconds = |n| Some(std::time::Duration::from_secs(n));
+        c.next_update_check = now + 60.0;
+        assert_eq!(c.next_tick_delay(now), seconds(60));
+
+        c.notices.state.set_pref("updateCheck", json!(false));
+        assert_eq!(c.next_tick_delay(now), None);
+
+        c.login_rechecks = 1;
+        c.next_recheck = now + 3.0;
+        assert_eq!(c.next_tick_delay(now), seconds(3));
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        c.deleted_profiles.push((PathBuf::from("deleted"), receiver));
+        assert_eq!(c.next_tick_delay(now), seconds(1));
+        c.deleted_profiles.clear();
+        c.login_rechecks = 0;
+
+        c.update.staged = Some(PathBuf::from("new"));
+        c.settings_opened();
+        assert_eq!(c.next_tick_delay(now), None);
+        c.settings_open = false;
+        assert_eq!(c.next_tick_delay(now), seconds(0));
     }
 
     #[test]

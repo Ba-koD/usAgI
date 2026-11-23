@@ -84,6 +84,7 @@ struct App {
     icon_size: u32,
     taskbar_created: u32,
     hook: HWINEVENTHOOK,
+    taskbar_layout_hook: HWINEVENTHOOK,
     frame_ms: u32,
     last_control_tick: f64,
     /// 위젯 내용을 다시 계산해야 함 (사용량·설정이 바뀜). 아니면 1초에 한 번만.
@@ -171,8 +172,13 @@ impl App {
             w.bars = bars;
             w.reposition();
         }
-        // 위젯을 꺼 뒀으면 작업 표시줄 버튼 위치를 물어볼 필요가 없음
-        crate::uia::set_active(on && !self.widgets.is_empty());
+        // 왼쪽 배치는 시작 버튼 앞의 공간만 사용.
+        let lookup = if on && matches!(side, Side::Right) {
+            self.widgets.iter().map(|w| w.taskbar as isize).collect()
+        } else {
+            Vec::new()
+        };
+        crate::uia::set_taskbars(lookup);
     }
 
     fn reposition_widgets(&mut self) {
@@ -649,8 +655,12 @@ impl Drop for App {
     fn drop(&mut self) {
         self.ctl.engine.stop();
         self.settings = None;
+        crate::uia::set_taskbars(Vec::new());
         if !self.hook.is_null() {
             unsafe { UnhookWinEvent(self.hook) };
+        }
+        if !self.taskbar_layout_hook.is_null() {
+            unsafe { UnhookWinEvent(self.taskbar_layout_hook) };
         }
         for w in &self.widgets {
             unsafe { DestroyWindow(w.hwnd) };
@@ -675,6 +685,16 @@ unsafe extern "system" fn on_foreground(_: HWINEVENTHOOK, _: u32, _: HWND, _: i3
     let host = HOST.load(Ordering::Relaxed);
     if host != 0 {
         PostMessageW(host as HWND, WM_FOREGROUND, 0, 0);
+    }
+}
+
+unsafe extern "system" fn on_taskbar_layout(_: HWINEVENTHOOK, _: u32, hwnd: HWND, object: i32, _: i32, _: u32, _: u32) {
+    if hwnd.is_null() || object != OBJID_WINDOW || !crate::uia::is_active() {
+        return;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if matches!(win::class_name(root).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+        crate::uia::poke();
     }
 }
 
@@ -779,6 +799,9 @@ pub fn run(from_autostart: bool) {
     let mut tray = Tray::new(host);
     tray.set_balloon_icon(&rabbit::render(&Pose::default(), 64), 64, ink);
     let hook = unsafe { SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, null_mut(), Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT) };
+    let taskbar_layout_hook = unsafe {
+        SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, null_mut(), Some(on_taskbar_layout), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+    };
     let seed = (time::now() * 1000.0) as u64;
 
     let app = App {
@@ -793,6 +816,7 @@ pub fn run(from_autostart: bool) {
         icon_size: win::small_icon_size(),
         taskbar_created: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
         hook,
+        taskbar_layout_hook,
         frame_ms: 0,
         last_control_tick: 0.0,
         widget_dirty: true,

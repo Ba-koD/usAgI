@@ -1,19 +1,41 @@
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-/// The same executable opens a settings window on its own main thread. Its
-/// allocator, fonts and rendering buffers disappear when the window closes.
+/// A settings executable from the app bundle, the build directory, or an
+/// embedded payload extracted into a temporary directory.
+pub struct SettingsProgram {
+    path: PathBuf,
+    _directory: Option<tempfile::TempDir>,
+}
+
+impl SettingsProgram {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path, _directory: None }
+    }
+
+    pub fn temporary(path: PathBuf, directory: tempfile::TempDir) -> Self {
+        Self { path, _directory: Some(directory) }
+    }
+
+    /// Keep supporting direct --settings-ui invocations with inherited pipes.
+    pub fn run(self) -> io::Result<ExitStatus> {
+        Command::new(&self.path).status()
+    }
+}
+
+/// Hosts the settings process and its JSON lines without linking the UI.
 pub struct SettingsWindow {
     child: Child,
     outgoing: Sender<String>,
     incoming: Receiver<String>,
+    _program: SettingsProgram,
 }
 
 impl SettingsWindow {
-    pub fn open(wake_host: impl Fn() + Send + 'static) -> io::Result<Self> {
-        let mut child = Command::new(std::env::current_exe()?)
-            .arg(super::SETTINGS_ARG)
+    pub fn open(program: SettingsProgram, wake_host: impl Fn() + Send + 'static) -> io::Result<Self> {
+        let mut child = Command::new(&program.path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
@@ -43,6 +65,7 @@ impl SettingsWindow {
             child,
             outgoing,
             incoming,
+            _program: program,
         })
     }
 

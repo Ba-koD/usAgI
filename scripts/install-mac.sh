@@ -19,6 +19,7 @@ if [ ! -w "$DEST" ]; then
   DEST="$HOME/Applications"
   mkdir -p "$DEST"
 fi
+DEST="$(cd "$DEST" && pwd -P)"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -96,9 +97,32 @@ fi
 ditto -x -k "$TMP/usAgI-mac.zip" "$TMP"
 [ -d "$TMP/usAgI.app" ] || { echo "압축 안에 usAgI.app 없음" >&2; exit 1; }
 
-# 실행 중이면 끄고 바꿈
-pkill -f "usAgI.app/Contents/MacOS/usAgI" 2>/dev/null || true
+# 이 설치 경로에서 실행 중인 앱만 끄고 바꿈.
+for pid in $(pgrep -x usAgI || true); do
+  if [ "$(ps -p "$pid" -o comm=)" = "$DEST/usAgI.app/Contents/MacOS/usAgI" ]; then
+    kill "$pid" 2>/dev/null || true
+  fi
+done
 sleep 1
+# A legacy portable directory inside the bundle would be replaced with it.
+legacy="$DEST/usAgI.app/Contents/MacOS"
+legacy_data="$legacy/data"
+if [ -d "$legacy_data" ] && { [ -f "$legacy/usagi.portable" ] || [ -f "$legacy_data/usagi.portable" ] || [ -f "$legacy_data/config.toml" ] || [ -f "$legacy_data/state.json" ]; }; then
+  if [ -f "$TMP/usAgI.app/Contents/MacOS/usagi-settings" ]; then
+    portable="$DEST/usAgI.data"
+    if [ -e "$portable" ] || [ -L "$portable" ]; then
+      echo "기존 포터블 데이터를 옮길 폴더가 이미 있습니다: $portable" >&2
+      exit 1
+    fi
+    touch "$legacy_data/usagi.portable"
+    mv -n "$legacy_data" "$portable"
+    [ ! -d "$legacy_data" ] || { echo "포터블 데이터 이동 실패: $legacy_data" >&2; exit 1; }
+  else
+    # Older bundles look for data inside Contents/MacOS.
+    ditto "$legacy_data" "$TMP/usAgI.app/Contents/MacOS/data"
+    touch "$TMP/usAgI.app/Contents/MacOS/data/usagi.portable"
+  fi
+fi
 rm -rf "$DEST/usAgI.app"
 ditto "$TMP/usAgI.app" "$DEST/usAgI.app"
 # curl은 격리 표시를 붙이지 않지만, 다른 경로로 받은 zip일 때를 위해 한 번 더 정리

@@ -23,10 +23,16 @@ use std::process::Command;
 use usagi_core::{accounts, bridge, config, engine, texts};
 
 fn main() {
-    install_panic_log();
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == uia::HELPER_ARG) {
+        if uia::run_helper(&args[2..]).is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
+    install_panic_log();
     match args.get(1).map(String::as_str) {
-        Some(usagi_settings::SETTINGS_ARG) => usagi_settings::main_window(),
+        Some("--settings-ui") => settings::run_standalone(),
         Some("statusline") => statusline(&args),
         Some("--widget-preview") => widget_preview(args.get(2).map(String::as_str).unwrap_or("widget-preview.bmp")),
         // 디자인 확인용: 설정 창 미리 보기에 보내는 것과 같은 자료를 예시 값으로 출력
@@ -79,7 +85,7 @@ fn main() {
         Some("--sha256") => {
             // 개발용: 업데이트 검증과 같은 방식으로 파일 해시
             let data = std::fs::read(args.get(2).map(String::as_str).unwrap_or("")).unwrap_or_default();
-            println!("{}", updater::sha256_hex(&data).unwrap_or_default());
+            println!("{}", usagi_core::sha256::hex(&data));
         }
         #[cfg(debug_assertions)]
         Some("--apply-staged") => {

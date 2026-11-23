@@ -45,7 +45,7 @@ jobs:
             os: macos-latest
             app: usagi-mac
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -69,4 +69,7 @@ jobs:
         env:
           APP: ${{ matrix.app }}
         shell: bash
-        run: cargo check -p "$APP" --locked
+        run: |
+          args=(-p "$APP")
+          if [[ "$APP" == usagi-win || "$APP" == usagi-mac ]]; then args+=(-p usagi-settings); fi
+          cargo check "${args[@]}" --locked

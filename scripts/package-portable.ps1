@@ -14,22 +14,53 @@ try {
     # CI에서는 Cargo.lock 그대로 (바뀌면 실패)
     $extra = @()
     if ($env:CI) { $extra += @('--locked', '--timings') }
-    cargo build --release -p usagi-win @extra
+    cargo build --release -p usagi-win -p usagi-settings @extra
     if ($LASTEXITCODE -ne 0) { throw "빌드 실패" }
 
     $dist = Join-Path $root 'dist'
-    $exe = Join-Path $root 'target\release\usagi.exe'
+    $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
+    $build = Join-Path $target 'release'
+    $hostExe = Join-Path $build 'usagi.exe'
+    $settingsExe = Join-Path $build 'usagi-settings.exe'
     $rel = Join-Path $dist 'release'
     New-Item -ItemType Directory -Force $rel | Out-Null
-    Copy-Item -LiteralPath $exe -Destination $rel -Force
-    $hash = (Get-FileHash (Join-Path $rel 'usagi.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $exe = Join-Path $rel 'usagi.exe'
+    Copy-Item -LiteralPath $hostExe -Destination $exe -Force
+    # Overlay outside the PE image: the settings code is mapped only when launched.
+    $output = [IO.File]::Open($exe, [IO.FileMode]::Append)
+    try {
+        $start = $output.Position
+        $inputStream = [IO.File]::OpenRead($settingsExe)
+        try {
+            if ($inputStream.Length -eq 0 -or $inputStream.Length -gt 64MB) { throw '설정 실행 파일 크기 오류' }
+            $gzip = [IO.Compression.GZipStream]::new($output, [IO.Compression.CompressionLevel]::Optimal, $true)
+            try { $inputStream.CopyTo($gzip) } finally { $gzip.Dispose() }
+        } finally {
+            $inputStream.Dispose()
+        }
+        $length = [BitConverter]::GetBytes([uint64]($output.Position - $start))
+        $marker = [Text.Encoding]::ASCII.GetBytes('USAGISETTINGS001')
+        $output.Write($length, 0, $length.Length)
+        $output.Write($marker, 0, $marker.Length)
+    } finally {
+        $output.Dispose()
+    }
+    if ((Get-Item -LiteralPath $exe).Length -gt 64MB) { throw 'Windows 업데이트 다운로드 크기 초과' }
+    $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -NoNewline -Encoding ascii (Join-Path $rel 'usagi.exe.sha256') "$hash  usagi.exe"
     Write-Host "릴리스 파일:   $rel"
     if ($ReleaseOnly) { return }
 
     $ver = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
     $out = Join-Path $dist 'usAgI-portable'
-    if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+    if (Test-Path -LiteralPath $out) {
+        $resolved = (Resolve-Path -LiteralPath $out).ProviderPath
+        $item = Get-Item -LiteralPath $out -Force
+        if ($resolved -ne $out -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw '포터블 출력 폴더 경로 확인 실패'
+        }
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
     New-Item -ItemType Directory -Force $out | Out-Null
 
     Copy-Item -LiteralPath $exe -Destination $out
