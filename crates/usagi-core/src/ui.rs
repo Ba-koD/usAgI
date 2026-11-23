@@ -105,6 +105,7 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
                                 "alertOn": alert.on,
                                 // 켜 둔 사용량 기준 (막대 위 표시), 꺼 둔 기준, 리셋 임박 시점(리셋 몇 분 전) 켜짐·꺼짐
                                 "alertAt": alert.at,
+                                "alertRules": crate::alert_rules::rules(state, &key),
                                 "alertAtOff": alert.at_off,
                                 "before": alert.before,
                                 "beforeOff": alert.before_off,
@@ -242,6 +243,10 @@ pub fn apply_meter_ipc(state: &mut State, cmd: &str, msg: &Value) -> bool {
     let key = msg.get("key").and_then(|k| k.as_str()).unwrap_or("").to_string();
     let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     match cmd {
+        "alertRule" if key.split_once(':').is_some_and(|(id, label)| !label.is_empty()
+            && accounts::load(state).iter().any(|account| account.id == id)) => {
+            crate::alert_rules::apply(state, &key, msg);
+        }
         // 알림 항목 추가·바꾸기·지우기. kind: "pct"(사용량 %, 기본) | "reset"(리셋 몇 분 전)
         "threshold" if !key.is_empty() => {
             // 다음 스냅숏이 설정 창에 닿기 전에 여러 번 바꿔도 저장된 최신 목록에 적용

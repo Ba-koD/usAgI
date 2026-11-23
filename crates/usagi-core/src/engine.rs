@@ -580,8 +580,31 @@ impl Notices {
                 }
             }
         }
+        let compound = self.compound_usage(snap, snap.now);
+        dirty |= !compound.is_empty();
+        out.extend(compound);
         if dirty {
             self.state.save();
+        }
+        out
+    }
+
+    pub(crate) fn compound_usage(&mut self, snap: &Snapshot, now: f64) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for p in &snap.providers {
+            for m in &p.meters {
+                let key = alert_key(&p.account_id, &m.label);
+                for rule in crate::alert_rules::due(&mut self.state, &key, m, now) {
+                    let details = rule.conditions.iter().map(|c| {
+                        format!("{} {}", c.metric.label(), c.description())
+                    }).collect::<Vec<_>>().join(match rule.logic {
+                        crate::alert_rules::Logic::And => crate::tr!(" · 그리고 · ", " · and · "),
+                        crate::alert_rules::Logic::Or => crate::tr!(" · 또는 · ", " · or · "),
+                    });
+                    out.push((crate::tr!("사용량 알림", "Usage alert").into(),
+                        format!("{} · {}\n{details}", p.name, texts::meter_label(&m.label))));
+                }
+            }
         }
         out
     }

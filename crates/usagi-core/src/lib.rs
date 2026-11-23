@@ -17,6 +17,7 @@
 //! - [`update`], [`version`]: 자동 업데이트 공통 부분
 
 pub mod accounts;
+pub mod alert_rules;
 pub mod animator;
 pub mod b64;
 pub mod bridge;

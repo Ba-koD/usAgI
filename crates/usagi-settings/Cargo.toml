@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+external-fonts = []
+
 [dependencies]
 serde_json = "1"
 usagi-core = { path = "../usagi-core" }

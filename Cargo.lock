@@ -2783,7 +2783,7 @@ dependencies = [
  "image-webp",
  "moxcms",
  "num-traits",
- "png 0.18.1",
+ "png",
  "qoi",
  "ravif",
  "rayon",
@@ -3457,7 +3457,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "once_cell",
- "png 0.18.1",
+ "png",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
@@ -3477,7 +3477,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
- "png 0.18.1",
+ "png",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
@@ -4446,19 +4446,6 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
-
-[[package]]
-name = "png"
-version = "0.17.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
-dependencies = [
- "bitflags 1.3.2",
- "crc32fast",
- "fdeflate",
- "flate2",
- "miniz_oxide",
-]
 
 [[package]]
 name = "png"
@@ -5916,7 +5903,6 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "log",
- "png 0.17.16",
  "tiny-skia-path 0.11.4",
 ]
 
@@ -5931,7 +5917,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "log",
- "png 0.18.1",
+ "png",
  "tiny-skia-path 0.12.0",
 ]
 
@@ -6141,7 +6127,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "once_cell",
- "png 0.18.1",
+ "png",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
@@ -6323,7 +6309,7 @@ dependencies = [
 
 [[package]]
 name = "usagi-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "jiff",
  "memchr",
@@ -6333,7 +6319,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tiny-skia 0.11.4",
+ "tiny-skia 0.12.0",
  "toml 0.8.2",
  "ureq",
  "windows-sys 0.59.0",
@@ -6341,7 +6327,7 @@ dependencies = [
 
 [[package]]
 name = "usagi-mac"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "block2 0.6.2",
  "objc2 0.6.5",
@@ -6351,14 +6337,14 @@ dependencies = [
  "objc2-user-notifications 0.3.2",
  "serde_json",
  "tao",
- "tiny-skia 0.11.4",
+ "tiny-skia 0.12.0",
  "tray-icon",
  "usagi-core",
 ]
 
 [[package]]
 name = "usagi-settings"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde_json",
  "slint",
@@ -6369,7 +6355,7 @@ dependencies = [
 
 [[package]]
 name = "usagi-sign"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "minisign",
  "usagi-core",
@@ -6377,14 +6363,14 @@ dependencies = [
 
 [[package]]
 name = "usagi-win"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "embed-resource",
  "flate2",
  "serde",
  "serde_json",
  "tempfile",
- "tiny-skia 0.11.4",
+ "tiny-skia 0.12.0",
  "usagi-core",
  "windows",
  "windows-sys 0.59.0",

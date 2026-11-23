@@ -128,6 +128,7 @@ pub struct Controller {
     deleted_profiles: Vec<(PathBuf, std::sync::mpsc::Receiver<std::io::Result<()>>)>,
     update: UpdateState,
     next_update_check: f64,
+    next_rule_check: Option<f64>,
     settings_open: bool,
     widget_preview_open: bool,
     widget_bar_draft: Option<f64>,
@@ -158,6 +159,7 @@ impl Controller {
             deleted_profiles: Vec::new(),
             update: UpdateState::default(),
             next_update_check: time::now() + UPDATE_FIRST_SECS,
+            next_rule_check: None,
             settings_open: false,
             widget_preview_open: false,
             widget_bar_draft: None,
@@ -257,6 +259,7 @@ impl Controller {
         }
         let cfg = self.effective_config();
         let mut fx: Vec<Effect> = self.notices.check(self.snap.as_ref(), &snap, &cfg).into_iter().map(|(t, m)| Effect::Notify(t, m)).collect();
+        self.next_rule_check = if cfg.notify { crate::alert_rules::next_check(self.state(), &snap, snap.now) } else { None };
         self.snap = Some(snap);
         fx.push(Effect::Redraw);
         fx.push(Effect::Push);
@@ -267,6 +270,15 @@ impl Controller {
     pub fn tick(&mut self) -> Vec<Effect> {
         let now = time::now();
         let mut fx = Vec::new();
+        if self.next_rule_check.is_some_and(|at| now >= at) {
+            self.next_rule_check = None;
+            if let Some(snap) = self.snap.as_ref().filter(|_| self.effective_config().notify) {
+                let notices = self.notices.compound_usage(snap, now);
+                if !notices.is_empty() { self.notices.state.save(); }
+                fx.extend(notices.into_iter().map(|(title, body)| Effect::Notify(title, body)));
+                self.next_rule_check = crate::alert_rules::next_check(self.state(), snap, now);
+            }
+        }
         self.poll_connection(&mut fx);
         if self.poll_profile_deletions() {
             fx.push(Effect::Push);
@@ -309,6 +321,7 @@ impl Controller {
             (!self.deleted_profiles.is_empty()).then_some(now + PROFILE_DELETE_POLL_SECS),
             (self.login_rechecks > 0).then_some(self.next_recheck),
             self.state().pref_bool("updateCheck", true).then_some(self.next_update_check),
+            self.next_rule_check,
             (self.update.staged.is_some() && self.can_apply_update(false)).then_some(now),
         ]
         .into_iter()
@@ -483,6 +496,9 @@ impl Controller {
         if ui::apply_meter_ipc(&mut self.notices.state, &cmd, &msg) {
             if self.notices.state.0 != previous.0 && !self.save_settings(previous) {
                 return vec![Effect::Push];
+            }
+            if matches!(cmd.as_str(), "alertRule" | "alert" | "threshold") && self.snap.is_some() {
+                self.next_rule_check = Some(time::now());
             }
             return vec![Effect::Redraw, Effect::Push];
         }

@@ -31,9 +31,11 @@ export component Stepper inherits HorizontalLayout {
     in property <int> minimum: 0;
     in property <int> maximum: 100;
     in property <length> field-width: 46px;
+    in property <bool> show-keys: true;
     in property <string> label;
     // 값을 정했을 때 (−/+, Enter, 칸을 벗어날 때)
     callback committed(int);
+    callback edited-value(int);
     height: 36px; spacing: 6px;
     accessible-role: spinbox; accessible-label: root.label; accessible-value: root.value;
     function set(v: int) { root.value = clamp(v, root.minimum, root.maximum); input.text = root.value; root.committed(root.value); }
@@ -46,7 +48,7 @@ export component Stepper inherits HorizontalLayout {
     changed value => { if !input.has-focus { input.text = root.value; } }
     changed minimum => { root.sync-bounds(); }
     changed maximum => { root.sync-bounds(); }
-    CenterItem { StepKey { icon: @image-url("icons/minus.svg"); label: @tr("줄이기"); enabled: root.value > root.minimum;
+    if root.show-keys: CenterItem { StepKey { icon: @image-url("icons/minus.svg"); label: @tr("줄이기"); enabled: root.value > root.minimum;
         clicked => { root.set(root.value - 1); } } }
     Rectangle {
         width: root.field-width; border-radius: 8px; border-width: 1px;
@@ -57,12 +59,17 @@ export component Stepper inherits HorizontalLayout {
             text: root.value; single-line: true; input-type: number;
             horizontal-alignment: center; vertical-alignment: center;
             color: Theme.ink; font-size: 14.5px;
-            edited => { if self.text != "" { root.value = clamp(self.text.to-float(), root.minimum, root.maximum); } }
+            edited => {
+                if self.text != "" {
+                    root.value = clamp(self.text.to-float(), root.minimum, root.maximum);
+                    root.edited-value(root.value);
+                }
+            }
             accepted => { root.set(root.value); }
             changed has-focus => { if !self.has-focus { root.set(root.value); } }
         }
     }
-    CenterItem { StepKey { icon: @image-url("icons/plus.svg"); label: @tr("늘리기"); enabled: root.value < root.maximum;
+    if root.show-keys: CenterItem { StepKey { icon: @image-url("icons/plus.svg"); label: @tr("늘리기"); enabled: root.value < root.maximum;
         clicked => { root.set(root.value + 1); } } }
 }
 
@@ -160,23 +167,36 @@ export component LeadInput inherits HorizontalLayout {
     in property <int> initial: 60;
     in property <int> maximum: 168 * 60;
     in property <string> suffix;
-    out property <int> minutes: clamp(hours.value * 60 + mins.value, min(1, root.maximum), root.maximum);
+    in property <bool> allow-zero;
+    in property <bool> show-keys: true;
+    private property <int> minimum: root.allow-zero ? 0 : min(1, root.maximum);
+    out property <int> minutes: clamp(hours.value * 60 + mins.value, root.minimum, root.maximum);
     callback committed(int);
-    private property <int> starting-minutes: clamp(root.initial, min(1, root.maximum), root.maximum);
+    callback edited-value(int);
+    private property <int> starting-minutes: clamp(root.initial, root.minimum, root.maximum);
     spacing: 6px;
     changed starting-minutes => { hours.value = floor(root.starting-minutes / 60); mins.value = mod(root.starting-minutes, 60); }
     hours := Stepper { maximum: floor(root.maximum / 60); value: floor(root.starting-minutes / 60);
-        field-width: 40px; label: @tr("시간"); committed => { root.committed(root.minutes); } }
+        field-width: 40px; show-keys: root.show-keys; label: @tr("시간");
+        committed => { root.committed(root.minutes); }
+        edited-value => { root.edited-value(root.minutes); } }
     CenterItem { Text { text: @tr("시간"); color: Theme.sub; font-size: Theme.size-small; } }
-    mins := Stepper { minimum: hours.value == 0 ? min(1, root.maximum) : 0;
+    mins := Stepper { minimum: hours.value == 0 ? root.minimum : 0;
         maximum: hours.value == hours.maximum ? mod(root.maximum, 60) : 59;
-        value: mod(root.starting-minutes, 60); field-width: 40px; label: @tr("분");
-        committed => { root.committed(root.minutes); } }
+        value: mod(root.starting-minutes, 60); field-width: 40px; show-keys: root.show-keys; label: @tr("분");
+        committed => { root.committed(root.minutes); }
+        edited-value => { root.edited-value(root.minutes); } }
     CenterItem { Text { text: root.suffix == "" ? @tr("분") : root.suffix; color: Theme.sub; font-size: Theme.size-small; } }
 }
 
 // 그래프 알림 하나: 종류(0 사용량 %, 1 리셋 몇 분 전), 저장된 값, 켜짐, 보일 글자
 export struct AlertItem { kind: int, value: int, on: bool, text: string }
+export struct RuleCondition { metric: int, op: int, value: int }
+export struct RuleDetail { metric: string, value: string }
+export struct CompoundRule {
+    id: int, logic: int, conditions: [RuleCondition], details: [RuleDetail],
+    full: string, compact: string, summary: string, accessible-text: string,
+}
 // 변경 내용의 한 줄: 0 제목, 1 목록 항목, 2 문단. level은 목록 들여쓰기 단계
 export struct NoteLine { kind: int, level: int, text: string }
 export struct Meter {
@@ -188,6 +208,7 @@ export struct Meter {
     // 막대 위 눈금 (켜진 사용량 알림)
     thresholds: [int],
     alerts: [AlertItem],
+    compound: [CompoundRule],
     // 이미 있는 값 (켜짐·꺼짐 모두): 빠른 선택에서 막음
     taken-pct: [int], taken-reset: [int],
 }
@@ -216,6 +237,20 @@ export global Actions {
     callback meter(string, string, int, int);
     // 그래프 알림 하나: add | replace | delete | toggle, 그래프 키, 종류(0 % / 1 리셋 전), 이전 값, 새 값(toggle은 1 켜기 0 끄기)
     callback alert(string, string, int, int, int);
+    callback open-rule(string, string, int, CompoundRule);
+    callback rule-row(string, int, int);
+    callback save-rule();
+    callback delete-rule(string, int);
+    callback rule-logic-changed();
+    in-out property <string> selected-rule-key;
+    in-out property <int> selected-rule-id;
+    in-out property <string> rule-key;
+    in-out property <string> rule-meter;
+    in-out property <int> rule-max;
+    in-out property <int> rule-id;
+    in-out property <int> rule-logic;
+    in-out property <[RuleCondition]> rule-conditions;
+    in-out property <string> rule-summary;
     // 계정별 리필권 만료 알림 (계정 id, default|on|off, 만료 몇 분 전)
     callback refill(string, string, int);
     callback pref(string, string);
@@ -620,15 +655,18 @@ component AlertChip inherits Rectangle {
     private property <int> edit-lead: root.item.value;
 }
 
-// 알림 추가 팝업의 [사용량 | 리셋 전] 선택
+// 알림 추가 팝업의 빠른 설정 선택
 component KindSwitch inherits Rectangle {
     in-out property <int> kind;
     height: 38px; border-radius: 10px; border-width: 1px; border-color: Theme.line; background: Theme.segment;
     HorizontalLayout { padding: 3px; spacing: 3px;
-        for opt[i] in [{ text: @tr("사용량"), icon: @image-url("icons/gauge.svg") }, { text: @tr("리셋 전"), icon: @image-url("icons/clock.svg") }]: ClickTarget {
+        for opt[i] in [
+            { text: @tr("사용량"), icon: @image-url("icons/gauge.svg") },
+            { text: @tr("리셋 전"), icon: @image-url("icons/clock.svg") },
+        ]: ClickTarget {
             label: opt.text; border-radius: 7px;
             horizontal-stretch: 1; min-width: 0px; preferred-width: 0px;
-            background: i == root.kind ? Theme.selected : transparent;
+            background: i == root.kind ? Theme.selected : self.hovered ? Theme.track : transparent;
             animate background { duration: 120ms; }
             clicked => { root.kind = i; }
             HorizontalLayout { alignment: center; spacing: 6px;
@@ -683,18 +721,18 @@ component AddAlert inherits ClickTarget {
         PopupFrame {
             dismiss => { pop.close(); }
             alert-content := VerticalLayout {
-                HorizontalLayout { padding-left: 16px; padding-right: 9px; padding-top: 14px; spacing: 10px;
+                HorizontalLayout { padding-left: Theme.gap-l; padding-right: Theme.gap-l; padding-top: Theme.gap-l; spacing: Theme.gap-m;
                     VerticalLayout { horizontal-stretch: 1; spacing: 4px;
                         Caption { text: @tr("{} 알림 추가", root.meter.label); font-size: 14.5px; font-weight: 600; }
                         Hint { text: @tr("각 알림은 리셋 전까지 한 번만 표시"); }
                     }
                     RoundIcon { size: 28px; radius: 8px; icon: @image-url("icons/x.svg"); tint: Theme.faint; label: @tr("닫기"); clicked => { pop.close(); } }
                 }
-                VerticalLayout { padding-left: 16px; padding-right: 16px; padding-top: 14px; padding-bottom: 16px; spacing: 0px;
+                VerticalLayout { padding-left: Theme.gap-l; padding-right: Theme.gap-l; padding-top: Theme.gap-m; padding-bottom: Theme.gap-l; spacing: 0px;
                     KindSwitch { kind <=> root.kind; }
-                    Rectangle { height: 14px; }
+                    Rectangle { height: Theme.gap-m; }
                     Hint { text: root.kind == 1 ? @tr("리셋 전 최대 {}", root.meter.reset-lead-label) : root.meter.left ? @tr("알림을 받을 남은 양 선택") : @tr("알림을 받을 사용량 선택"); }
-                    Rectangle { height: 8px; }
+                    Rectangle { height: Theme.gap-s; }
                     if root.kind == 0: VerticalLayout { spacing: 6px;
                         for r in 2: HorizontalLayout { spacing: 6px;
                             for c in 4: PresetKey {
@@ -732,6 +770,13 @@ component AddAlert inherits ClickTarget {
                             enabled: custom-lead.minutes > 0 && !Actions.has-threshold(root.meter.taken-reset, custom-lead.minutes);
                             clicked => { Actions.alert("add", root.meter.key, 1, 0, custom-lead.minutes); pop.close(); } }
                     }
+                    Rectangle { height: Theme.gap-m; }
+                    Rule {}
+                    Rectangle { height: Theme.gap-m; }
+                    UiButton { text: @tr("복합 알림 만들기…"); icon: @image-url("icons/alerts.svg");
+                        ghost: true; start: true; horizontal-stretch: 1;
+                        clicked => { pop.close(); Actions.open-rule(root.meter.key, root.meter.label, root.meter.reset-lead-max, { id: 0 }); }
+                    }
                 }
             }
         }
@@ -746,6 +791,34 @@ component BellToggle inherits ClickTarget {
     background: root.on ? Theme.accent.with-alpha(root.hovered ? 0.18 : 0.12) : root.hovered ? Theme.track : transparent;
     animate background { duration: 120ms; }
     Image { width: 16px; height: 16px; source: root.on ? @image-url("icons/alerts.svg") : @image-url("icons/bell-off.svg"); colorize: root.on ? Theme.accent : Theme.faint; }
+}
+
+component CompoundChip inherits ClickTarget {
+    in property <string> key;
+    in property <CompoundRule> rule;
+    in property <length> room;
+    in property <bool> graph-on;
+    private property <bool> active: Actions.selected-rule-key == root.key && Actions.selected-rule-id == root.rule.id;
+    private property <string> shown: root.rule.conditions.length > 2 ? root.rule.summary
+        : full-width.preferred-width + 38px <= root.room ? root.rule.full
+        : compact-width.preferred-width + 38px <= root.room ? root.rule.compact : root.rule.summary;
+    label: root.rule.accessible-text;
+    height: 30px; border-radius: 15px; border-width: 1px; clip: true;
+    max-width: root.room;
+    border-color: root.active || root.focused || root.hovered ? Theme.accent : Theme.line2;
+    background: root.active ? Theme.soft : root.hovered ? Theme.track : Theme.selected;
+    clicked => {
+        Actions.selected-rule-key = root.active ? "" : root.key;
+        Actions.selected-rule-id = root.rule.id;
+    }
+    full-width := Text { text: root.rule.full; font-size: Theme.size-small; visible: false; }
+    compact-width := Text { text: root.rule.compact; font-size: Theme.size-small; visible: false; }
+    HorizontalLayout {
+        alignment: start; padding-left: 9px; padding-right: 10px; spacing: 5px;
+        CenterItem { Image { width: 14px; height: 14px; source: @image-url("icons/alerts.svg"); colorize: root.active ? Theme.accent : root.graph-on ? Theme.sub : Theme.faint; } }
+        Text { text: root.shown; font-size: Theme.size-small; color: root.active ? Theme.accent : root.graph-on ? Theme.ink : Theme.faint;
+            wrap: no-wrap; overflow: elide; vertical-alignment: center; }
+    }
 }
 
 component MeterCard inherits Rectangle {
@@ -777,7 +850,7 @@ component MeterCard inherits Rectangle {
     changed compact-controls => { basis.close(); }
     // 긴 리셋 알림과 삭제 아이콘까지 들어갈 너비를 확보
     private property <int> per-row: root.width >= 600px ? 3 : root.width >= 390px ? 2 : 1;
-    private property <int> slots: root.meter.alerts.length + 1;
+    private property <int> slots: root.meter.alerts.length + root.meter.compound.length + 1;
     private property <string> dbg: Debug.open;
     changed dbg => { if root.dbg == "basis:" + root.meter.key { basis.show(); } }
     border-radius: 10px; border-width: 1px; border-color: Theme.line; background: Theme.bg;
@@ -877,7 +950,7 @@ component MeterCard inherits Rectangle {
                     // 종(그래프 전체) + 알림 칩들 + [알림 추가]. 칩은 한 줄에 per-row개씩
                     for row in ceil(root.slots / root.per-row): HorizontalLayout {
                         alignment: start; spacing: 6px;
-                        if row == 0 && root.meter.alerts.length > 0: BellToggle {
+                        if row == 0 && root.slots > 1: BellToggle {
                             on: root.meter.alert-on;
                             label: root.meter.alert-on ? @tr("이 그래프 알림 모두 끄기") : @tr("이 그래프 알림 모두 켜기");
                             clicked => { Actions.meter("enabled", root.meter.key, !root.meter.alert-on ? 1 : 0, 0); }
@@ -886,7 +959,31 @@ component MeterCard inherits Rectangle {
                             if row * root.per-row + col < root.meter.alerts.length: AlertChip {
                                 meter: root.meter; item: root.meter.alerts[row * root.per-row + col];
                             }
-                            if row * root.per-row + col == root.meter.alerts.length: AddAlert { meter: root.meter; }
+                            if row * root.per-row + col >= root.meter.alerts.length && row * root.per-row + col < root.slots - 1: CompoundChip {
+                                key: root.meter.key;
+                                graph-on: root.meter.alert-on;
+                                rule: root.meter.compound[row * root.per-row + col - root.meter.alerts.length];
+                                room: max(64px, (root.width - 2 * Theme.gap-l - 6px * (root.per-row - 1) - (row == 0 ? 38px : 0px)) / root.per-row);
+                            }
+                            if row * root.per-row + col == root.slots - 1: AddAlert { meter: root.meter; }
+                        }
+                    }
+                    for rule in root.meter.compound: VerticalLayout {
+                        if Actions.selected-rule-key == root.meter.key && Actions.selected-rule-id == rule.id: Panel {
+                            inset: 10px; gap: 8px;
+                            if rule.conditions.length > 1: Hint {
+                                text: rule.logic == 0 ? @tr("모두 충족") : @tr("하나라도 충족"); color: Theme.accent;
+                            }
+                            for term in rule.details: VerticalLayout { spacing: 2px;
+                                Hint { text: term.metric; }
+                                Caption { text: term.value; font-weight: 600; }
+                            }
+                            HorizontalLayout { alignment: end; spacing: 5px;
+                                UiButton { text: @tr("편집"); small: true;
+                                    clicked => { Actions.open-rule(root.meter.key, root.meter.label, root.meter.reset-lead-max, rule); } }
+                                UiButton { text: @tr("삭제"); small: true; danger: true;
+                                    clicked => { Actions.delete-rule(root.meter.key, rule.id); } }
+                            }
                         }
                     }
                 }

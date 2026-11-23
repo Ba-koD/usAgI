@@ -4,5 +4,12 @@ fn main() {
     let config = slint_build::CompilerConfiguration::new()
         .with_style("fluent".into())
         .with_bundled_translations("lang");
-    slint_build::compile_with_config("ui/settings.slint", config).expect("compile settings UI");
+    let source = if cfg!(feature = "external-fonts")
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+    {
+        "ui/settings.slint"
+    } else {
+        "ui/settings-embedded.slint"
+    };
+    slint_build::compile_with_config(source, config).expect("compile settings UI");
 }

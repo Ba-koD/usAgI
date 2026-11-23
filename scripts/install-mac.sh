@@ -96,6 +96,12 @@ JXA
 fi
 ditto -x -k "$TMP/usAgI-mac.zip" "$TMP"
 [ -d "$TMP/usAgI.app" ] || { echo "압축 안에 usAgI.app 없음" >&2; exit 1; }
+APP="$TMP/usAgI.app"
+NATIVE_APP="$TMP/native/usAgI.app"
+if /usr/bin/ditto --arch "$(uname -m)" "$APP" "$NATIVE_APP" 2>/dev/null \
+    && /usr/bin/codesign --verify --deep --strict "$NATIVE_APP" 2>/dev/null; then
+  APP="$NATIVE_APP"
+fi
 
 # 이 설치 경로에서 실행 중인 앱만 끄고 바꿈.
 for pid in $(pgrep -x usAgI || true); do
@@ -108,7 +114,7 @@ sleep 1
 legacy="$DEST/usAgI.app/Contents/MacOS"
 legacy_data="$legacy/data"
 if [ -d "$legacy_data" ] && { [ -f "$legacy/usagi.portable" ] || [ -f "$legacy_data/usagi.portable" ] || [ -f "$legacy_data/config.toml" ] || [ -f "$legacy_data/state.json" ]; }; then
-  if [ -f "$TMP/usAgI.app/Contents/MacOS/usagi-settings" ]; then
+  if [ -f "$APP/Contents/MacOS/usagi-settings" ]; then
     portable="$DEST/usAgI.data"
     if [ -e "$portable" ] || [ -L "$portable" ]; then
       echo "기존 포터블 데이터를 옮길 폴더가 이미 있습니다: $portable" >&2
@@ -119,12 +125,12 @@ if [ -d "$legacy_data" ] && { [ -f "$legacy/usagi.portable" ] || [ -f "$legacy_d
     [ ! -d "$legacy_data" ] || { echo "포터블 데이터 이동 실패: $legacy_data" >&2; exit 1; }
   else
     # Older bundles look for data inside Contents/MacOS.
-    ditto "$legacy_data" "$TMP/usAgI.app/Contents/MacOS/data"
-    touch "$TMP/usAgI.app/Contents/MacOS/data/usagi.portable"
+    ditto "$legacy_data" "$APP/Contents/MacOS/data"
+    touch "$APP/Contents/MacOS/data/usagi.portable"
   fi
 fi
 rm -rf "$DEST/usAgI.app"
-ditto "$TMP/usAgI.app" "$DEST/usAgI.app"
+ditto "$APP" "$DEST/usAgI.app"
 # curl은 격리 표시를 붙이지 않지만, 다른 경로로 받은 zip일 때를 위해 한 번 더 정리
 xattr -dr com.apple.quarantine "$DEST/usAgI.app" 2>/dev/null || true
 

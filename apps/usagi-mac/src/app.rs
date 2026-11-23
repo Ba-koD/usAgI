@@ -577,8 +577,38 @@ pub fn write_iconset(dir: &std::path::Path) {
         (512, "icon_512x512.png"),
         (1024, "icon_512x512@2x.png"),
     ] {
-        if let Some(png) = usagi_core::rabbit::app_icon(n).and_then(|pm| pm.encode_png().ok()) {
+        if let Some(png) = mac_app_icon(n).and_then(|pm| pm.encode_png().ok()) {
             let _ = std::fs::write(dir.join(name), png);
         }
     }
+}
+
+fn mac_app_icon(size: u32) -> Option<tiny_skia::Pixmap> {
+    use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Transform};
+
+    let mut icon = Pixmap::new(size, size)?;
+    // Leave a transparent margin around the rounded macOS icon tile.
+    let mut tile = PathBuilder::new();
+    tile.move_to(29.0, 10.0);
+    tile.line_to(71.0, 10.0);
+    tile.quad_to(90.0, 10.0, 90.0, 29.0);
+    tile.line_to(90.0, 71.0);
+    tile.quad_to(90.0, 90.0, 71.0, 90.0);
+    tile.line_to(29.0, 90.0);
+    tile.quad_to(10.0, 90.0, 10.0, 71.0);
+    tile.line_to(10.0, 29.0);
+    tile.quad_to(10.0, 10.0, 29.0, 10.0);
+    tile.close();
+
+    let mut black = Paint::default();
+    black.set_color_rgba8(0, 0, 0, 255);
+    black.anti_alias = true;
+    let scale = size as f32 / 100.0;
+    icon.fill_path(&tile.finish()?, &black, FillRule::Winding, Transform::from_scale(scale, scale), None);
+
+    let rabbit_size = (size as f32 * 0.70).round() as u32;
+    let rabbit = usagi_core::rabbit::app_icon(rabbit_size)?;
+    let offset = ((size - rabbit_size) / 2) as i32;
+    icon.draw_pixmap(offset, offset, rabbit.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    Some(icon)
 }

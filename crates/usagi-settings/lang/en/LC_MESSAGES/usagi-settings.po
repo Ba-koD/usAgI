@@ -1112,3 +1112,115 @@ msgstr "Delete the profile and local history for {}?"
 msgctxt "SettingsView"
 msgid "usAgI 전용 폴더의 로그인 파일, 대화 기록, 설정을 영구 삭제."
 msgstr "Permanently deletes sign-in files, conversation history, and settings in the usAgI profile folder."
+
+msgctxt "AddAlert"
+msgid "복합 알림 만들기…"
+msgstr "Create compound alert…"
+
+msgctxt "MeterCard"
+msgid "모두 충족"
+msgstr "Match all"
+
+msgctxt "MeterCard"
+msgid "하나라도 충족"
+msgstr "Match any"
+
+msgctxt "MeterCard"
+msgid "편집"
+msgstr "Edit"
+
+msgctxt "MeterCard"
+msgid "삭제"
+msgstr "Delete"
+
+msgctxt "RuleEditor"
+msgid "{} 복합 알림 추가"
+msgstr "Add {} compound alert"
+
+msgctxt "RuleEditor"
+msgid "{} 복합 알림 편집"
+msgstr "Edit {} compound alert"
+
+msgctxt "RuleEditor"
+msgid "각 알림은 리셋 전까지 한 번만 표시"
+msgstr "One notification per reset cycle"
+
+msgctxt "RuleEditor"
+msgid "모두 충족"
+msgstr "Match all"
+
+msgctxt "RuleEditor"
+msgid "하나라도 충족"
+msgstr "Match any"
+
+msgctxt "RuleEditor"
+msgid "조건 기준"
+msgstr "Condition metric"
+
+msgctxt "RuleEditor"
+msgid "리셋까지 남은 시간"
+msgstr "Time until reset"
+
+msgctxt "RuleEditor"
+msgid "남은 사용량"
+msgstr "Remaining usage"
+
+msgctxt "RuleEditor"
+msgid "사용량"
+msgstr "Usage"
+
+msgctxt "RuleEditor"
+msgid "삭제"
+msgstr "Delete"
+
+msgctxt "RuleEditor"
+msgid "비교"
+msgstr "Comparison"
+
+msgctxt "RuleEditor"
+msgid "< 미만"
+msgstr "< Less than"
+
+msgctxt "RuleEditor"
+msgid "≤ 이하"
+msgstr "≤ At most"
+
+msgctxt "RuleEditor"
+msgid "= 같음"
+msgstr "= Equal to"
+
+msgctxt "RuleEditor"
+msgid "> 초과"
+msgstr "> Greater than"
+
+msgctxt "RuleEditor"
+msgid "≥ 이상"
+msgstr "≥ At least"
+
+msgctxt "RuleEditor"
+msgid "퍼센트"
+msgstr "Percentage"
+
+msgctxt "RuleEditor"
+msgid "조건 추가"
+msgstr "Add condition"
+
+msgctxt "RuleEditor"
+msgid "조건은 최소 1개"
+msgstr "At least one condition"
+
+msgctxt "RuleEditor"
+msgid "알림 시점"
+msgstr "Notify when"
+
+msgctxt "RuleEditor"
+msgid "취소"
+msgstr "Cancel"
+
+msgctxt "RuleEditor"
+msgid "알림 추가"
+msgstr "Add alert"
+
+msgctxt "RuleEditor"
+msgid "저장"
+msgstr "Save"

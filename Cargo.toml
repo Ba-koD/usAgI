@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/usagi-core", "crates/usagi-settings", "apps/usagi-win", "apps/usagi-mac", "tools/usagi-sign"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT"
 
@@ -14,3 +14,8 @@ lto = "thin"
 codegen-units = 16
 panic = "abort"
 strip = true
+
+[profile.settings-release]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1

@@ -91,6 +91,7 @@ fn wire_actions(view: &SettingsView) {
         send(message);
     });
     actions.on_refill(|id, mode, lead| send(json!({"cmd":"refillRule","id":id.as_str(),"mode":mode.as_str(),"lead":lead})));
+    wire_rule_editor(view);
     // 그래프 알림 하나 (코어 cmd: threshold / alertItem, kind: pct | reset)
     actions.on_alert(|op, key, kind, old, new| {
         let kind = if kind == 1 { "reset" } else { "pct" };
@@ -116,11 +117,118 @@ fn wire_actions(view: &SettingsView) {
     });
 }
 
+fn rule_condition(item: RuleCondition) -> Option<usagi_core::alert_rules::Condition> {
+    Some(usagi_core::alert_rules::Condition {
+        metric: *view_state::METRICS.get(item.metric as usize)?,
+        op: *view_state::COMPARISONS.get(item.op as usize)?,
+        value: u32::try_from(item.value).ok()?,
+    })
+}
+
+fn update_rule_summary(actions: &Actions<'_>) {
+    let separator = if actions.get_rule_logic() == 0 {
+        usagi_core::tr!(" 그리고 ", " and ")
+    } else {
+        usagi_core::tr!(" 또는 ", " or ")
+    };
+    let terms = actions.get_rule_conditions().iter().filter_map(rule_condition).map(|term| {
+        format!("{} {}", term.metric.label(), term.description())
+    }).collect::<Vec<_>>();
+    actions.set_rule_summary(terms.join(separator).into());
+}
+
+fn wire_rule_editor(view: &SettingsView) {
+    use usagi_core::alert_rules::Logic;
+    let actions = view.global::<Actions>();
+    let weak = view.as_weak();
+    actions.on_open_rule(move |key, label, maximum, rule| {
+        let Some(view) = weak.upgrade() else { return };
+        let actions = view.global::<Actions>();
+        let mut draft = rule.conditions.iter().collect::<Vec<_>>();
+        if draft.is_empty() {
+            draft = vec![
+                RuleCondition { metric: 0, op: 1, value: maximum.min(60) },
+                RuleCondition { metric: 1, op: 1, value: 20 },
+            ];
+        }
+        actions.set_rule_meter(label);
+        actions.set_rule_max(maximum);
+        actions.set_rule_id(rule.id);
+        actions.set_rule_logic(rule.logic);
+        actions.set_rule_conditions(ModelRc::new(VecModel::from(draft)));
+        actions.set_rule_key(key);
+        update_rule_summary(&actions);
+    });
+    let weak = view.as_weak();
+    actions.on_rule_logic_changed(move || {
+        if let Some(view) = weak.upgrade() { update_rule_summary(&view.global::<Actions>()); }
+    });
+    let weak = view.as_weak();
+    actions.on_rule_row(move |field, index, value| {
+        let Some(view) = weak.upgrade() else { return };
+        let actions = view.global::<Actions>();
+        let model = actions.get_rule_conditions();
+        let Some(rows) = model.as_any().downcast_ref::<VecModel<RuleCondition>>() else { return };
+        if field == "add" {
+            let metric = (0..3).find(|metric| rows.iter().all(|condition| condition.metric != *metric)).unwrap_or(1);
+            let (op, value) = match metric {
+                0 => (1, actions.get_rule_max().min(60)),
+                1 => (1, 20),
+                _ => (4, 80),
+            };
+            rows.push(RuleCondition { metric, op, value });
+            update_rule_summary(&actions);
+            return;
+        }
+        let index = index as usize;
+        let Some(mut row) = rows.row_data(index) else { return };
+        match field.as_str() {
+            "remove" if rows.row_count() > 1 => {
+                rows.remove(index);
+                update_rule_summary(&actions);
+                return;
+            }
+            "metric" if (0..3).contains(&value) && row.metric != value => {
+                row.metric = value;
+                row.value = match value { 0 => actions.get_rule_max().min(60), 1 => 20, _ => 80 };
+                row.op = if value == 2 { 4 } else { 1 };
+            }
+            "operator" if (0..5).contains(&value) => row.op = value,
+            "value" => row.value = value.clamp(0, if row.metric == 0 { actions.get_rule_max() } else { 100 }),
+            _ => return,
+        }
+        if rows.row_data(index) != Some(row.clone()) {
+            rows.set_row_data(index, row);
+            update_rule_summary(&actions);
+        }
+    });
+    let weak = view.as_weak();
+    actions.on_save_rule(move || {
+        let Some(view) = weak.upgrade() else { return };
+        let actions = view.global::<Actions>();
+        let draft = actions.get_rule_conditions();
+        let conditions = draft.iter().map(rule_condition).collect::<Option<Vec<_>>>();
+        let Some(conditions) = conditions.filter(|items| !items.is_empty()) else { return };
+        let id = actions.get_rule_id();
+        let logic = if actions.get_rule_logic() == 0 { Logic::And } else { Logic::Or };
+        send(json!({"cmd":"alertRule", "op": if id == 0 { "add" } else { "edit" },
+            "key":actions.get_rule_key().as_str(), "id":id, "logic":logic, "conditions":conditions}));
+        actions.set_rule_key("".into());
+    });
+    let weak = view.as_weak();
+    actions.on_delete_rule(move |key, id| {
+        send(json!({"cmd":"alertRule","op":"delete","key":key.as_str(),"id":id}));
+        if let Some(view) = weak.upgrade() { view.global::<Actions>().set_selected_rule_key("".into()); }
+    });
+}
+
 pub fn run() -> Result<(), slint::PlatformError> {
     // 작업 표시줄: 본체(시작 메뉴 바로 가기)와 다른 앱 ID를 줘서, 바로 가기 아이콘 대신 창 아이콘(로고 색 설정)을 쓰게 함
     #[cfg(windows)]
     live::set_app_id();
     let view = SettingsView::new()?;
+    #[cfg(all(target_os = "macos", feature = "external-fonts"))]
+    load_bundled_fonts(view.window())?;
     #[cfg(windows)]
     {
         view.global::<Motion>().set_live_clock(true);
@@ -208,6 +316,23 @@ pub fn run() -> Result<(), slint::PlatformError> {
     });
     send(json!({"cmd":"ready"}));
     slint::run_event_loop()
+}
+
+#[cfg(all(target_os = "macos", feature = "external-fonts"))]
+fn load_bundled_fonts(window: &slint::Window) -> Result<(), slint::PlatformError> {
+    // Slint 1.17 exposes dynamic font registration through its renderer.
+    use slint::private_unstable_api::re_exports::WindowInner;
+
+    let exe = std::env::current_exe().map_err(|e| slint::PlatformError::Other(e.to_string()))?;
+    let contents = exe.parent().and_then(std::path::Path::parent)
+        .ok_or_else(|| slint::PlatformError::Other("Missing app bundle".into()))?;
+    let fonts = contents.join("Resources/Fonts");
+    let adapter = WindowInner::from_pub(window).window_adapter();
+    for name in ["UsagiUI-Medium.otf", "UsagiUI-SemiBold.otf"] {
+        adapter.renderer().register_font_from_path(&fonts.join(name))
+            .map_err(|e| slint::PlatformError::Other(e.to_string()))?;
+    }
+    Ok(())
 }
 
 pub fn main_window() {

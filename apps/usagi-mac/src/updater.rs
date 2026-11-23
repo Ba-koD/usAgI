@@ -88,7 +88,27 @@ pub fn download(rel: &Release) -> Result<PathBuf, String> {
     if !ok.success() || !["usAgI", "usagi-settings"].iter().all(|name| app.join("Contents/MacOS").join(name).is_file()) {
         return Err(usagi_core::tr!("받은 압축 파일에 usAgI.app 없음", "usAgI.app not found in the downloaded archive").into());
     }
-    Ok(app)
+    let _ = std::fs::remove_file(zip);
+    if let Some(native) = stage_native_app(&app) {
+        let _ = std::fs::remove_dir_all(app);
+        Ok(native)
+    } else {
+        Ok(app)
+    }
+}
+
+fn stage_native_app(app: &Path) -> Option<PathBuf> {
+    let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" };
+    let native = app.parent()?.join("native/usAgI.app");
+    // Thin a copy of the checked archive contents. The original remains
+    // available if a host tool can't preserve its Mach-O signatures.
+    let copied = Command::new("/usr/bin/ditto").args(["--arch", arch])
+        .arg(app).arg(&native).output().ok()?.status.success();
+    if !copied {
+        return None;
+    }
+    Command::new("/usr/bin/codesign").args(["--verify", "--deep", "--strict"])
+        .arg(&native).output().ok()?.status.success().then_some(native)
 }
 
 /// 새 .app으로 바꾸고 다시 시작 (성공하면 호출한 쪽이 종료해야 함)

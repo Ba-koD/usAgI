@@ -1,7 +1,11 @@
-use super::{Account, AlertItem, LoginInfo, Meter, NoteLine, Preferences, SettingsView, UpdateInfo};
+use super::{Account, AlertItem, CompoundRule, LoginInfo, Meter, NoteLine, Preferences, RuleCondition, RuleDetail, SettingsView, UpdateInfo};
 use serde_json::Value;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use usagi_core::tr;
+use usagi_core::alert_rules::{Comparison, Logic, Metric, Rule};
+
+pub const METRICS: [Metric; 3] = [Metric::Time, Metric::Left, Metric::Used];
+pub const COMPARISONS: [Comparison; 5] = [Comparison::Lt, Comparison::Le, Comparison::Eq, Comparison::Gt, Comparison::Ge];
 
 pub const INTERVALS: [u32; 5] = [1, 3, 5, 10, 15];
 
@@ -33,6 +37,31 @@ fn rows<T: Clone + PartialEq + 'static>(current: ModelRc<T>, values: Vec<T>) -> 
         }
     }
     current
+}
+
+fn compound(rule: Rule, previous: Option<CompoundRule>) -> CompoundRule {
+    let logic = if rule.logic == Logic::And { "AND" } else { "OR" };
+    let separator = format!("  {logic}  ");
+    let (old_conditions, old_details) = previous.map(|r| (r.conditions, r.details)).unwrap_or_default();
+    let conditions = rule.conditions.iter().map(|c| RuleCondition {
+        metric: METRICS.iter().position(|m| *m == c.metric).unwrap() as i32,
+        op: COMPARISONS.iter().position(|op| *op == c.op).unwrap() as i32,
+        value: c.value as i32,
+    }).collect();
+    let details = rule.conditions.iter().map(|c| RuleDetail {
+        metric: c.metric.label().into(), value: c.description().into(),
+    }).collect();
+    let full = rule.conditions.iter().map(|c| c.description()).collect::<Vec<_>>().join(&separator);
+    let compact = rule.conditions.iter().map(|c| format!("{}{}", c.op.symbol(), c.amount())).collect::<Vec<_>>().join(&separator);
+    let count = rule.conditions.len();
+    let summary = if count == 1 { compact.clone() }
+        else { tr!(format!("조건 {count}개 {logic}"), format!("{count} conditions · {logic}")) };
+    let accessible = rule.conditions.iter().map(|c| format!("{} {}", c.metric.label(), c.description())).collect::<Vec<_>>().join(&separator);
+    CompoundRule {
+        id: rule.id as i32, logic: (rule.logic == Logic::Or) as i32,
+        conditions: rows(old_conditions, conditions), details: rows(old_details, details),
+        full: full.into(), compact: compact.into(), summary: summary.into(), accessible_text: accessible.into(),
+    }
 }
 
 fn meter(v: &Value, previous: Option<Meter>) -> Meter {
@@ -73,10 +102,15 @@ fn meter(v: &Value, previous: Option<Meter>) -> Meter {
     }
     let taken_pct: Vec<i32> = pct.iter().map(|&(x, _)| x).collect();
     let taken_reset: Vec<i32> = lead.iter().map(|&(x, _)| x).collect();
-    let (old_thresholds, old_alerts, old_pct, old_reset) = match previous {
-        Some(m) => (m.thresholds, m.alerts, m.taken_pct, m.taken_reset),
+    let (old_thresholds, old_alerts, old_pct, old_reset, old_rules) = match previous {
+        Some(m) => (m.thresholds, m.alerts, m.taken_pct, m.taken_reset, m.compound),
         None => Default::default(),
     };
+    let rules = list(&v["alertRules"]).iter().filter_map(|raw| serde_json::from_value::<Rule>(raw.clone()).ok())
+        .enumerate().map(|(i, rule)| {
+            let previous = old_rules.row_data(i).filter(|r| r.id == rule.id as i32);
+            compound(rule, previous)
+        }).collect();
     Meter {
         key: key.into(),
         label: text(v, "label").into(),
@@ -94,6 +128,7 @@ fn meter(v: &Value, previous: Option<Meter>) -> Meter {
         reset_lead_label: usagi_core::texts::fmt_lead(f64::from(reset_lead_max)).into(),
         thresholds: rows(old_thresholds, thresholds),
         alerts: rows(old_alerts, items),
+        compound: rows(old_rules, rules),
         taken_pct: rows(old_pct, taken_pct),
         taken_reset: rows(old_reset, taken_reset),
     }

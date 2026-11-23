@@ -14,14 +14,18 @@ try {
     # CI에서는 Cargo.lock 그대로 (바뀌면 실패)
     $extra = @()
     if ($env:CI) { $extra += @('--locked', '--timings') }
-    cargo build --release -p usagi-win -p usagi-settings @extra
+    $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
+    $timings = Join-Path $target 'cargo-timings'
+    cargo build --release -p usagi-win @extra
     if ($LASTEXITCODE -ne 0) { throw "빌드 실패" }
+    if ($env:CI) { Copy-Item (Join-Path $timings 'cargo-timing.html') (Join-Path $timings 'windows-host.html') }
+    cargo build --profile settings-release -p usagi-settings @extra
+    if ($LASTEXITCODE -ne 0) { throw "설정 빌드 실패" }
+    if ($env:CI) { Copy-Item (Join-Path $timings 'cargo-timing.html') (Join-Path $timings 'windows-settings.html') }
 
     $dist = Join-Path $root 'dist'
-    $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
-    $build = Join-Path $target 'release'
-    $hostExe = Join-Path $build 'usagi.exe'
-    $settingsExe = Join-Path $build 'usagi-settings.exe'
+    $hostExe = Join-Path $target 'release/usagi.exe'
+    $settingsExe = Join-Path $target 'settings-release/usagi-settings.exe'
     $rel = Join-Path $dist 'release'
     New-Item -ItemType Directory -Force $rel | Out-Null
     $exe = Join-Path $rel 'usagi.exe'
@@ -33,7 +37,11 @@ try {
         $inputStream = [IO.File]::OpenRead($settingsExe)
         try {
             if ($inputStream.Length -eq 0 -or $inputStream.Length -gt 64MB) { throw '설정 실행 파일 크기 오류' }
-            $gzip = [IO.Compression.GZipStream]::new($output, [IO.Compression.CompressionLevel]::Optimal, $true)
+            $level = [IO.Compression.CompressionLevel]::Optimal
+            if ([Enum]::IsDefined([IO.Compression.CompressionLevel], 'SmallestSize')) {
+                $level = [IO.Compression.CompressionLevel]::SmallestSize
+            }
+            $gzip = [IO.Compression.GZipStream]::new($output, $level, $true)
             try { $inputStream.CopyTo($gzip) } finally { $gzip.Dispose() }
         } finally {
             $inputStream.Dispose()

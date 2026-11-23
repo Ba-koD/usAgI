@@ -141,7 +141,7 @@ jobs:
         if: ${{ !cancelled() }}
         with:
           name: timings-Windows
-          path: target/cargo-timings/cargo-timing.html
+          path: target/cargo-timings/windows-*.html
           if-no-files-found: ignore
           retention-days: 7
 
@@ -177,7 +177,12 @@ jobs:
         run: cargo test -p usagi-core --locked
 
       - name: macOS 바이너리 빌드
-        run: cargo build --locked --release --timings -p usagi-mac -p usagi-settings --target "$TARGET"
+        run: |
+          cargo build --locked --release --timings -p usagi-mac --target "$TARGET"
+          cp target/cargo-timings/cargo-timing.html target/cargo-timings/usagi-mac.html
+          cargo build --locked --profile settings-release --timings -p usagi-settings --features external-fonts --target "$TARGET"
+          cp target/cargo-timings/cargo-timing.html target/cargo-timings/usagi-settings.html
+          cp "target/$TARGET/settings-release/usagi-settings" "target/$TARGET/release/usagi-settings"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -193,7 +198,7 @@ jobs:
         if: ${{ !cancelled() }}
         with:
           name: timings-${{ matrix.target }}
-          path: target/cargo-timings/cargo-timing.html
+          path: target/cargo-timings/usagi-*.html
           if-no-files-found: ignore
           retention-days: 7
 

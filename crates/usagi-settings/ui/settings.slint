@@ -1,9 +1,8 @@
 import { FocusOut, Theme, CenterItem, NavItem, UiButton, Segments, Toggle } from "style.slint";
 import { AboutSlint, Palette, ScrollView } from "std-widgets.slint";
+import { RuleEditor } from "rule-editor.slint";
 import { Account, AccountCard, Actions, AddAccount, Banner, Debug, Fold, NoteLine, Notes, WidgetPreview, Dropdown, Motion, LeadTime, BarLength, TextField, Caption, Group, Hint, Heading, Panel, PrefToggle, Rule, Section, SettingRow } from "components.slint";
-import "fonts/Pretendard-Medium.otf";
-import "fonts/Pretendard-SemiBold.otf";
-export { Account, Meter, AlertItem, NoteLine, Actions, Debug, Motion } from "components.slint";
+export { Account, Meter, AlertItem, CompoundRule, RuleCondition, RuleDetail, NoteLine, Actions, Debug, Motion } from "components.slint";
 
 export struct Preferences {
     widget: bool, side: string, monitor-index: int, mode: string, theme: string, locale: string, logo: string, bar-px: int, bar-min: int, bar-max: int, bar-default: int, bars: bool, basis: string, refresh: int,
@@ -33,7 +32,7 @@ export component SettingsView inherits Window {
     // 최소 크기: 계정 카드 머리줄(로고·이름·위젯 켜기)과 그래프 한 장, 설정 한 줄이 잘리지 않는 크기
     min-width: 600px; min-height: 500px;
     background: Theme.bg;
-    default-font-family: "Pretendard";
+    default-font-family: "Usagi UI";
     default-font-weight: 500;
     in property <[Account]> accounts;
     in property <Preferences> prefs;
@@ -483,6 +482,7 @@ export component SettingsView inherits Window {
     }
     // 시스템 제목 표시줄 아래에서 사이드바와 본문을 함께 구분
     Rule { x: 0px; y: 0px; width: root.width; background: Theme.line2; }
+    if Actions.rule-key != "": RuleEditor { width: root.width; height: root.height; }
     if Actions.confirm-cmd != "": Backdrop {
         background: #0007;
         TouchArea {}

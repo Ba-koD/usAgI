@@ -1,0 +1,82 @@
+import { Theme, UiButton, Segments, CenterItem } from "style.slint";
+import { Actions, Caption, Dropdown, Hint, Panel, Rule, Section, Stepper, LeadInput } from "components.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export component RuleEditor inherits Rectangle {
+    background: #0007;
+    TouchArea {}
+    Panel {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(572px, parent.width - 32px);
+        inset: 16px; gap: 12px;
+        VerticalLayout { spacing: 4px;
+            Section { text: Actions.rule-id == 0 ? @tr("{} 복합 알림 추가", Actions.rule-meter) : @tr("{} 복합 알림 편집", Actions.rule-meter); }
+            Hint { text: @tr("각 알림은 리셋 전까지 한 번만 표시"); }
+        }
+        if Actions.rule-conditions.length > 1: Segments {
+            options: [@tr("모두 충족") + "  AND", @tr("하나라도 충족") + "  OR"];
+            index: Actions.rule-logic;
+            selected(value) => { Actions.rule-logic = value; Actions.rule-logic-changed(); }
+        }
+        ScrollView {
+            height: min(condition-list.preferred-height, max(96px, root.height - 324px));
+            viewport-width: self.visible-width;
+            horizontal-scrollbar-policy: always-off;
+            condition-list := VerticalLayout {
+                width: parent.width; height: self.preferred-height; spacing: 8px;
+                for condition[i] in Actions.rule-conditions: Panel {
+                    inset: Theme.gap-s; gap: 0px;
+                    HorizontalLayout { spacing: Theme.gap-s;
+                        Dropdown {
+                            label: @tr("조건 기준");
+                            model: [@tr("리셋까지 남은 시간"), @tr("남은 사용량"), @tr("사용량")];
+                            current: condition.metric; popup-width: 200px; min-width: 0px; horizontal-stretch: 1;
+                            selected(value) => { Actions.rule-row("metric", i, value); }
+                        }
+                        Dropdown {
+                            label: @tr("비교");
+                            width: 106px; popup-width: 136px;
+                            model: [@tr("< 미만"), @tr("≤ 이하"), @tr("= 같음"), @tr("> 초과"), @tr("≥ 이상")];
+                            current: condition.op;
+                            selected(value) => { Actions.rule-row("operator", i, value); }
+                        }
+                        HorizontalLayout { width: 144px; alignment: start; spacing: 5px;
+                            if condition.metric == 0: LeadInput {
+                                initial: condition.value; maximum: Actions.rule-max; allow-zero: true; show-keys: false;
+                                committed(value) => { Actions.rule-row("value", i, value); }
+                                edited-value(value) => { Actions.rule-row("value", i, value); }
+                            }
+                            if condition.metric != 0: Stepper {
+                                label: @tr("퍼센트"); value: condition.value; maximum: 100; show-keys: false;
+                                committed(value) => { Actions.rule-row("value", i, value); }
+                                edited-value(value) => { Actions.rule-row("value", i, value); }
+                            }
+                            if condition.metric != 0: CenterItem { Caption { text: "%"; } }
+                        }
+                        CenterItem { UiButton {
+                            text: @tr("삭제"); danger: true; ghost: true; enabled: Actions.rule-conditions.length > 1;
+                            clicked => { Actions.rule-row("remove", i, 0); }
+                        } }
+                    }
+                }
+            }
+        }
+        HorizontalLayout { spacing: 8px;
+            UiButton { text: @tr("조건 추가"); small: true; icon: @image-url("icons/plus.svg");
+                clicked => { Actions.rule-row("add", 0, 0); } }
+            Rectangle { horizontal-stretch: 1; }
+            if Actions.rule-conditions.length == 1: CenterItem { Hint { text: @tr("조건은 최소 1개"); } }
+        }
+        Rule {}
+        VerticalLayout { spacing: 4px; height: 48px;
+            Hint { text: @tr("알림 시점"); }
+            Caption { text: Actions.rule-summary; wrap: no-wrap; overflow: elide; }
+        }
+        HorizontalLayout { alignment: end; spacing: 6px;
+            UiButton { text: @tr("취소"); ghost: true; clicked => { Actions.rule-key = ""; } }
+            UiButton { text: Actions.rule-id == 0 ? @tr("알림 추가") : @tr("저장"); primary: true;
+                clicked => { Actions.save-rule(); } }
+        }
+    }
+}

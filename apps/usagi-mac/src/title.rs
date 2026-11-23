@@ -214,6 +214,8 @@ pub fn apply(tray: &TrayIcon, parts: &[Part], dark: bool) {
     let Some(item) = tray.ns_status_item() else { return };
     let Some(button) = item.button(mtm) else { return };
     button.setAttributedTitle(&compose(parts, dark, &Ink::system()));
+    // tray-icon's mouse view must follow AppKit's new title width.
+    let _ = tray.set_tooltip(Some("usAgI"));
 }
 
 /// 설정 창 미리 보기 그림 (실제 픽셀 크기, RGBA). 띠 색은 설정 창의 미리 보기 띠와 같음

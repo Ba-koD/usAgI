@@ -9,32 +9,34 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+SETTINGS_BINS=()
 if [ "$#" -eq 0 ]; then
   TARGETS=(aarch64-apple-darwin)
   if rustup target list --installed 2>/dev/null | grep -q '^x86_64-apple-darwin$'; then
     TARGETS+=(x86_64-apple-darwin)
   fi
-  ARGS=(--release -p usagi-mac -p usagi-settings)
+  ARGS=()
   [ -n "${CI:-}" ] && ARGS+=(--locked)
   BINS=()
   for t in "${TARGETS[@]}"; do
     ARGS+=(--target "$t")
     BINS+=("${CARGO_TARGET_DIR:-target}/$t/release/usagi-mac")
+    SETTINGS_BINS+=("${CARGO_TARGET_DIR:-target}/$t/settings-release/usagi-settings")
   done
-  cargo build "${ARGS[@]}"
+  cargo build --release -p usagi-mac "${ARGS[@]}"
+  cargo build --profile settings-release -p usagi-settings --features external-fonts "${ARGS[@]}"
 elif [ "$#" -eq 2 ]; then
   BINS=("$@")
+  for bin in "${BINS[@]}"; do
+    SETTINGS_BINS+=("$(dirname "$bin")/usagi-settings")
+  done
 else
   echo "사용: bash scripts/package-mac.sh [<ARM 바이너리> <Intel 바이너리>]" >&2
   exit 1
 fi
 
-SETTINGS_BINS=()
-for bin in "${BINS[@]}"; do
+for bin in "${BINS[@]}" "${SETTINGS_BINS[@]}"; do
   [ -s "$bin" ] || { echo "macOS 바이너리 없음: $bin" >&2; exit 1; }
-  settings="$(dirname "$bin")/usagi-settings"
-  [ -s "$settings" ] || { echo "macOS 설정 실행 파일 없음: $settings" >&2; exit 1; }
-  SETTINGS_BINS+=("$settings")
 done
 
 APP=dist/usAgI.app
@@ -42,6 +44,8 @@ EXE="$APP/Contents/MacOS/usAgI"
 SETTINGS="$APP/Contents/MacOS/usagi-settings"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/Resources/Fonts"
+cp crates/usagi-settings/ui/fonts/UsagiUI-*.otf "$APP/Contents/Resources/Fonts/"
 if [ "${#BINS[@]}" -gt 1 ]; then
   lipo -create "${BINS[@]}" -output "$EXE"
   lipo -create "${SETTINGS_BINS[@]}" -output "$SETTINGS"
