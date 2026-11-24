@@ -109,7 +109,7 @@ Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UP
 - 캐시 저장: `scripts/ci-deps-hash.sh`의 의존성 지문(외부 의존성·기능·프로필·Rust 버전, 우리 버전 번호 제외)이 지난번과 같으면 큰 캐시를 다시 올리지 않음. 버전만 올린 릴리스는 작업마다 업로드 시간을 아낌
 - `release.yml`은 `Cargo.toml`·`Cargo.lock`이 바뀐 main 푸시에서만 실행. 의존성만 바뀐 푸시는 빌드만 해서 캐시를 미리 새로 만듦 (게시 안 함)
 - 테스트·컴파일 확인은 디버그 정보 없이(`CARGO_PROFILE_DEV_DEBUG=0`) 빌드해서 빠르고 캐시가 작음
-- 수동 실행(Actions → Build & Release → **Run workflow**)은 빌드만 하고, 실행 페이지에서 산출물과 `timings-*` 컴파일 리포트를 7일간 확인 가능. main에서 **publish**를 켜면 아직 게시하지 않은 버전을 게시
+- 수동 실행(Actions → Build & Release → **Run workflow**)은 빌드만 하고, 실행 페이지에서 산출물과 `timings-*` 컴파일 리포트를 7일간 확인 가능. main에서 **publish**를 켜면 아직 게시하지 않은 버전을 게시. **save_cache**를 켜면 main이 아닌 브랜치에도 의존성 캐시를 저장 (그 브랜치에서만 읽힘, 캐시 효과 확인용)
 
 | 릴리스 파일 | 쓰는 곳 |
 |---|---|

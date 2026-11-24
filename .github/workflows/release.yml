@@ -28,6 +28,10 @@ on:
         description: "게시까지 (main에서, 아직 게시하지 않은 버전만)"
         type: boolean
         default: false
+      save_cache:
+        description: "이 브랜치에도 의존성 캐시 저장 (main이 아닌 브랜치에서 캐시 효과를 확인할 때)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -158,18 +162,18 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-test-${{ matrix.os }}
-          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+          save-if: ${{ (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true' }}
 
       - name: 공통 로직 테스트 (이 OS에서)
         run: cargo test -p usagi-core --locked
 
       - name: 의존성 캐시 표시 저장
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         shell: bash
         run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         with:
           path: .deps-marker
           key: deps-${{ github.job }}-${{ matrix.os }}-${{ steps.deps.outputs.hash }}
@@ -203,7 +207,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-signer
-          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+          save-if: ${{ (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true' }}
 
       - name: 서명 도구 빌드
         run: cargo build --locked --release -p usagi-sign
@@ -216,11 +220,11 @@ jobs:
           retention-days: 1
 
       - name: 의존성 캐시 표시 저장
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         with:
           path: .deps-marker
           key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
@@ -256,7 +260,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-win-host
-          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+          save-if: ${{ (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true' }}
 
       - name: 본체 빌드 (배포용 dist 프로필)
         shell: bash
@@ -281,12 +285,12 @@ jobs:
           retention-days: 7
 
       - name: 의존성 캐시 표시 저장
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         shell: bash
         run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         with:
           path: .deps-marker
           key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
@@ -322,7 +326,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-win-settings
-          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+          save-if: ${{ (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true' }}
 
       - name: 설정 창 빌드
         shell: bash
@@ -347,12 +351,12 @@ jobs:
           retention-days: 7
 
       - name: 의존성 캐시 표시 저장
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         shell: bash
         run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         with:
           path: .deps-marker
           key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
@@ -421,7 +425,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-mac-host-${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+          save-if: ${{ (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true' }}
 
       - name: 본체 빌드 (배포용 dist 프로필)
         run: |
@@ -445,11 +449,11 @@ jobs:
           retention-days: 7
 
       - name: 의존성 캐시 표시 저장
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         with:
           path: .deps-marker
           key: deps-${{ github.job }}-${{ matrix.target }}-${{ steps.deps.outputs.hash }}
@@ -489,7 +493,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-mac-settings-${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+          save-if: ${{ (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true' }}
 
       - name: 설정 창 빌드
         run: |
@@ -513,11 +517,11 @@ jobs:
           retention-days: 7
 
       - name: 의존성 캐시 표시 저장
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        if: (github.ref == 'refs/heads/main' || inputs.save_cache) && steps.marker.outputs.cache-hit != 'true'
         with:
           path: .deps-marker
           key: deps-${{ github.job }}-${{ matrix.target }}-${{ steps.deps.outputs.hash }}
