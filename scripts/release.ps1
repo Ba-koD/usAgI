@@ -44,7 +44,7 @@ try {
         git commit -m "Chore: Prepare release version $ver" -m "- 버전 $ver 릴리스 준비"
         if ($LASTEXITCODE -ne 0) { throw "커밋 실패" }
         Write-Host ""
-        Write-Host "버전 커밋 완료. main에 올리면 GitHub Actions가 빌드·게시하고 태그 v$ver를 만듦:"
+        Write-Host "버전 커밋 완료. main에 올리면 GitHub Actions가 빌드·게시하고 태그 v$($ver)를 만듦:"
         Write-Host "  git push origin main"
         Write-Host "서명(.minisig)은 게시 단계에서 자동 생성 (비밀값 UPDATE_SIGNING_KEY 필요)"
     } else {
