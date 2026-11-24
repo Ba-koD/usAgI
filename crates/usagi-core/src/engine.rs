@@ -1340,13 +1340,64 @@ impl Engine {
     }
 
     /// 테스트용: 스레드 없이 명령을 버리는 엔진 (CLI를 실행하지 않음)
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mock"))]
     pub(crate) fn idle() -> Engine {
         let (tx, _) = mpsc::channel();
         let (login_tx, _) = mpsc::channel();
         let (probe_tx, _) = mpsc::channel();
         Engine { tx, cfg: Arc::new(Mutex::new(Config::default())), login_tx, probe_tx }
     }
+
+    /// 테스트 빌드(mock): CLI·네트워크·로그 읽기 없이, 등록된 계정마다 가짜 사용량을 3초마다 보냄.
+    /// 화면(위젯·메뉴 막대·설정 창) 동작을 실제 계정과 상관없이 확인하는 용도
+    #[cfg(feature = "mock")]
+    pub fn mock<F: Fn(Snapshot) + Send + 'static>(on_snapshot: F) -> Engine {
+        std::thread::Builder::new()
+            .name("usagi-mock".into())
+            .spawn(move || loop {
+                on_snapshot(mock_snapshot(time::now()));
+                std::thread::sleep(Duration::from_secs(3));
+            })
+            .expect("spawn mock thread");
+        Engine::idle()
+    }
+}
+
+/// 가짜 사용량: 계정 순서대로 조금씩 다른 값이 천천히 오르내림 (막대가 움직이는지도 보이게)
+#[cfg(feature = "mock")]
+fn mock_snapshot(now: f64) -> Snapshot {
+    let accounts = accounts::load(&State::load());
+    let wave = |base: f64, phase: f64| (base + 0.08 * (now / 40.0 + phase).sin()).clamp(0.0, 1.0);
+    let mut providers = Vec::new();
+    let mut logins = HashMap::new();
+    for (i, acc) in accounts.iter().enumerate() {
+        let p = i as f64;
+        let meter = |label: &str, ratio: f64, resets_in: f64| Meter { label: label.into(), ratio, resets_at: Some(now + resets_in), exact: true };
+        let (id, name, meters) = if acc.is_claude() {
+            (ProviderId::Claude, "Claude", vec![meter("5시간", wave(0.62, p), 2.2 * HOUR), meter("주간", wave(0.38, p + 1.0), 4.0 * DAY)])
+        } else {
+            (ProviderId::Codex, "Codex", vec![meter("5시간", wave(0.47, p), 3.1 * HOUR), meter("주간", wave(0.12, p + 2.0), 5.5 * DAY)])
+        };
+        providers.push(ProviderView {
+            id,
+            account_id: acc.id.clone(),
+            name: name.into(),
+            meters,
+            updated_at: Some(now),
+            note: None,
+            forecast: None,
+            show: acc.show,
+            email: None,
+            workspace_id: None,
+            plan: None,
+            credits: None,
+            refills: None,
+            extra: None,
+        });
+        logins.insert(acc.id.clone(), LoginStatus { logged_in: Some(true), checked_at: now, ..Default::default() });
+    }
+    let revisions = accounts.iter().map(|a| (a.id.clone(), a.revision)).collect();
+    Snapshot { now, claude: None, providers, logins, probes: HashMap::new(), revisions, claude_statuses: HashMap::new() }
 }
 
 /// 한 번만 계산 (CLI `--status` 등)

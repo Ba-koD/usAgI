@@ -235,8 +235,10 @@ pub(crate) fn quiet_command(program: &Path) -> Command {
     cmd
 }
 
+/// 자식 프로세스와 그 자식(.cmd·node가 띄운 실제 CLI 등)을 한 묶음으로: 이 값이 없어지면 모두 종료.
+/// 시간 초과로 직계 프로세스만 끝내면 손자 프로세스가 남아 출력 파이프를 붙잡고, 읽는 스레드도 영원히 남음
 #[cfg(windows)]
-struct ChildJob(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct ChildJob(windows_sys::Win32::Foundation::HANDLE);
 
 // The parent controls this handle, and never shares it with the child processes.
 #[cfg(windows)]
@@ -244,7 +246,7 @@ unsafe impl Send for ChildJob {}
 
 #[cfg(windows)]
 impl ChildJob {
-    fn attach(child: &Child) -> std::io::Result<Self> {
+    pub(crate) fn attach(child: &Child) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::*;
         unsafe {
@@ -323,7 +325,10 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<String
 }
 
 pub(crate) fn capture_child_output(mut child: Child, timeout: Duration) -> std::io::Result<(String, String)> {
-    let read = |mut output: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
+    // 끝나면(정상·시간 초과 모두) CLI가 띄운 하위 프로세스까지 정리 → 출력 파이프가 닫혀 읽는 스레드도 끝남
+    #[cfg(windows)]
+    let _job = ChildJob::attach(&child).ok();
+    let read =|mut output: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = (&mut output).take(256 * 1024).read_to_end(&mut bytes);
         // Keep draining after the capture limit so the child never blocks on a full pipe.

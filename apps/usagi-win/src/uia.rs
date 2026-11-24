@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -18,11 +19,13 @@ use windows::Win32::UI::Accessibility::{
 };
 
 pub const HELPER_ARG: &str = "--taskbar-extents";
-// XAML 변경 이벤트가 빠질 수 있어 드물게 좌표를 재확인.
+// 15초마다 작업 표시줄 지문(위치·크기·배율·버튼이 있는 창 목록)만 가볍게 확인하고, 바뀌었을 때만 도우미 실행.
+// XAML 변경 이벤트가 빠질 수 있어 지문이 같아도 60초마다 한 번은 실제로 다시 잼.
 const IDLE: Duration = Duration::from_secs(15);
+const FORCE: Duration = Duration::from_secs(60);
 const QUICK: Duration = Duration::from_millis(1200);
 const SETTLE: Duration = Duration::from_millis(250);
-const FRESH: Duration = Duration::from_secs(35);
+const FRESH: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Extents {
@@ -40,6 +43,8 @@ struct Cache {
 
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
 static WAKE: OnceLock<SyncSender<()>> = OnceLock::new();
+/// 지문과 상관없이 다음 확인 때 꼭 다시 잼 (탐색기가 작업 표시줄 배치를 바꿈, 화면 구성 변경, 대상 변경)
+static FORCE_NEXT: AtomicBool = AtomicBool::new(false);
 
 pub fn get(taskbar: isize) -> Option<Extents> {
     let cache = CACHE.lock().ok()?;
@@ -51,8 +56,17 @@ pub fn is_active() -> bool {
     CACHE.lock().is_ok_and(|cache| !cache.targets.is_empty())
 }
 
+/// 앞 창이 바뀜: 작업 표시줄 버튼이 늘거나 줄었을 수 있음 → 지문이 바뀌었으면 다시 잼
 pub fn poke() {
     if is_active() {
+        wake();
+    }
+}
+
+/// 탐색기가 작업 표시줄 안의 창을 옮겼거나 화면 구성이 바뀜 → 지문과 상관없이 다시 잼
+pub fn poke_layout() {
+    if is_active() {
+        FORCE_NEXT.store(true, Ordering::Relaxed);
         wake();
     }
 }
@@ -76,6 +90,7 @@ pub fn set_taskbars(targets: Vec<isize>) {
     if is_active() {
         WAKE.get_or_init(start);
     }
+    FORCE_NEXT.store(true, Ordering::Relaxed);
     wake();
 }
 
@@ -83,6 +98,9 @@ fn start() -> SyncSender<()> {
     let (tx, rx) = mpsc::sync_channel::<()>(1);
     let _ = std::thread::Builder::new().name("usagi-taskbar".into()).spawn(move || {
         let mut quick = true;
+        // 마지막으로 실제로 잰 때의 지문·시각. 바뀐 걸 보고 잰 뒤에는 버튼 애니메이션이 끝난 1.2초 뒤에 한 번 더 잼
+        let mut measured: Option<(u64, Instant)> = None;
+        let mut follow_up = false;
         loop {
             let Ok((generation, targets)) = CACHE.lock().map(|cache| (cache.generation, cache.targets.clone())) else { return };
             if targets.is_empty() {
@@ -90,14 +108,36 @@ fn start() -> SyncSender<()> {
                     return;
                 }
                 quick = true;
+                measured = None;
                 continue;
             }
-            if let Some(extents) = helper_output(&targets) {
-                if let Ok(mut cache) = CACHE.lock() {
-                    if cache.generation == generation {
-                        cache.extents = extents;
-                        cache.measured_at = Some(Instant::now());
+            let print = fingerprint(&targets);
+            let forced = FORCE_NEXT.swap(false, Ordering::Relaxed);
+            let changed = measured.is_none_or(|(old, _)| old != print);
+            let stale = measured.is_none_or(|(_, at)| at.elapsed() >= FORCE);
+            let was_follow_up = std::mem::take(&mut follow_up);
+            if forced || changed || stale || was_follow_up {
+                match helper_output(&targets) {
+                    Some(extents) => {
+                        if let Ok(mut cache) = CACHE.lock() {
+                            if cache.generation == generation {
+                                cache.extents = extents;
+                                cache.measured_at = Some(Instant::now());
+                            }
+                        }
+                        // 바뀐 걸 보고 쟀으면 1.2초 뒤 한 번 더 (방금 잰 값이 버튼 애니메이션 중간일 수 있음)
+                        if (forced || changed) && !was_follow_up {
+                            follow_up = true;
+                            quick = true;
+                        }
+                        measured = Some((print, Instant::now()));
                     }
+                    None => measured = None, // 실패: 다음 확인 때 다시 시도
+                }
+            } else if let Ok(mut cache) = CACHE.lock() {
+                // 지문이 그대로: 도우미를 띄우지 않고 지금 좌표를 계속 사용
+                if cache.generation == generation && !cache.extents.is_empty() {
+                    cache.measured_at = Some(Instant::now());
                 }
             }
             let delay = if std::mem::take(&mut quick) { QUICK } else { IDLE };
@@ -113,6 +153,54 @@ fn start() -> SyncSender<()> {
         }
     });
     tx
+}
+
+/// 작업 표시줄 지문: 대상 작업 표시줄과 그 안의 알림 영역·버튼 영역·시작 버튼 위치, 화면 배율,
+/// 그리고 작업 표시줄에 버튼이 생기는 창 목록. 이 값이 같으면 버튼 끝·알림 영역 위치도 같다고 봄 (도우미 실행 생략)
+fn fingerprint(targets: &[isize]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    fn rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+        crate::win::window_rect(hwnd).map(|r| (r.left, r.top, r.right, r.bottom))
+    }
+    let mut h = DefaultHasher::new();
+    for &tb in targets {
+        let hwnd = tb as HWND;
+        rect(hwnd).hash(&mut h);
+        unsafe { GetDpiForWindow(hwnd) }.hash(&mut h);
+        for class in ["TrayNotifyWnd", "ReBarWindow32", "WorkerW", "Start"] {
+            let child = unsafe { FindWindowExW(hwnd, std::ptr::null_mut(), crate::win::wide(class).as_ptr(), std::ptr::null()) };
+            rect(child).hash(&mut h);
+        }
+    }
+    // 버튼이 생기는 창: 보이고, 주인 창이 없거나 앱 창 표시가 있고, 도구 창이 아니고, 숨겨지지(cloaked) 않은 창
+    unsafe extern "system" fn each(hwnd: HWND, list: LPARAM) -> BOOL {
+        let list = &mut *(list as *mut Vec<isize>);
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let owned = !GetWindow(hwnd, GW_OWNER).is_null();
+        if ex & WS_EX_TOOLWINDOW != 0 || (owned && ex & WS_EX_APPWINDOW == 0) {
+            return 1;
+        }
+        let mut cloaked = 0u32;
+        let ok = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, (&mut cloaked as *mut u32).cast(), 4) >= 0;
+        if ok && cloaked != 0 {
+            return 1;
+        }
+        list.push(hwnd as isize);
+        1
+    }
+    let mut windows: Vec<isize> = Vec::new();
+    unsafe { EnumWindows(Some(each), &mut windows as *mut Vec<isize> as LPARAM) };
+    windows.sort_unstable();
+    windows.hash(&mut h);
+    h.finish()
 }
 
 fn helper_output(targets: &[isize]) -> Option<HashMap<isize, Extents>> {

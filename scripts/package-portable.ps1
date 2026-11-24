@@ -4,28 +4,31 @@
 #         dist\release\       릴리스 파일 (usagi.exe, usagi.exe.sha256)
 # 사용: powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1
 # -ReleaseOnly: 릴리스 파일만 준비하고 로컬 포터블 묶음은 생략
+# -HostExe / -SettingsExe: 이미 빌드한 exe로 묶기만 함 (CI는 본체·설정 창을 다른 러너에서 동시에 빌드한 뒤 여기서 합침)
 
-param([switch]$ReleaseOnly)
+param([switch]$ReleaseOnly, [string]$HostExe, [string]$SettingsExe)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
 try {
-    # CI에서는 Cargo.lock 그대로 (바뀌면 실패)
-    $extra = @()
-    if ($env:CI) { $extra += @('--locked', '--timings') }
     $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
-    $timings = Join-Path $target 'cargo-timings'
-    cargo build --release -p usagi-win @extra
-    if ($LASTEXITCODE -ne 0) { throw "빌드 실패" }
-    if ($env:CI) { Copy-Item (Join-Path $timings 'cargo-timing.html') (Join-Path $timings 'windows-host.html') }
-    cargo build --profile settings-release -p usagi-settings @extra
-    if ($LASTEXITCODE -ne 0) { throw "설정 빌드 실패" }
-    if ($env:CI) { Copy-Item (Join-Path $timings 'cargo-timing.html') (Join-Path $timings 'windows-settings.html') }
+    if (-not $HostExe -or -not $SettingsExe) {
+        # CI에서는 Cargo.lock 그대로 (바뀌면 실패)
+        $extra = @()
+        if ($env:CI) { $extra += @('--locked') }
+        cargo build --profile dist -p usagi-win @extra
+        if ($LASTEXITCODE -ne 0) { throw "빌드 실패" }
+        cargo build --profile settings-release -p usagi-settings @extra
+        if ($LASTEXITCODE -ne 0) { throw "설정 빌드 실패" }
+    }
+    if (-not $HostExe) { $HostExe = Join-Path $target 'dist/usagi.exe' }
+    if (-not $SettingsExe) { $SettingsExe = Join-Path $target 'settings-release/usagi-settings.exe' }
+    foreach ($file in @($HostExe, $SettingsExe)) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "빌드 결과 없음: $file" }
+    }
 
     $dist = Join-Path $root 'dist'
-    $hostExe = Join-Path $target 'release/usagi.exe'
-    $settingsExe = Join-Path $target 'settings-release/usagi-settings.exe'
     $rel = Join-Path $dist 'release'
     New-Item -ItemType Directory -Force $rel | Out-Null
     $exe = Join-Path $rel 'usagi.exe'

@@ -1,26 +1,31 @@
 # 자동 빌드 · 릴리스
 #
-#   태그(v*) 올리면 준비 → Windows·Mac ARM·Mac Intel 병렬 빌드 → Mac 앱 묶기 → 게시
-#   수동 실행       기본은 빌드만 (산출물은 실행 페이지에서 받기). 태그를 골라 "publish"를 켜면 그 태그로 게시
-#   main에 올리면   여기서는 아무것도 안 함. ci.yml이 테스트와 컴파일 확인만 해요.
+#   main에 올리면   Cargo.toml·Cargo.lock이 바뀐 푸시만 실행 (버전을 올리면 항상 바뀜).
+#                   빌드는 바로 시작하고, 버전(Cargo.toml)이 아직 게시되지 않았고 CHANGELOG에 그 버전 섹션이
+#                   있으면 묶기 → 게시. 태그(v<버전>)는 게시할 때 여기서 만들어요.
+#                   의존성만 바뀐 푸시는 빌드만 해서 의존성 캐시를 미리 새로 만들어 둬요 (게시 안 함).
+#   수동 실행       빌드만 (산출물은 실행 페이지에서 받기). main에서 "publish"를 켜면 게시까지.
 #
 # 왜 이렇게 나눴나
-#   - 준비(몇 초, Rust 없음): 태그와 버전이 다르면 비싼 러너를 띄우기 전에 바로 멈춰요.
-#   - Windows와 Mac ARM에서 공통 테스트 실행. Mac은 두 타깃의 바이너리를 별도 러너에서 빌드하고
-#     Mac 앱 묶기 단계에서 합쳐요. 앱 묶기는 Windows 빌드를 기다리지 않아요.
-#   - main에서 수동 실행하면 같은 타깃·Cargo 프로필의 릴리스 의존성 캐시가 준비돼요.
-#     태그 빌드는 기본 브랜치 캐시를 받아 쓰고, 태그 범위에 새 캐시는 저장하지 않아요.
+#   - 캐시: GitHub 캐시는 브랜치·태그 범위로 나뉘어서, 태그에서 만든 캐시는 다음 태그가 못 읽어요.
+#     그래서 릴리스 빌드를 main에서 돌리고 캐시도 main에 저장해요. 다음 릴리스는 그 캐시를 받아 의존성을
+#     다시 빌드하지 않아요.
+#   - 캐시 저장: 의존성 지문(scripts/ci-deps-hash.sh: 외부 의존성·기능·프로필·Rust 버전, 우리 버전 번호 제외)이
+#     지난번과 같으면 큰 캐시를 다시 올리지 않아요. 버전만 올린 릴리스는 저장 시간을 아껴요.
+#   - 동시 빌드: 본체·설정 창·테스트·서명 도구를 각자 다른 러너에서 준비 단계를 기다리지 않고 바로 시작해요.
+#     가장 오래 걸리는 설정 창 빌드가 끝나는 대로 묶기와 게시가 이어져요. Mac은 ARM·Intel도 따로 빌드한 뒤 합쳐요.
 #   - 게시: 모든 파일을 초안 릴리스에 올린 뒤 한 번에 공개해요. 앱의 자동 업데이트가
 #     파일이 덜 올라간 릴리스를 보는 일이 없어요.
 name: Build & Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: ["Cargo.toml", "Cargo.lock"]
   workflow_dispatch:
     inputs:
       publish:
-        description: "릴리스까지 게시 (태그를 골라 실행할 때만)"
+        description: "게시까지 (main에서, 아직 게시하지 않은 버전만)"
         type: boolean
         default: false
 
@@ -29,12 +34,14 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  # 수동 실행은 같은 브랜치에서 다시 돌리면 이전 실행을 취소, 태그(릴리스)는 끝까지
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  # 릴리스 중인 실행을 다음 푸시가 취소하지 않게 차례로
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # 테스트 빌드에 디버그 정보를 넣지 않음: 컴파일이 빠르고 캐시가 작아짐 (배포 빌드는 원래 없음)
+  CARGO_PROFILE_DEV_DEBUG: "0"
   # 앱이 업데이트를 확인할 저장소 = 이 저장소 (빌드 때 실행 파일에 들어감)
   USAGI_UPDATE_REPO: ${{ github.repository }}
 
@@ -47,61 +54,245 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
       prerelease: ${{ steps.ver.outputs.prerelease }}
       publish: ${{ steps.ver.outputs.publish }}
-      cache_profile: ${{ steps.ver.outputs.cache_profile }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: 버전 확인
+      - name: 게시할지 확인
         id: ver
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           WANT_PUBLISH: ${{ inputs.publish }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
-          publish=false
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            if [[ "$GITHUB_REF_NAME" != "v$ver" ]]; then
-              echo "::error::Cargo.toml 버전(v$ver)과 태그($GITHUB_REF_NAME) 불일치"
-              exit 1
-            fi
-            if [[ "$EVENT" == "push" || "$WANT_PUBLISH" == "true" ]]; then publish=true; fi
-          fi
-          if [[ "$publish" == "true" ]] && ! grep -qF "## [$ver]" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md에 '## [$ver] - 날짜' 섹션 없음"
-            exit 1
-          fi
           prerelease=false
           [[ "$ver" == *-* ]] && prerelease=true
-          # 버전 번호와 별도로 최적화·테스트 프로필이 바뀌면 새 캐시 그룹 사용.
-          cache_profile=$(awk '
-            /^[[:space:]]*\[/ { profile = ($0 ~ /^[[:space:]]*\[profile\./) }
-            profile && $0 !~ /^[[:space:]]*(#|$)/ { print }
-          ' Cargo.toml | sha256sum | cut -c1-12)
+          has_notes=false
+          grep -qF "## [$ver]" CHANGELOG.md && has_notes=true
+          # 공개된 릴리스가 이미 있으면 다시 게시하지 않음 (초안은 이어서 게시)
+          released=false
+          [[ "$(gh release view "v$ver" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || true)" == "false" ]] && released=true
+          # 같은 이름의 태그가 다른 커밋에 있으면 멈춤 (태그는 게시할 때 이 커밋에 만듦)
+          tag_sha=$(git ls-remote --tags origin "refs/tags/v$ver" "refs/tags/v$ver^{}" | sort -k2 | tail -n1 | cut -f1)
+          publish=false
+          on_default=false
+          [[ "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]] && on_default=true
+          if [[ "$EVENT" == "push" ]]; then
+            if [[ "$released" == "true" ]]; then
+              echo "v$ver 이미 게시됨: 빌드만 (의존성 캐시 갱신)"
+            elif [[ "$has_notes" != "true" ]]; then
+              echo "CHANGELOG.md에 '## [$ver]' 섹션 없음: 빌드만"
+            else
+              publish=true
+            fi
+          elif [[ "$WANT_PUBLISH" == "true" ]]; then
+            [[ "$on_default" == "true" ]] || { echo "::error::게시는 $DEFAULT_BRANCH에서만"; exit 1; }
+            [[ "$has_notes" == "true" ]] || { echo "::error::CHANGELOG.md에 '## [$ver] - 날짜' 섹션 없음"; exit 1; }
+            [[ "$released" != "true" ]] || { echo "::error::v$ver 이미 게시됨"; exit 1; }
+            publish=true
+          fi
+          if [[ "$publish" == "true" && -n "$tag_sha" && "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::태그 v$ver가 다른 커밋($tag_sha)을 가리킴"
+            exit 1
+          fi
           {
             echo "version=$ver"
             echo "publish=$publish"
             echo "prerelease=$prerelease"
-            echo "cache_profile=$cache_profile"
           } >> "$GITHUB_OUTPUT"
           echo "버전 $ver · 게시 $publish · 미리보기 $prerelease"
 
       - name: 릴리스 노트 (CHANGELOG.md에서)
+        if: steps.ver.outputs.publish == 'true'
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: bash scripts/release-notes.sh "$VERSION" > notes.md
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.ver.outputs.publish == 'true'
         with:
           name: dist-notes
           path: notes.md
           retention-days: 7
 
-  windows:
-    name: 빌드 (Windows)
-    needs: prepare
+  # 아래 빌드 작업은 모두 같은 순서: Rust 준비 → 의존성 지문 → 의존성 캐시가 최신인지 확인(작은 표시 파일만)
+  # → 의존성 캐시 받기(main에서, 지문이 바뀌었을 때만 저장) → 빌드 → (지문이 바뀌었으면) 표시 파일 저장
+
+  # macOS 테스트는 같은 커밋에서 ci.yml이 실행. GitHub 무료 요금제는 macOS 작업을 동시에 5개까지만 돌려서,
+  # 여기서도 돌리면 Mac 빌드 하나가 줄을 서서 릴리스가 늦어짐
+  test:
+    name: 테스트 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        os: [windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust 준비
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: 의존성 지문
+        id: deps
+        shell: bash
+        run: echo "hash=$(bash scripts/ci-deps-hash.sh '${{ matrix.os }}')" >> "$GITHUB_OUTPUT"
+
+      - name: 의존성 캐시가 이미 최신인지
+        id: marker
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ matrix.os }}-${{ steps.deps.outputs.hash }}
+          lookup-only: true
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-test-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+
+      - name: 공통 로직 테스트 (이 OS에서)
+        run: cargo test -p usagi-core --locked
+
+      - name: 의존성 캐시 표시 저장
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        shell: bash
+        run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ matrix.os }}-${{ steps.deps.outputs.hash }}
+
+  signer:
+    name: 서명 도구 빌드
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust 준비
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: 의존성 지문
+        id: deps
+        run: echo "hash=$(bash scripts/ci-deps-hash.sh signer)" >> "$GITHUB_OUTPUT"
+
+      - name: 의존성 캐시가 이미 최신인지
+        id: marker
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
+          lookup-only: true
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-signer
+          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+
+      - name: 서명 도구 빌드
+        run: cargo build --locked --release -p usagi-sign
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signer
+          path: target/release/usagi-sign
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: 의존성 캐시 표시 저장
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
+
+  win-host:
+    name: 빌드 (Windows 본체)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust 준비
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: 의존성 지문
+        id: deps
+        shell: bash
+        run: echo "hash=$(bash scripts/ci-deps-hash.sh windows)" >> "$GITHUB_OUTPUT"
+
+      - name: 의존성 캐시가 이미 최신인지
+        id: marker
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
+          lookup-only: true
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-win-host
+          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+
+      - name: 본체 빌드 (배포용 dist 프로필)
+        shell: bash
+        run: |
+          cargo build --locked --profile dist --timings -p usagi-win
+          cp target/cargo-timings/cargo-timing.html target/cargo-timings/windows-host.html
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win-host
+          path: target/dist/usagi.exe
+          compression-level: 1
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: timings-windows-host
+          path: target/cargo-timings/windows-host.html
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 의존성 캐시 표시 저장
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        shell: bash
+        run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
+
+  win-settings:
+    name: 빌드 (Windows 설정 창)
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -115,17 +306,75 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
 
+      - name: 의존성 지문
+        id: deps
+        shell: bash
+        run: echo "hash=$(bash scripts/ci-deps-hash.sh windows)" >> "$GITHUB_OUTPUT"
+
+      - name: 의존성 캐시가 이미 최신인지
+        id: marker
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
+          lookup-only: true
+
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: release-windows-${{ needs.prepare.outputs.cache_profile }}
-          save-if: ${{ github.ref_name == github.event.repository.default_branch && github.ref_type == 'branch' }}
+          shared-key: release-win-settings
+          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
 
-      - name: 공통 로직 테스트 (이 OS에서)
-        run: cargo test -p usagi-core --locked
+      - name: 설정 창 빌드
+        shell: bash
+        run: |
+          cargo build --locked --profile settings-release --timings -p usagi-settings
+          cp target/cargo-timings/cargo-timing.html target/cargo-timings/windows-settings.html
 
-      - name: Windows 빌드 (exe, 체크섬)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win-settings
+          path: target/settings-release/usagi-settings.exe
+          compression-level: 1
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: timings-windows-settings
+          path: target/cargo-timings/windows-settings.html
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 의존성 캐시 표시 저장
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        shell: bash
+        run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ steps.deps.outputs.hash }}
+
+  win-package:
+    name: Windows 묶기
+    needs: [win-host, win-settings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: win-*
+          path: win-binaries
+
+      - name: 본체에 설정 창 합치기 (exe, 체크섬)
         shell: pwsh
-        run: ./scripts/package-portable.ps1 -ReleaseOnly
+        run: ./scripts/package-portable.ps1 -ReleaseOnly -HostExe win-binaries/win-host/usagi.exe -SettingsExe win-binaries/win-settings/usagi-settings.exe
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -137,21 +386,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: ${{ !cancelled() }}
-        with:
-          name: timings-Windows
-          path: target/cargo-timings/windows-*.html
-          if-no-files-found: ignore
-          retention-days: 7
-
-  mac-build:
-    name: 빌드 (macOS · ${{ matrix.target }})
-    needs: prepare
+  mac-host:
+    name: 빌드 (macOS 본체 · ${{ matrix.target }})
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
-      fail-fast: ${{ github.ref_type == 'tag' }}
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     env:
@@ -167,29 +406,32 @@ jobs:
           rustup default stable
           rustup target add "$TARGET"
 
+      - name: 의존성 지문
+        id: deps
+        run: echo "hash=$(bash scripts/ci-deps-hash.sh "$TARGET")" >> "$GITHUB_OUTPUT"
+
+      - name: 의존성 캐시가 이미 최신인지
+        id: marker
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ matrix.target }}-${{ steps.deps.outputs.hash }}
+          lookup-only: true
+
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: release-${{ matrix.target }}-${{ needs.prepare.outputs.cache_profile }}
-          save-if: ${{ github.ref_name == github.event.repository.default_branch && github.ref_type == 'branch' }}
+          shared-key: release-mac-host-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
 
-      - name: 공통 로직 테스트 (이 OS에서)
-        if: matrix.target == 'aarch64-apple-darwin'
-        run: cargo test -p usagi-core --locked
-
-      - name: macOS 바이너리 빌드
+      - name: 본체 빌드 (배포용 dist 프로필)
         run: |
-          cargo build --locked --release --timings -p usagi-mac --target "$TARGET"
+          cargo build --locked --profile dist --timings -p usagi-mac --target "$TARGET"
           cp target/cargo-timings/cargo-timing.html target/cargo-timings/usagi-mac.html
-          cargo build --locked --profile settings-release --timings -p usagi-settings --features external-fonts --target "$TARGET"
-          cp target/cargo-timings/cargo-timing.html target/cargo-timings/usagi-settings.html
-          cp "target/$TARGET/settings-release/usagi-settings" "target/$TARGET/release/usagi-settings"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mac-bin-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/usagi-mac
-            target/${{ matrix.target }}/release/usagi-settings
+          name: mac-host-${{ matrix.target }}
+          path: target/${{ matrix.target }}/dist/usagi-mac
           compression-level: 1
           if-no-files-found: error
           retention-days: 7
@@ -197,14 +439,92 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
-          name: timings-${{ matrix.target }}
-          path: target/cargo-timings/usagi-*.html
+          name: timings-mac-host-${{ matrix.target }}
+          path: target/cargo-timings/usagi-mac.html
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: 의존성 캐시 표시 저장
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ matrix.target }}-${{ steps.deps.outputs.hash }}
+
+  mac-settings:
+    name: 빌드 (macOS 설정 창 · ${{ matrix.target }})
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust 준비
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+
+      - name: 의존성 지문
+        id: deps
+        run: echo "hash=$(bash scripts/ci-deps-hash.sh "$TARGET")" >> "$GITHUB_OUTPUT"
+
+      - name: 의존성 캐시가 이미 최신인지
+        id: marker
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ matrix.target }}-${{ steps.deps.outputs.hash }}
+          lookup-only: true
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-mac-settings-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true' }}
+
+      - name: 설정 창 빌드
+        run: |
+          cargo build --locked --profile settings-release --timings -p usagi-settings --features external-fonts --target "$TARGET"
+          cp target/cargo-timings/cargo-timing.html target/cargo-timings/usagi-settings.html
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mac-settings-${{ matrix.target }}
+          path: target/${{ matrix.target }}/settings-release/usagi-settings
+          compression-level: 1
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: timings-mac-settings-${{ matrix.target }}
+          path: target/cargo-timings/usagi-settings.html
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 의존성 캐시 표시 저장
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        run: echo "${{ steps.deps.outputs.hash }}" > .deps-marker
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.marker.outputs.cache-hit != 'true'
+        with:
+          path: .deps-marker
+          key: deps-${{ github.job }}-${{ matrix.target }}-${{ steps.deps.outputs.hash }}
+
   mac-package:
     name: macOS 유니버설 앱 묶기
-    needs: mac-build
+    needs: [mac-host, mac-settings]
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -214,14 +534,19 @@ jobs:
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: mac-bin-*
-          path: mac-binaries
+          pattern: mac-*
+          path: mac-artifacts
 
       - name: Mac 앱 묶기 (.app zip, 체크섬)
         run: |
+          # 묶기 스크립트는 본체 옆의 usagi-settings를 함께 묶음
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            mkdir -p "mac-binaries/$t"
+            mv "mac-artifacts/mac-host-$t/usagi-mac" "mac-artifacts/mac-settings-$t/usagi-settings" "mac-binaries/$t/"
+          done
           bash scripts/package-mac.sh \
-            mac-binaries/mac-bin-aarch64-apple-darwin/usagi-mac \
-            mac-binaries/mac-bin-x86_64-apple-darwin/usagi-mac
+            mac-binaries/aarch64-apple-darwin/usagi-mac \
+            mac-binaries/x86_64-apple-darwin/usagi-mac
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -236,7 +561,7 @@ jobs:
 
   publish:
     name: 게시
-    needs: [prepare, windows, mac-package]
+    needs: [prepare, test, signer, win-package, mac-package]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -259,6 +584,12 @@ jobs:
           pattern: dist-*
           path: out
           merge-multiple: true
+
+      # 같은 실행에서 이 커밋으로 미리 빌드한 서명 도구 (게시 단계에서 Rust를 설치·컴파일하지 않음)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signer
+          path: signer-bin
 
       - name: 게시 파일 확인
         working-directory: out
@@ -284,12 +615,11 @@ jobs:
             echo "::error::packaging/usagi-update.pub에 공개 키가 있는데 UPDATE_SIGNING_KEY 비밀값이 없음 (서명 없는 릴리스는 앱이 받지 않음)"
             exit 1
           fi
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          chmod +x signer-bin/usagi-sign
           key="$RUNNER_TEMP/update-signing.key"
           trap 'rm -f "$key"' EXIT
           (umask 077; printf '%s\n' "$USAGI_SIGN_KEY" > "$key")
-          cargo run --quiet --locked -p usagi-sign -- sign --version "$VERSION" --key "$key" \
+          signer-bin/usagi-sign sign --version "$VERSION" --key "$key" \
             out/usagi.exe out/usAgI-mac.zip
           echo "signed=true" >> "$GITHUB_OUTPUT"
 
@@ -304,7 +634,7 @@ jobs:
           $body = Get-Content -LiteralPath out/notes.md -Raw -Encoding utf8
           Set-Content -LiteralPath out/notes.md -Value (Set-ReleaseVerificationBlock $body $block) -Encoding utf8NoBOM
 
-      - name: 릴리스 만들기 (초안에 모두 올린 뒤 공개)
+      - name: 릴리스 만들기 (초안에 모두 올린 뒤 공개, 태그는 이 커밋에)
         working-directory: out
         env:
           SIGNED: ${{ steps.sign.outputs.signed }}
@@ -319,11 +649,11 @@ jobs:
             fi
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            # 다시 실행한 경우: 파일과 노트만 바꿔 올림
+            # 초안이 남아 있던 경우: 파일과 노트만 바꿔 올림
             gh release upload "$TAG" "${files[@]}" --clobber
             gh release edit "$TAG" --notes-file notes.md
           else
-            flags=(--title "usAgI $TAG" --notes-file notes.md --verify-tag --draft)
+            flags=(--title "usAgI $TAG" --notes-file notes.md --target "$GITHUB_SHA" --draft)
             [[ "$PRERELEASE" == "true" ]] && flags+=(--prerelease)
             gh release create "$TAG" "${flags[@]}" "${files[@]}"
           fi

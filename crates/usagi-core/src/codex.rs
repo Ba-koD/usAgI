@@ -6,7 +6,7 @@
 
 mod http;
 
-use crate::logs::{home_dir, walk_files};
+use crate::logs::home_dir;
 use crate::time::{self, DAY};
 use crate::usage_retry::{self, UsageError, UsageMode};
 use memchr::memmem;
@@ -202,13 +202,21 @@ impl CodexReader {
     }
 
     pub fn rescan(&mut self) -> bool {
-        let mut paths = Vec::new();
+        let mut listed = Vec::new();
         for root in &self.roots {
-            walk_files(root, "jsonl", &mut paths);
+            crate::logs::walk_files_with_meta(root, "jsonl", &mut listed);
         }
-        let present: std::collections::HashSet<_> = paths.iter().collect();
+        let present: std::collections::HashSet<&PathBuf> = listed.iter().map(|(path, _)| path).collect();
         self.files.retain(|path, _| present.contains(path));
-        self.update_paths(paths.iter().map(|path| (path.as_path(), false)))
+        // 목록 정보로 확실한 파일은 열지 않음 (logs::rescan_needs_check)
+        let now = time::now();
+        let cutoff = (now - self.max_age_days * DAY).max(self.connected_at.unwrap_or(0.0));
+        let check: Vec<&Path> = listed
+            .iter()
+            .filter(|(path, meta)| crate::logs::rescan_needs_check(*meta, self.files.get(path).map(|f| (f.len, f.modified)), cutoff, now))
+            .map(|(path, _)| path.as_path())
+            .collect();
+        self.update_paths(check.into_iter().map(|path| (path, false)))
     }
 
     /// Pick the newest usage event across concurrent rollouts.
@@ -401,6 +409,9 @@ fn app_server_usage(acc: &crate::accounts::Account) -> Result<CodexSnapshot, Str
                 continue;
             }
         };
+        // 끝낼 때 Codex가 띄운 하위 프로세스(.cmd·node 경유로 실행된 실제 app-server)까지 함께 종료
+        #[cfg(windows)]
+        let _job = crate::login::ChildJob::attach(&child).ok();
         let mut stdin = child.stdin.take().ok_or("stdin")?;
         let stdout = child.stdout.take().ok_or("stdout")?;
         let (tx, rx) = std::sync::mpsc::channel::<String>();

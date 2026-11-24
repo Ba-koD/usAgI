@@ -46,7 +46,7 @@ pub fn bar_range() -> (f32, f32, f32) {
             return r;
         }
     }
-    let widest = Widget::new(std::ptr::null_mut(), std::ptr::null_mut(), true).widest_value(1.0);
+    let widest = Widget::new(std::ptr::null_mut(), std::ptr::null_mut(), false, true).widest_value(1.0);
     let range = (widest, default_bar(widest), BAR_MAX.max(widest));
     *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((lang, range));
     range
@@ -189,6 +189,9 @@ pub struct Widget {
     pub hwnd: HWND,
     /// 이 위젯이 붙는 작업 표시줄 (주: Shell_TrayWnd, 보조: Shell_SecondaryTrayWnd)
     pub taskbar: HWND,
+    /// 작업 표시줄의 자식 창인지. 자식이면 작업 표시줄과 함께 보이고 가려짐 (시작 메뉴를 열어도, 전체 화면 앱이 덮어도).
+    /// 자식 창을 못 만들면 예전처럼 작업 표시줄 위에 띄운 "항상 위" 창
+    pub child: bool,
     pub primary: bool,
     pub enabled: bool,
     pub side: Side,
@@ -230,10 +233,11 @@ fn hash_of<T: Hash>(v: &T) -> u64 {
 }
 
 impl Widget {
-    pub fn new(hwnd: HWND, taskbar: HWND, primary: bool) -> Self {
+    pub fn new(hwnd: HWND, taskbar: HWND, child: bool, primary: bool) -> Self {
         Self {
             hwnd,
             taskbar,
+            child,
             primary,
             enabled: true,
             side: Side::Right,
@@ -350,6 +354,7 @@ impl Widget {
         self.last_tick = Some(now);
         let k = 1.0 - (-dt / EASE_TAU).exp();
         let mut easing = false;
+        let mut shown_keys = std::collections::HashSet::new();
         for sec in content.sections.iter_mut() {
             for row in &mut sec.rows {
                 let key = format!("{}:{}", sec.key, row.key);
@@ -357,6 +362,7 @@ impl Widget {
                 let target = row.ratio;
                 let next = if (target - cur).abs() < 0.004 { target } else { cur + (target - cur) * k };
                 easing |= next != target;
+                shown_keys.insert(key.clone());
                 self.eased.insert(key, next);
                 if row.percent {
                     // 차오르는 동안은 숫자, 다 쓴 값에 닿으면 "소진"
@@ -365,6 +371,8 @@ impl Widget {
                 row.ratio = next;
             }
         }
+        // 지운 계정·꺼 둔 그래프의 이전 값은 버림 (오래 켜 둬도 쌓이지 않게)
+        self.eased.retain(|key, _| shown_keys.contains(key));
         // 값 칸 = 지금 보이는 값 중 가장 넓은 것. 막대는 그만큼만 줄고 늘며, 모든 줄이 같은 길이.
         let target = self.measure_col(content.sections.iter().flat_map(|s| s.rows.iter().map(|r| r.value.as_str())), scale) as f64;
         let col = match self.value_col {
@@ -424,10 +432,25 @@ impl Widget {
         if moved {
             self.last_key = None;
         }
-        unsafe {
-            SetWindowPos(self.hwnd, HWND_TOPMOST, place.x, place.y, place.w, place.h, SWP_NOACTIVATE);
+        // 1초마다 불려도, 자리가 그대로이고 이미 맨 위(자식 창)면 창을 건드리지 않음.
+        // "항상 위" 창(자식 창을 못 만든 경우)은 다른 항상 위 창에 가려질 수 있어서 매번 맨 위로 다시 올림
+        let on_top = self.child && unsafe { GetWindow(self.taskbar, GW_CHILD) } == self.hwnd;
+        if moved || !self.shown || !on_top {
+            unsafe {
+                if self.child {
+                    // 작업 표시줄 안 좌표로. 형제 창(작업 표시줄 버튼을 그리는 XAML 창 등) 맨 위에 둠
+                    let mut at = POINT { x: place.x, y: place.y };
+                    ScreenToClient(self.taskbar, &mut at);
+                    SetWindowPos(self.hwnd, HWND_TOP, at.x, at.y, place.w, place.h, SWP_NOACTIVATE);
+                } else {
+                    SetWindowPos(self.hwnd, HWND_TOPMOST, place.x, place.y, place.w, place.h, SWP_NOACTIVATE);
+                }
+            }
         }
-        self.paint();
+        // 내용이 바뀌면 update()가 그림. 여기서는 자리를 옮겼거나 처음 보일 때만
+        if moved || !self.shown {
+            self.paint();
+        }
         if !self.shown {
             unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
             self.shown = true;
@@ -452,13 +475,16 @@ impl Widget {
         if unsafe { GetMonitorInfoW(MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST), &mut mi) } == 0 {
             return None;
         }
-        let mon = mi.rcMonitor;
-        let visible_h = r.bottom.min(mon.bottom) - r.top.max(mon.top);
-        if (visible_h as f32) < tb_h as f32 * 0.9 {
-            return None; // 자동 숨김으로 내려가 있음
-        }
-        if fullscreen_app(&mon, self.hwnd) {
-            return None;
+        // 자식 창은 작업 표시줄과 같이 움직이고 같이 가려지므로 자동 숨김·전체 화면을 따로 판단하지 않음
+        if !self.child {
+            let mon = mi.rcMonitor;
+            let visible_h = r.bottom.min(mon.bottom) - r.top.max(mon.top);
+            if (visible_h as f32) < tb_h as f32 * 0.9 {
+                return None; // 자동 숨김으로 내려가 있음
+            }
+            if fullscreen_app(&mon, self.hwnd) {
+                return None;
+            }
         }
         let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(tb) };
         let scale = if dpi > 0 { dpi } else { win::taskbar_dpi() } as f32 / 96.0;
@@ -502,8 +528,7 @@ impl Widget {
         match self.side {
             Side::Left => {
                 let mut lo = r.left + margin;
-                let centered = win::reg_dword(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "TaskbarAl") != Some(0);
-                let widgets = win::reg_dword(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "TaskbarDa") != Some(0);
+                let (centered, widgets) = win::taskbar_layout_flags();
                 if self.primary && centered && widgets {
                     lo += px(170.0); // 왼쪽 끝 날씨(위젯) 버튼 자리
                 }
@@ -553,7 +578,8 @@ impl Widget {
             let x = (PAD * place.scale).round() as i32 + ((RABBIT_W - 4.0) * place.scale - size as f32).max(0.0) as i32 / 2;
             img.blend_mask(x, (place.h - size as i32) / 2, mask, size, size, content.ink, 255);
         }
-        win::blit_layered(self.hwnd, place.x, place.y, &img);
+        // 자식 창은 위치를 SetWindowPos로만 정함 (여기서는 그림만 바꿈)
+        win::blit_layered(self.hwnd, (!self.child).then_some((place.x, place.y)), &img);
         self.last_key = Some(key);
     }
 
@@ -700,7 +726,7 @@ pub fn preview_switch(content: &Content, scale: f32, height: i32, level: u8, tr:
 /// 디자인 확인용: 퍼센트 ↔ 남은 시간 전환의 한 장면 (from: (칸, 그래프 key) → 이전 값, t: 0..1)
 /// 막대 길이 설정(bar)을 정해서 그리기
 pub fn preview_bar(content: &Content, scale: f32, height: i32, level: u8, tr: Option<(&HashMap<(usize, String), String>, f32)>, bar_px: Option<f32>) -> Image {
-    let mut w = Widget::new(std::ptr::null_mut(), std::ptr::null_mut(), true);
+    let mut w = Widget::new(std::ptr::null_mut(), std::ptr::null_mut(), false, true);
     w.bar_px = bar_px;
     w.label_cols = w.measure_labels(content, scale); // 열 너비가 라벨 칸을 따르므로 먼저
     w.note_w = w.measure_notes(content, scale);

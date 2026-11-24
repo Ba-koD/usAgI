@@ -7,15 +7,25 @@ version = "0.4.1"
 edition = "2021"
 license = "MIT"
 
+# 로컬 개발용 릴리스: 나눠서 최적화(thin LTO)라 다시 빌드가 빠름. 배포 파일은 아래 dist 프로필로 만듦
 [profile.release]
 opt-level = 3
-# 나눠서 최적화(thin LTO): 전체를 한 덩어리로 최적화할 때보다 다시 빌드하는 시간이 절반쯤 (실행 파일은 약 13% 커짐)
 lto = "thin"
 codegen-units = 16
 panic = "abort"
 strip = true
 
+# 배포용 본체(CI·패키지 스크립트): 크기 우선. 빌드는 느리지만 CI에서 설정 창과 동시에 빌드돼 릴리스 시간은 그대로
+# 측정(Windows 본체): thin 3.995MB·다시 빌드 16초 → fat + codegen-units 1 3.676MB(−8%)·58초
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# 설정 창: 크기 우선. 전체 최적화(fat LTO)가 링크 때 한 덩어리로 다시 최적화하므로 코드 생성은 나눠서(16) 병렬로.
+# 측정(설정 창 다시 빌드, Windows): codegen-units 1 + thin LTO 195초·압축 5.94MB → 16 + fat LTO 167초·압축 5.81MB
 [profile.settings-release]
 inherits = "release"
 opt-level = "z"
-codegen-units = 1
+lto = "fat"
+codegen-units = 16

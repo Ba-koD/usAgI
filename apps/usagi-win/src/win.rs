@@ -29,6 +29,27 @@ pub fn copy_wide(dst: &mut [u16], s: &str) {
 
 // ------------------------------------------------------------------ 레지스트리
 
+static TASKBAR_FLAGS: std::sync::Mutex<Option<(std::time::Instant, (bool, bool))>> = std::sync::Mutex::new(None);
+
+/// 작업 표시줄 가운데 정렬(TaskbarAl)·날씨 위젯 버튼(TaskbarDa). 위젯 자리를 1초마다 계산하므로
+/// 레지스트리는 30초에 한 번만 읽고, 설정이 바뀌었다는 알림(WM_SETTINGCHANGE)이 오면 바로 다시 읽음
+pub fn taskbar_layout_flags() -> (bool, bool) {
+    let mut cache = TASKBAR_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, flags)) = *cache {
+        if at.elapsed() < std::time::Duration::from_secs(30) {
+            return flags;
+        }
+    }
+    let key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced";
+    let flags = (reg_dword(key, "TaskbarAl") != Some(0), reg_dword(key, "TaskbarDa") != Some(0));
+    *cache = Some((std::time::Instant::now(), flags));
+    flags
+}
+
+pub fn forget_taskbar_layout_flags() {
+    *TASKBAR_FLAGS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 pub fn reg_dword(subkey: &str, value: &str) -> Option<u32> {
     let mut data: u32 = 0;
     let mut size = 4u32;
@@ -268,13 +289,14 @@ unsafe fn dib_with(w: u32, h: u32, bgra: &[u8]) -> HBITMAP {
 }
 
 /// 레이어드 창에 프리멀티 이미지를 그림 (per-pixel alpha)
-pub fn blit_layered(hwnd: HWND, x: i32, y: i32, img: &Image) {
+/// 투명 창에 그림을 올림. `at`: 화면 좌표로 옮길 위치 (None이면 지금 위치 그대로 — 자식 창은 SetWindowPos로 옮김)
+pub fn blit_layered(hwnd: HWND, at: Option<(i32, i32)>, img: &Image) {
     unsafe {
         let screen = GetDC(null_mut());
         let mem = CreateCompatibleDC(screen);
         let hbm = dib_with(img.w, img.h, &img.px);
         let old = SelectObject(mem, hbm as HGDIOBJ);
-        let dst = POINT { x, y };
+        let dst = at.map(|(x, y)| POINT { x, y });
         let src = POINT { x: 0, y: 0 };
         let size = SIZE { cx: img.w as i32, cy: img.h as i32 };
         let blend = BLENDFUNCTION {
@@ -283,7 +305,8 @@ pub fn blit_layered(hwnd: HWND, x: i32, y: i32, img: &Image) {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        UpdateLayeredWindow(hwnd, screen, &dst, &size, mem, &src, 0, &blend, ULW_ALPHA);
+        let dst_ptr = dst.as_ref().map_or(null(), |p| p as *const POINT);
+        UpdateLayeredWindow(hwnd, screen, dst_ptr, &size, mem, &src, 0, &blend, ULW_ALPHA);
         SelectObject(mem, old);
         DeleteObject(hbm as HGDIOBJ);
         DeleteDC(mem);
@@ -374,6 +397,9 @@ impl TextRenderer {
             let mut bits: *mut c_void = null_mut();
             let hbm = CreateDIBSection(self.dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
             if hbm.is_null() || bits.is_null() {
+                if !hbm.is_null() {
+                    DeleteObject(hbm as HGDIOBJ); // 비트맵만 만들어지고 메모리를 못 받은 경우도 GDI 객체 반환
+                }
                 return tw;
             }
             let old_bm = SelectObject(self.dc, hbm as HGDIOBJ);

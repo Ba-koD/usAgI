@@ -159,9 +159,21 @@ impl Animator {
         if now < self.peek_until && self.mood != Some(Mood::Nap) {
             return self.peek_until - now;
         }
+        // 일정 간격으로만 바뀌는 동작은 다음 경계까지 기다림 (매 프레임 깨어나지 않음).
+        // 경계보다 2ms 뒤에 깨어나서 소수점 오차로 경계 바로 앞에서 한 번 더 깨는 일을 막음
+        let until_step = |period: f64, from: f64| period - (now - from).rem_euclid(period) + 0.002;
         match self.mood {
             Some(Mood::Nap) => 0.3 - (now % 2.4) % 0.3,
-            Some(Mood::Tired) => FRAME,
+            Some(Mood::Tired) => {
+                // 헐떡임 0.45초, 땀방울 0.2초 간격. 뛰는 중에만 매 프레임
+                let mut next = until_step(0.45, 0.0).min(until_step(0.2, 0.0));
+                if self.hop_speed > 0 {
+                    let (hop, pause) = hop_timing(1);
+                    let phase = (now - self.hop_origin).rem_euclid(hop + pause);
+                    next = next.min(if phase < hop { FRAME } else { hop + pause - phase });
+                }
+                next
+            }
             Some(Mood::Hop) => {
                 let (hop, pause) = hop_timing(self.hop_speed);
                 let phase = (now - self.hop_origin).rem_euclid(hop + pause);
@@ -169,10 +181,16 @@ impl Animator {
             }
             Some(Mood::Rest) | None => {
                 let binky = now - self.binky_start;
-                if (self.idle_act.is_none() && (0.0..0.55).contains(&binky))
-                    || (self.long_idle && self.idle_act.is_some())
-                {
+                if self.idle_act.is_none() && (0.0..0.55).contains(&binky) {
                     return FRAME;
+                }
+                if self.long_idle {
+                    match self.idle_act {
+                        // 털 고르기: 앞발이 0.8초에 6단계 (0.133초 간격)
+                        Some((0, start)) => return until_step(0.8 / 6.0, start),
+                        Some(_) => return FRAME, // 기지개: 부드러운 곡선
+                        None => {}
+                    }
                 }
                 let twitch = if now < self.twitch_until { self.twitch_until } else { self.next_twitch };
                 let mut next = twitch.min(self.next_binky);
@@ -277,6 +295,36 @@ mod tests {
     use super::*;
     use crate::tracker::Tracker;
     use crate::logs::UsageEvent;
+
+    #[test]
+    fn waits_until_the_next_visible_change_without_skipping_one() {
+        // 지친 상태(뛰지 않음)와 털 고르기: 다음 깨어날 때까지는 모양이 그대로여야 함
+        let start = 1_795_000_000.0;
+        let mut tired = Animator::new(3);
+        tired.mood = Some(Mood::Tired);
+        tired.hop_speed = 0;
+        let mut grooming = Animator::new(4);
+        grooming.long_idle = true;
+        grooming.idle_act = Some((0, start));
+        grooming.next_binky = start + 1e6;
+        grooming.next_twitch = start + 1e6;
+        for a in [&mut tired, &mut grooming] {
+            let mut now = start;
+            let mut wakes = 0;
+            while now < start + 2.3 {
+                let pose = a.frame(now);
+                let wait = a.frame_delay(now);
+                assert!(wait > 0.0 && wait < 0.5, "wait {wait}");
+                // 경계 바로 위(대기 최소값)는 소수점 오차로 경계가 1ms 안에 있어 비교하지 않음
+                if wait > 0.01 {
+                    assert_eq!(a.frame(now + wait * 0.5), pose, "모양이 깨어나기 전에 바뀜 (now {now}, wait {wait})");
+                }
+                now += wait;
+                wakes += 1;
+            }
+            assert!(wakes < 25, "2.3초 동안 {wakes}번 깨어남 (66ms 간격이면 35번)");
+        }
+    }
 
     #[test]
     fn rest_schedules_fast_frames_only_during_motion() {

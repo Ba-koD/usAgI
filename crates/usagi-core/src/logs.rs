@@ -97,6 +97,59 @@ pub fn walk_files(root: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// 다시 훑기용: 파일 경로와 목록에 함께 오는 (크기, 수정 시각). Windows는 목록 정보라 파일을 열지 않음
+pub fn walk_files_with_meta(root: &Path, ext: &str, out: &mut Vec<(PathBuf, Option<(u64, f64)>)>) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            walk_files_with_meta(&path, ext, out);
+        } else if ft.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) {
+            let listed = entry.metadata().ok().map(|m| (m.len(), mtime_secs(&m)));
+            out.push((path, listed));
+        }
+    }
+}
+
+#[cfg(test)]
+mod rescan_tests {
+    use super::*;
+
+    #[test]
+    fn rescan_skips_only_files_the_listing_settles() {
+        let (now, cutoff) = (1_000_000.0, 1_000_000.0 - 8.0 * DAY);
+        let old = now - 2.0 * DAY;
+        // 처음 보는 오래된 파일은 열지 않고, 처음 보는 최근 파일은 확인
+        assert!(!rescan_needs_check(Some((10, cutoff - 1.0)), None, cutoff, now));
+        assert!(rescan_needs_check(Some((10, now - 5.0)), None, cutoff, now));
+        // 아는 파일: 그대로이고 오래 조용하면 건너뜀, 크기·시각이 바뀌었거나 최근이면 확인
+        assert!(!rescan_needs_check(Some((10, old)), Some((10, old)), cutoff, now));
+        assert!(rescan_needs_check(Some((11, old)), Some((10, old)), cutoff, now));
+        assert!(rescan_needs_check(Some((10, now - 60.0)), Some((10, now - 60.0)), cutoff, now), "쓰는 중일 수 있는 최근 파일");
+        // 보관 기간을 넘긴 파일은 정리되게 확인, 목록 정보가 없으면 확인
+        assert!(rescan_needs_check(Some((10, cutoff - 5.0)), Some((10, cutoff - 5.0)), cutoff, now));
+        assert!(rescan_needs_check(None, Some((10, old)), cutoff, now));
+    }
+}
+
+/// 이 시간보다 오래 안 바뀐 파일만 목록 정보로 판단 (쓰는 중인 파일은 목록 정보가 늦게 바뀔 수 있음)
+const QUIET_SECS: f64 = 60.0 * 60.0;
+
+/// 다시 훑기(이벤트 누락 복구)에서 파일을 실제로 확인할지. 수천 개 기록을 매번 열지 않게, 목록 정보만으로 확실한 것은 건너뜀
+/// - 처음 보는 파일인데 보관 기간보다 오래됨 → 건너뜀
+/// - 아는 파일이고 크기·시각이 그대로이며 1시간 넘게 조용함 → 건너뜀 (보관 기간을 넘기면 정리되게 다시 확인)
+/// 실시간 변경은 파일 감시가 따로 실제 크기로 확인함
+pub(crate) fn rescan_needs_check(listed: Option<(u64, f64)>, known: Option<(u64, f64)>, cutoff: f64, now: f64) -> bool {
+    let Some((size, modified)) = listed else { return true };
+    match known {
+        None => modified >= cutoff,
+        Some((old_size, old_modified)) => {
+            old_size != size || old_modified != modified || modified >= now - QUIET_SECS || old_modified < cutoff
+        }
+    }
+}
+
 // ------------------------------------------------------------------ 한도 메시지
 
 pub fn limit_kind(text: &str) -> LimitKind {
@@ -313,15 +366,21 @@ impl LogReader {
 
     /// 이벤트 누락 복구. 변경된 파일만 다시 읽음.
     pub fn rescan(&mut self) -> bool {
-        let mut paths = Vec::new();
+        let mut listed = Vec::new();
         for root in &self.roots {
-            walk_files(root, "jsonl", &mut paths);
+            walk_files_with_meta(root, "jsonl", &mut listed);
         }
-        let present: std::collections::HashSet<_> = paths.iter().collect();
+        let present: std::collections::HashSet<&PathBuf> = listed.iter().map(|(path, _)| path).collect();
         self.offsets.retain(|path, _| present.contains(path));
         self.discarding.retain(|path| present.contains(path));
-        let changed = self.update_paths(paths.iter().map(|path| (path.as_path(), false)));
         let now = time::now();
+        let cutoff = (now - self.history_days * DAY).max(self.connected_at);
+        let check: Vec<&Path> = listed
+            .iter()
+            .filter(|(path, meta)| rescan_needs_check(*meta, self.offsets.get(path).map(|p| (p.size, p.modified)), cutoff, now))
+            .map(|(path, _)| path.as_path())
+            .collect();
+        let changed = self.update_paths(check.into_iter().map(|path| (path, false)));
         let pruned = self.prune((now - self.history_days * DAY).max(self.connected_at), now - crate::tracker::LONG_IDLE);
         self.dirty |= pruned;
         changed || pruned

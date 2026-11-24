@@ -9,6 +9,10 @@ license.workspace = true
 name = "usagi"
 path = "src/main.rs"
 
+[features]
+# 테스트 빌드: 가짜 사용량, 따로 쓰는 잠금·창 이름, 포터블 data 폴더 필수 (실제 앱과 같이 띄워 확인용)
+mock = ["usagi-core/mock"]
+
 [dependencies]
 usagi-core = { path = "../../crates/usagi-core" }
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }

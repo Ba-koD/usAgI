@@ -20,10 +20,10 @@ if [ "$#" -eq 0 ]; then
   BINS=()
   for t in "${TARGETS[@]}"; do
     ARGS+=(--target "$t")
-    BINS+=("${CARGO_TARGET_DIR:-target}/$t/release/usagi-mac")
+    BINS+=("${CARGO_TARGET_DIR:-target}/$t/dist/usagi-mac")
     SETTINGS_BINS+=("${CARGO_TARGET_DIR:-target}/$t/settings-release/usagi-settings")
   done
-  cargo build --release -p usagi-mac "${ARGS[@]}"
+  cargo build --profile dist -p usagi-mac "${ARGS[@]}"
   cargo build --profile settings-release -p usagi-settings --features external-fonts "${ARGS[@]}"
 elif [ "$#" -eq 2 ]; then
   BINS=("$@")

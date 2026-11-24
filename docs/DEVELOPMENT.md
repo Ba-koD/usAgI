@@ -64,6 +64,15 @@ scripts\package-portable.ps1              # 로컬 포터블 묶음 dist\usAgI-p
 
 Windows 배포용 `dist/release/usagi.exe`는 포터블 패키지 스크립트가 설정 실행 파일을 압축해 내장함. macOS는 `bash scripts/package-mac.sh`가 본체와 설정 실행 파일을 같은 앱에 넣고 `dist/release/usAgI-mac.zip`을 생성함.
 
+빌드 프로필 (`Cargo.toml`)
+- `release`: 로컬 개발용. thin LTO라 다시 빌드가 빠름
+- `dist`: 배포용 본체. fat LTO + `codegen-units = 1`로 가장 작게 (패키지 스크립트·CI가 사용)
+- `settings-release`: 설정 창. 크기 우선(`opt-level = "z"`), 코드는 16개로 나눠 병렬 생성하고 링크 때 fat LTO로 다시 최적화
+
+테스트 빌드
+- 포터블 사본(exe 옆 `data\usagi.portable`)은 데이터 폴더마다 따로 실행되므로, 설치형을 그대로 둔 채 옆에서 띄워 확인 가능
+- `cargo build --release -p usagi-win --features mock`: 가짜 사용량만 보내는 화면 확인용 빌드 (CLI·네트워크·로그 읽기 없음, 자동 실행·알림 등록·업데이트는 건드리지 않음, 포터블 data 폴더가 있어야 실행)
+
 `USAGI_UPDATE_REPO=owner/name`을 지정하고 빌드하면 그 저장소에서 업데이트 수신 (릴리스 빌드는 자동 지정).
 
 ## 릴리스 만들기
@@ -83,11 +92,11 @@ Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UP
 ### 릴리스마다
 
 1. `CHANGELOG.md` 맨 위에 `## [x.y.z] - 날짜` 섹션 작성
-2. `scripts\release.ps1 -Version x.y.z -Tag` (버전 올리기 → 테스트·빌드 → 버전 파일 커밋·태그, push는 하지 않음)
-3. `git push origin main` 후 `git push origin vx.y.z`
+2. `scripts\release.ps1 -Version x.y.z -Commit` (버전 올리기 → 테스트·컴파일 확인 → 버전 파일 커밋, push는 하지 않음)
+3. `git push origin main` (태그는 올리지 않음. 게시할 때 CI가 그 커밋에 `vx.y.z` 태그 생성)
 4. GitHub Actions(`.github/workflows/release.yml`)가 자동 실행
-   - **준비**: 태그와 `Cargo.toml` 버전 일치, `CHANGELOG.md` 섹션 확인, 릴리스 노트 추출
-   - **빌드**: Windows·Mac ARM·Mac Intel을 별도 러너에서 병렬 빌드. Windows와 Mac ARM에서 공통 테스트를 실행하고, Mac은 두 바이너리를 합쳐 유니버설 ZIP 생성
+   - **준비**: 아직 게시하지 않은 버전이고 `CHANGELOG.md`에 그 섹션이 있을 때만 진행. 같은 이름의 태그가 다른 커밋에 있으면 중단. 릴리스 노트 추출
+   - **빌드**: Windows 본체·Windows 설정 창·Mac 본체(ARM·Intel)·Mac 설정 창(ARM·Intel)·공통 테스트(Windows)·서명 도구를 준비 단계를 기다리지 않고 각자 다른 러너에서 동시에. 묶기 단계에서 Windows는 본체에 설정 창을 합치고, Mac은 유니버설 ZIP 생성. macOS 테스트는 같은 커밋의 `ci.yml`이 실행 (무료 요금제의 macOS 동시 작업 5개 제한 때문에 릴리스 쪽에서는 빼서 Mac 빌드가 줄을 서지 않게)
    - **게시**: 파일마다 서명(`.minisig`)을 만들고 릴리스 본문의 **파일 검증 정보** 접기 영역에 SHA-256과 서명을 넣음. 배포 파일을 올린 뒤 공개하고, `HOMEBREW_TAP_TOKEN` 비밀값이 있으면 Homebrew 탭 갱신
 
 공개 키가 저장소에 있는데 `UPDATE_SIGNING_KEY` 비밀값이 없으면 게시 단계가 실패 (서명 없는 릴리스는 설치된 앱이 받지 않음).
@@ -95,8 +104,12 @@ Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UP
 
 0.3.0은 기존 앱도 자동 업데이트할 수 있도록 `usagi.exe`와 `usAgI-mac.zip`의 `.sha256`·`.minisig`를 함께 첨부. 0.3.1부터 검증 정보는 본문에만 게시. 0.3.0을 지나친 0.2.1 이하 앱은 한 번 수동 업데이트 필요. macOS 설치 스크립트는 릴리스 본문에서 SHA-256을 읽고, 이전 릴리스는 첨부의 체크섬을 사용.
 
-- main 푸시와 PR: `ci.yml`이 세 OS에서 테스트와 컴파일 확인만 실행 (2~3분). 릴리스 빌드는 태그에서 한 번만 실행
-- 릴리스 의존성을 미리 컴파일하려면 태그를 푸시하기 전에 Actions → Build & Release → **Run workflow**에서 기본 브랜치로 실행. 이때 저장한 캐시를 같은 Rust 도구 체인·타깃·Cargo 프로필의 태그 빌드에서 사용. 기본 실행은 빌드만 하며, 실행 페이지에서 산출물과 `timings-*` 컴파일 리포트를 7일간 확인 가능
+- main 푸시와 PR: `ci.yml`이 세 OS에서 테스트와 컴파일 확인만 실행 (2~3분). 릴리스 빌드는 버전을 올린 커밋에서 한 번만 실행
+- 캐시: 릴리스 빌드가 main에서 돌아 의존성 캐시를 main에 저장하고, 다음 릴리스가 그 캐시를 받아 씀 (태그에서 만든 캐시는 다른 태그가 못 읽어서 예전 구조는 매번 처음부터 빌드하기 쉬웠음). 캐시를 미리 데우는 수동 실행은 필요 없음
+- 캐시 저장: `scripts/ci-deps-hash.sh`의 의존성 지문(외부 의존성·기능·프로필·Rust 버전, 우리 버전 번호 제외)이 지난번과 같으면 큰 캐시를 다시 올리지 않음. 버전만 올린 릴리스는 작업마다 업로드 시간을 아낌
+- `release.yml`은 `Cargo.toml`·`Cargo.lock`이 바뀐 main 푸시에서만 실행. 의존성만 바뀐 푸시는 빌드만 해서 캐시를 미리 새로 만듦 (게시 안 함)
+- 테스트·컴파일 확인은 디버그 정보 없이(`CARGO_PROFILE_DEV_DEBUG=0`) 빌드해서 빠르고 캐시가 작음
+- 수동 실행(Actions → Build & Release → **Run workflow**)은 빌드만 하고, 실행 페이지에서 산출물과 `timings-*` 컴파일 리포트를 7일간 확인 가능. main에서 **publish**를 켜면 아직 게시하지 않은 버전을 게시
 
 | 릴리스 파일 | 쓰는 곳 |
 |---|---|

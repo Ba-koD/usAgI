@@ -1,7 +1,7 @@
 # main 푸시·PR 확인: 공통 로직 테스트 + 플랫폼 앱 컴파일 확인 (세 OS 동시에)
 #
-# - 실제 릴리스 빌드와 묶기는 태그를 올릴 때만 release.yml(Build & Release)이 해요.
-#   main 푸시마다 릴리스 빌드를 돌리면 같은 커밋을 태그에서 한 번 더 빌드하게 돼서, 여기서는 가볍게 확인만 해요.
+# - 실제 릴리스 빌드와 묶기는 release.yml(Build & Release)이 해요. 버전을 올린 커밋을 main에 올렸을 때만
+#   빌드하고, 그 밖의 main 푸시는 여기서 가볍게 확인만 해요.
 # - 릴리스 최적화(LTO) 없이 cargo check로 컴파일만 확인해서 빨라요.
 # - Linux 줄은 앱이 아직 없어서 공통 로직과 서명 도구만 (게시 단계가 Linux에서 서명 도구를 빌드하므로 미리 확인).
 # - 같은 브랜치·PR에 새로 올리면 이전 실행은 취소해요. 문서만 바뀌면 돌지 않아요.
@@ -25,6 +25,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # 디버그 정보 없이: 테스트·컴파일 확인이 빠르고 캐시가 작아짐
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   check:

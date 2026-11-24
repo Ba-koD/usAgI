@@ -30,8 +30,19 @@ use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWI
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+// 테스트 빌드(mock)는 이름을 따로 써서 실제 usAgI와 같이 떠 있어도 서로 찾거나 막지 않음
+#[cfg(not(feature = "mock"))]
 const HOST_CLASS: &str = "usAgIHost";
+#[cfg(not(feature = "mock"))]
 const WIDGET_CLASS: &str = "usAgIWidget";
+#[cfg(not(feature = "mock"))]
+const INSTANCE_LOCK: &str = "Local\\usAgI-app";
+#[cfg(feature = "mock")]
+const HOST_CLASS: &str = "usAgIMockHost";
+#[cfg(feature = "mock")]
+const WIDGET_CLASS: &str = "usAgIMockWidget";
+#[cfg(feature = "mock")]
+const INSTANCE_LOCK: &str = "Local\\usAgI-mock";
 
 const WM_SNAPSHOT: u32 = WM_APP + 10;
 const WM_FOREGROUND: u32 = WM_APP + 12;
@@ -146,18 +157,21 @@ impl App {
         if targets.is_empty() {
             targets = bars.iter().filter(|b| b.primary).collect();
         }
-        // 더는 대상이 아닌 위젯 정리
+        // 더는 대상이 아닌 위젯 정리. 자식 창은 탐색기가 다시 시작되면 옛 작업 표시줄과 함께 없어지므로 새로 만듦
+        // (없어진 창의 번호가 다른 창에 다시 쓰였을 수 있어서 우리 위젯 창인지까지 확인)
+        let own = |hwnd: HWND| unsafe { IsWindow(hwnd) } != 0 && win::class_name(hwnd) == WIDGET_CLASS;
         self.widgets.retain(|w| {
-            let keep = targets.iter().any(|t| t.hwnd == w.taskbar);
-            if !keep {
+            let alive = own(w.hwnd);
+            let keep = alive && targets.iter().any(|t| t.hwnd == w.taskbar);
+            if !keep && alive {
                 unsafe { DestroyWindow(w.hwnd) };
             }
             keep
         });
         for t in targets {
             if !self.widgets.iter().any(|w| w.taskbar == t.hwnd) {
-                if let Some(hwnd) = create_widget_window() {
-                    self.widgets.push(Widget::new(hwnd, t.hwnd, t.primary));
+                if let Some((hwnd, child)) = create_widget_window(t.hwnd) {
+                    self.widgets.push(Widget::new(hwnd, t.hwnd, child, t.primary));
                     self.widget_dirty = true;
                 }
             }
@@ -361,7 +375,10 @@ impl App {
                 Effect::OpenNotifySettings => shell_open("ms-settings:notifications"),
                 Effect::Notify(title, body) => self.notify(&title, &body),
                 Effect::SetAutostart(on) => {
-                    if let Err(error) = crate::autostart::set(on) {
+                    // 테스트 빌드는 실제 앱의 자동 실행 등록을 바꾸지 않음
+                    if cfg!(feature = "mock") {
+                        self.ctl.set_error(usagi_core::tr!("테스트 빌드: 자동 실행 설정 안 함", "Test build: autostart is not changed"));
+                    } else if let Err(error) = crate::autostart::set(on) {
                         self.ctl.set_error(error);
                     }
                 }
@@ -424,7 +441,7 @@ impl App {
             crate::toast::refresh_icon(); // 라이트·다크 모드가 바뀌면 알림 아이콘 색도
         }
         self.sync_widgets();
-        crate::uia::poke();
+        crate::uia::poke_layout(); // 화면 구성·배율·테마가 바뀜: 작업 표시줄 좌표를 꼭 다시 잼
         self.redraw();
         self.push_settings();
     }
@@ -612,7 +629,7 @@ impl App {
                 Some(0)
             }
             WM_FOREGROUND => {
-                // 앞 창이 바뀜: 작업 표시줄 버튼이 늘거나 줄었을 수 있으니 곧 다시 확인
+                // 앞 창이 바뀜: 작업 표시줄 버튼이 늘거나 줄었을 수 있으니 곧 다시 확인 (지문이 바뀌었을 때만 실제로 잼)
                 crate::uia::poke();
                 self.reposition_widgets();
                 Some(0)
@@ -631,6 +648,7 @@ impl App {
                 Some(0)
             }
             WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => {
+                win::forget_taskbar_layout_flags(); // 작업 표시줄 정렬·위젯 버튼 설정이 바뀌었을 수 있음
                 unsafe { SetTimer(self.host, TIMER_RECHECK, 700, None) };
                 None
             }
@@ -643,6 +661,11 @@ impl App {
                 if !self.tray.readd() {
                     self.schedule_retry();
                 }
+                // 탐색기가 다시 시작됐으면 프로세스가 바뀌었으므로 작업 표시줄 위치 훅도 새 프로세스에 다시 걺
+                if !self.taskbar_layout_hook.is_null() {
+                    unsafe { UnhookWinEvent(self.taskbar_layout_hook) };
+                }
+                self.taskbar_layout_hook = hook_taskbar_layout();
                 unsafe { SetTimer(self.host, TIMER_RECHECK, 300, None) };
                 Some(0)
             }
@@ -688,13 +711,29 @@ unsafe extern "system" fn on_foreground(_: HWINEVENTHOOK, _: u32, _: HWND, _: i3
     }
 }
 
+/// 작업 표시줄(탐색기 프로세스) 창이 움직일 때만 받는 훅. 모든 프로세스를 받으면 어느 창·커서가 움직여도
+/// 화면 스레드가 깨어나므로(게임·영상 중에도 계속), 작업 표시줄을 가진 탐색기 프로세스로 좁힘
+fn hook_taskbar_layout() -> HWINEVENTHOOK {
+    let tray = win::taskbar();
+    let mut pid = 0u32;
+    if !tray.is_null() {
+        unsafe { GetWindowThreadProcessId(tray, &mut pid) };
+    }
+    if pid == 0 {
+        return null_mut(); // 작업 표시줄이 아직 없음: TaskbarCreated 때 다시 걺
+    }
+    unsafe {
+        SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, null_mut(), Some(on_taskbar_layout), pid, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+    }
+}
+
 unsafe extern "system" fn on_taskbar_layout(_: HWINEVENTHOOK, _: u32, hwnd: HWND, object: i32, _: i32, _: u32, _: u32) {
     if hwnd.is_null() || object != OBJID_WINDOW || !crate::uia::is_active() {
         return;
     }
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
     if matches!(win::class_name(root).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
-        crate::uia::poke();
+        crate::uia::poke_layout(); // 탐색기가 작업 표시줄 안을 다시 배치함
     }
 }
 
@@ -718,24 +757,45 @@ fn register_class(name: &str, style: u32) {
     }
 }
 
-fn create_widget_window() -> Option<HWND> {
-    let hwnd = unsafe {
+/// 데이터 폴더별 실행 구분자: 설치형은 빈 글자(예전과 같은 잠금·창 제목), 포터블은 data 폴더 경로의 해시
+fn instance_suffix() -> String {
+    match config::portable_dir() {
+        Some(dir) => {
+            let mut h = DefaultHasher::new();
+            dir.to_string_lossy().to_lowercase().hash(&mut h);
+            format!("-{:016x}", h.finish())
+        }
+        None => String::new(),
+    }
+}
+
+/// 위젯 창 만들기. 먼저 작업 표시줄의 자식 창으로 (작업 표시줄과 함께 보이고 가려짐: 시작 메뉴·전체 화면 앱),
+/// 안 되면(Windows 7, 권한 차이 등) 예전처럼 작업 표시줄 위에 띄우는 "항상 위" 창. 반환: (창, 자식 창인지)
+///
+/// WS_EX_NOPARENTNOTIFY: 만들고 없앨 때 탐색기에 동기 메시지를 보내지 않음 (탐색기가 멈춰 있어도 기다리지 않게)
+fn create_widget_window(taskbar: HWND) -> Option<(HWND, bool)> {
+    let create = |ex: u32, style: u32, parent: HWND| unsafe {
         CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            ex,
             wide(WIDGET_CLASS).as_ptr(),
             wide("usAgI widget").as_ptr(),
-            WS_POPUP,
+            style,
             0,
             0,
             1,
             1,
-            null_mut(),
+            parent,
             null_mut(),
             GetModuleHandleW(null()),
             null(),
         )
     };
-    (!hwnd.is_null()).then_some(hwnd)
+    let child = create(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_NOPARENTNOTIFY, WS_CHILD | WS_CLIPSIBLINGS, taskbar);
+    if !child.is_null() {
+        return Some((child, true));
+    }
+    let popup = create(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, WS_POPUP, null_mut());
+    (!popup.is_null()).then_some((popup, false))
 }
 
 // ------------------------------------------------------------------ 도우미
@@ -750,12 +810,28 @@ fn shell_open(path: &str) {
 
 /// `from_autostart`: 로그인할 때 자동 실행으로 시작됨 (이미 떠 있으면 설정 창을 열지 않고 끝냄)
 pub fn run(from_autostart: bool) {
+    // 테스트 빌드는 exe 옆 data 폴더(포터블)에서만 실행: 실제 %APPDATA%\usAgI 설정·계정을 절대 읽거나 쓰지 않게
+    if cfg!(feature = "mock") && !config::is_portable() {
+        unsafe {
+            MessageBoxW(
+                null_mut(),
+                wide("테스트 빌드는 exe 옆 data\\usagi.portable 폴더가 있어야 실행").as_ptr(),
+                wide("usAgI 테스트").as_ptr(),
+                MB_ICONWARNING,
+            );
+        }
+        return;
+    }
+    // 중복 실행은 데이터 폴더마다 판단: 설치형(%APPDATA%\usAgI)은 하나만, 따로 data 폴더를 쓰는 포터블 사본은 각자 실행
+    // (같은 설정을 두 프로세스가 동시에 쓰지 않는 것이 목적이라, 데이터 폴더가 다르면 막을 이유가 없음)
+    let instance = instance_suffix();
+    let title = format!("usAgI{instance}");
     unsafe {
         // 중복 실행: 직접 실행했으면 이미 떠 있는 usAgI의 설정 창을 엶, 자동 실행이면 조용히 끝냄
-        CreateMutexW(null(), 0, wide("Local\\usAgI-app").as_ptr());
+        CreateMutexW(null(), 0, wide(&format!("{INSTANCE_LOCK}{instance}")).as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if !from_autostart {
-                let host = FindWindowW(wide(HOST_CLASS).as_ptr(), null());
+                let host = FindWindowW(wide(HOST_CLASS).as_ptr(), wide(&title).as_ptr());
                 if !host.is_null() {
                     PostMessageW(host, WM_SHOW_SETTINGS, 0, 0);
                 }
@@ -771,11 +847,11 @@ pub fn run(from_autostart: bool) {
 
     let host = unsafe {
         // 방송 메시지(TaskbarCreated 등)를 받으려면 메시지 전용 창이 아닌 최상위 창이어야 함
-        CreateWindowExW(WS_EX_TOOLWINDOW, wide(HOST_CLASS).as_ptr(), wide("usAgI").as_ptr(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), GetModuleHandleW(null()), null())
+        CreateWindowExW(WS_EX_TOOLWINDOW, wide(HOST_CLASS).as_ptr(), wide(&title).as_ptr(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), GetModuleHandleW(null()), null())
     };
     HOST.store(host as isize, Ordering::Relaxed);
 
-    let engine = Engine::start(|snap| {
+    let on_snapshot = |snap| {
         if let Ok(mut g) = LATEST.lock() {
             *g = Some(snap);
         }
@@ -783,9 +859,14 @@ pub fn run(from_autostart: bool) {
         if host != 0 {
             unsafe { PostMessageW(host as HWND, WM_SNAPSHOT, 0, 0) };
         }
-    });
+    };
+    #[cfg(not(feature = "mock"))]
+    let engine = Engine::start(on_snapshot);
+    #[cfg(feature = "mock")]
+    let engine = Engine::mock(on_snapshot);
 
-    // Windows 알림용 앱 이름·아이콘 등록 (설정 > 알림 목록에 usAgI로 보임)
+    // Windows 알림용 앱 이름·아이콘 등록 (설정 > 알림 목록에 usAgI로 보임). 테스트 빌드는 실제 앱의 등록을 건드리지 않음
+    #[cfg(not(feature = "mock"))]
     {
         crate::toast::refresh_icon();
         // 설치형일 때만 시작 메뉴 바로 가기 (포터블은 흔적을 남기지 않음)
@@ -799,9 +880,7 @@ pub fn run(from_autostart: bool) {
     let mut tray = Tray::new(host);
     tray.set_balloon_icon(&rabbit::render(&Pose::default(), 64), 64, ink);
     let hook = unsafe { SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, null_mut(), Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT) };
-    let taskbar_layout_hook = unsafe {
-        SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, null_mut(), Some(on_taskbar_layout), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
-    };
+    let taskbar_layout_hook = hook_taskbar_layout();
     let seed = (time::now() * 1000.0) as u64;
 
     let app = App {
@@ -810,7 +889,8 @@ pub fn run(from_autostart: bool) {
         widgets: Vec::new(),
         settings: None,
         preview_sent: std::cell::Cell::new(0),
-        ctl: Controller::new(engine, Platform { name: "windows", repo: crate::updater::REPO, managed_update: None }),
+        // 테스트 빌드는 스스로 업데이트하지 않음
+        ctl: Controller::new(engine, Platform { name: "windows", repo: crate::updater::REPO, managed_update: cfg!(feature = "mock").then_some("테스트 빌드") }),
         anim: Animator::new(seed),
         ink,
         icon_size: win::small_icon_size(),
@@ -828,7 +908,9 @@ pub fn run(from_autostart: bool) {
             app.tray.set_tip(usagi_core::tr!("usAgI · 불러오는 중…", "usAgI · Loading…"));
             app.sync_widgets();
             app.frame();
-            crate::autostart::refresh(); // 자동 실행이 켜져 있으면 지금 위치로 로그온 작업을 맞춤 (예전 Run 등록은 옮김)
+            // 자동 실행이 켜져 있으면 지금 위치로 로그온 작업을 맞춤 (예전 Run 등록은 옮김). 테스트 빌드는 실제 앱의 자동 실행을 건드리지 않음
+            #[cfg(not(feature = "mock"))]
+            crate::autostart::refresh();
             let fx = app.ctl.startup();
             app.run(fx);
             if !from_autostart && usagi_core::accounts::load(app.ctl.state()).is_empty() {
