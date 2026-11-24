@@ -54,10 +54,10 @@ curl -fsSL https://raw.githubusercontent.com/Ba-koD/usAgI/main/scripts/install-m
 
 | 측정 환경 | 다운로드 크기¹ | 앱 메모리 부담² | 전체 상주 메모리³ | 대기 CPU 시간⁴ |
 | --- | ---: | ---: | ---: | ---: |
-| Windows 11 · 작업 표시줄 위젯 | **약 10.3 MB** | **3.72 MB** | 23.21 MB | 335 ms/분 |
-| macOS · 메뉴 막대 | **약 17.6 MB** | **16.55 MB** | 79.79 MB | 1.57 ms/분 |
+| Windows 11 · 작업 표시줄 위젯 | **약 9.9 MB** | **3.72 MB** | 23.21 MB | 335 ms/분 |
+| macOS · 메뉴 막대 | **약 15.3 MB** | **16.55 MB** | 79.79 MB | 1.57 ms/분 |
 
-¹ **작을수록 다운로드 부담이 적습니다.** 0.4.1 릴리스 첨부 파일 기준입니다. Windows는 `usagi.exe`, macOS는 Apple Silicon과 Intel을 모두 포함한 `usAgI-mac.zip`입니다.
+¹ **작을수록 다운로드 부담이 적습니다.** 0.4.2 릴리스 첨부 파일 기준입니다. Windows는 `usagi.exe`, macOS는 Apple Silicon과 Intel을 모두 포함한 `usAgI-mac.zip`입니다.
 
 ² **작을수록 앱의 메모리 부담이 적습니다.** Windows는 **전용 작업 집합**, macOS는 **Physical Footprint**입니다.
 
