@@ -155,7 +155,7 @@ export component SettingsView inherits Window {
                             text: root.small ? "" : @tr("초기화"); icon: @image-url("icons/reset.svg"); danger: true; label: @tr("{} 설정 초기화", root.pages[root.page]);
                             clicked => {
                                 Actions.ask("resetPage", root.page == 1 ? "widget" : root.page == 2 ? "alerts" : "general", @tr("{} 설정 초기화", root.pages[root.page]),
-                                    root.page == 1 ? (root.windows ? @tr("위젯 표시, 위치, 표시 값, 막대 길이를 기본값으로 되돌림") : @tr("표시 값을 기본값으로 되돌림")) : root.page == 2 ? @tr("알림 켜기·끄기, 리필권 알림, 그래프별 알림 기준을 기본값으로 되돌림. 계정·로그인은 유지") : (root.windows ? @tr("화면 테마, 언어, 로고 색, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지") : @tr("화면 테마, 언어, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지")));
+                                    root.page == 1 ? (root.windows ? @tr("위젯 표시, 위치, 표시 값, 막대 길이를 기본값으로 되돌림") : @tr("표시 값을 기본값으로 되돌림")) : root.page == 2 ? @tr("알림 켜기·끄기, 리필권·쿠폰 알림, 그래프별 알림 기준을 기본값으로 되돌림. 계정·로그인은 유지") : (root.windows ? @tr("화면 테마, 언어, 로고 색, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지") : @tr("화면 테마, 언어, 갱신 주기를 기본값으로 되돌림. 시작 시 실행과 계정은 유지")));
                             }
                         } }
                     }
@@ -225,12 +225,12 @@ export component SettingsView inherits Window {
                                 key: "loginNotify"; checked: root.prefs.login; }
                             Rule {}
                             VerticalLayout {
-                                SettingRow { title: @tr("리필권 만료 알림"); subtitle: @tr("리필권이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경");
-                                    Toggle { label: @tr("리필권 만료 알림"); checked: root.prefs.refill;
+                                SettingRow { title: @tr("리필권·쿠폰 만료 알림"); subtitle: @tr("리필권과 Claude 쿠폰이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경");
+                                    Toggle { label: @tr("리필권·쿠폰 만료 알림"); checked: root.prefs.refill;
                                         clicked => { Actions.pref("refillNotify", !root.prefs.refill ? "true" : "false"); } }
                                 }
                                 Fold { k: root.refill-k; gap: 12px;
-                                    SettingRow { title: @tr("알림 시점"); subtitle: @tr("리필권 만료 얼마 전에 알릴지 설정");
+                                    SettingRow { title: @tr("알림 시점"); subtitle: @tr("리필권·쿠폰 만료 얼마 전에 알릴지 설정");
                                         LeadTime { minutes: root.prefs.refill-lead; edited(v) => { Actions.pref("refillLead", "" + v); } }
                                     }
                                 }

@@ -92,11 +92,13 @@ pub struct ProviderView {
     pub email: Option<String>,
     pub workspace_id: Option<String>,
     pub plan: Option<String>,
-    /// Codex 크레딧·리필권
+    /// 크레딧(Codex)·리필권(Codex, Claude 한도 초기화권)
     pub credits: Option<codex::Credits>,
     pub refills: Option<codex::Refills>,
     /// Claude 추가 사용량·지출 한도 (보일 글자)
     pub extra: Option<String>,
+    /// Claude 쿠폰 (만료되지 않은 것, 만료가 빠른 순)
+    pub coupons: Vec<bridge::Coupon>,
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +291,7 @@ pub fn claude_view(acc: &Account, st: &Status, file: Option<&BridgeFile>) -> Pro
         credits: None,
         refills: None,
         extra: None,
+        coupons: Vec::new(),
     }
 }
 
@@ -321,6 +324,7 @@ pub fn codex_view(acc: &Account, s: &CodexSnapshot, now: f64) -> ProviderView {
         credits: s.credits.clone(),
         refills: s.refills.clone(),
         extra: None,
+        coupons: Vec::new(),
     }
 }
 
@@ -529,6 +533,30 @@ impl Notices {
                 crate::tr!(
                     format!("{} 리필권 {n}장 · {left} 뒤 만료 ({clock})", p.name),
                     format!("{}: {n} refill{} expire in {left} ({clock})", p.name, if n == 1 { "" } else { "s" })
+                ),
+            ));
+        }
+        // Claude 쿠폰 만료 임박: 리필권과 같은 설정, 가장 먼저 만료되는 쿠폰의 만료 시각마다 한 번
+        for p in &snap.providers {
+            let Some(c) = p.coupons.iter().filter(|c| c.expires_at > snap.now).min_by(|a, b| a.expires_at.total_cmp(&b.expires_at)) else { continue };
+            let (on, lead) = refill_rule(&self.state, &p.account_id);
+            let at = c.expires_at;
+            if !on || at - snap.now > lead * 60.0 {
+                continue;
+            }
+            let key = format!("coupon:{}", p.account_id);
+            let stamp = ((at / 60.0).round() as i64).to_string();
+            if self.state.get_str(&key) == Some(stamp.as_str()) {
+                continue;
+            }
+            self.state.set_str(&key, &stamp);
+            dirty = true;
+            let (amount, left, clock) = (c.amount_label(), texts::fmt_duration(at - snap.now), texts::fmt_clock(at, snap.now));
+            out.push((
+                crate::tr!("쿠폰 만료 임박", "Coupon expiring soon").into(),
+                crate::tr!(
+                    format!("{} 쿠폰 {amount} · {left} 뒤 만료 ({clock})", p.name),
+                    format!("{}: {amount} coupon expires in {left} ({clock})", p.name)
                 ),
             ));
         }
@@ -805,6 +833,10 @@ impl Sources {
             }
             let mut view = claude_view(&src.acc, &st, file);
             view.extra = file.and_then(|b| b.spend.as_ref().map(|s| s.label()).or_else(|| b.extra.clone()));
+            view.coupons = file.and_then(|b| b.coupons.as_ref()).into_iter().flatten()
+                .filter(|c| c.expires_at > now).cloned().collect();
+            view.coupons.sort_by(|a, b| a.expires_at.total_cmp(&b.expires_at));
+            view.refills = file.and_then(|b| b.refills.clone()).filter(|r| r.expires_at.is_none_or(|at| at > now));
             if let Some(b) = file.filter(|_| st.exact) {
                 for m in &b.models {
                     view.meters.push(Meter {
@@ -855,6 +887,7 @@ pub fn hide_logged_out(snap: &mut Snapshot) {
         p.extra = None;
         p.credits = None;
         p.refills = None;
+        p.coupons.clear();
         p.forecast = None;
     }
     snap.claude_statuses.retain(|id, _| !out.contains(id));
@@ -1391,8 +1424,14 @@ fn mock_snapshot(now: f64) -> Snapshot {
             workspace_id: None,
             plan: None,
             credits: None,
-            refills: None,
+            // Claude 카드의 리필권·쿠폰 표시 확인용
+            refills: acc.is_claude().then(|| codex::Refills { available: 2, expires_at: Some(now + 6.0 * DAY) }),
             extra: None,
+            coupons: if acc.is_claude() {
+                vec![bridge::Coupon { amount: 50.0, currency: "USD".into(), expires_at: now + 3.0 * DAY + 5.0 * HOUR, name: None }]
+            } else {
+                Vec::new()
+            },
         });
         logins.insert(acc.id.clone(), LoginStatus { logged_in: Some(true), checked_at: now, ..Default::default() });
     }
@@ -1511,6 +1550,7 @@ mod tests {
                 credits: None,
                 refills: None,
                 extra: None,
+                coupons: Vec::new(),
             }],
             logins: HashMap::new(),
             probes: HashMap::new(),
@@ -1522,6 +1562,48 @@ mod tests {
         assert_eq!(n.check(None, &mk(0.6), &cfg).len(), 0); // 같은 기준 다시 안 알림
         assert_eq!(n.check(None, &mk(0.85), &cfg).len(), 1); // 80%
         assert_eq!(n.check(None, &mk(0.9), &cfg).len(), 0);
+    }
+
+    #[test]
+    fn coupon_expiry_alerts_follow_the_refill_setting_once_per_expiry() {
+        let mut n = Notices { state: State::default() };
+        let now = time::now();
+        let mk = |expires_at: f64| Snapshot {
+            now,
+            claude: None,
+            providers: vec![ProviderView {
+                id: ProviderId::Claude,
+                account_id: "claude-1".into(),
+                name: "Claude".into(),
+                meters: Vec::new(),
+                updated_at: Some(now),
+                note: None,
+                forecast: None,
+                show: true,
+                email: None,
+                workspace_id: None,
+                plan: None,
+                credits: None,
+                refills: None,
+                extra: None,
+                coupons: vec![bridge::Coupon { amount: 50.0, currency: "USD".into(), expires_at, name: None }],
+            }],
+            logins: HashMap::new(),
+            probes: HashMap::new(),
+            claude_statuses: HashMap::new(), revisions: HashMap::new(),
+        };
+        let cfg = Config::default();
+        let soon = mk(now + 2.0 * HOUR);
+        assert!(n.check(None, &soon, &cfg).is_empty(), "기본은 리필권·쿠폰 알림 꺼짐");
+        n.state.0.insert("prefs".into(), serde_json::json!({ "refillNotify": true }));
+        let sent = n.check(None, &soon, &cfg);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "쿠폰 만료 임박");
+        assert!(sent[0].1.starts_with("Claude 쿠폰 $50 · "), "{}", sent[0].1);
+        assert!(n.check(None, &soon, &cfg).is_empty(), "같은 만료는 한 번만");
+        assert!(n.check(None, &mk(now + 3.0 * DAY), &cfg).is_empty(), "기본 시점(하루 전)보다 이름");
+        n.state.0.insert("refill_rules".into(), serde_json::json!({ "claude-1": { "on": false } }));
+        assert!(n.check(None, &mk(now + HOUR), &cfg).is_empty(), "계정별 끔");
     }
 
     #[test]
@@ -1570,6 +1652,7 @@ mod tests {
                 credits: None,
                 refills: None,
                 extra: None,
+                coupons: Vec::new(),
             }],
             logins: HashMap::new(),
             probes: HashMap::new(),
@@ -1712,6 +1795,7 @@ mod tests {
             credits: None,
             refills: None,
             extra: Some("추가 사용 $12.30 / $50 · 월".into()),
+            coupons: Vec::new(),
         };
         let st = Tracker::new().status(now);
         let mut snap = Snapshot { now, claude: Some(st.clone()), providers: vec![view("claude-1"), view("claude-2"), view("claude-3")], logins: HashMap::new(), probes: HashMap::new(), claude_statuses: HashMap::new(), revisions: HashMap::new() };

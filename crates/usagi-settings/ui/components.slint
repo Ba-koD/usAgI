@@ -214,7 +214,7 @@ export struct Meter {
 }
 export struct Account {
     id: string, provider: string, title: string, label: string, details: string,
-    status: string, plan: string, credits: string, refills: string, folder: string, footer: string,
+    status: string, plan: string, credits: string, refills: string, coupons: string, folder: string, footer: string,
     refresh-status: string, refreshing: bool, managed: bool, reconnect-soon: bool, sign-in-ends: string,
     refill-mode: string, refill-lead: int,
     show-widget: bool, collapsed: bool, meters: [Meter],
@@ -1028,7 +1028,7 @@ export component AccountCard inherits Panel {
     private property <length> meter-width: root.meters-in-row
         ? (root.room - 2 * root.inset - max(0, root.entry.meters.length - 1) * root.meter-gap) / max(1, root.entry.meters.length)
         : root.room - 2 * root.inset;
-    private property <bool> has-extras: root.entry.credits != "" || root.entry.refills != "";
+    private property <bool> has-extras: root.entry.credits != "" || root.entry.refills != "" || root.entry.coupons != "";
     private property <bool> show-reconnect: root.entry.reconnect-soon || root.entry.status == "out";
     // 넓으면 요금제 옆, 좁으면 한 줄 아래에 크레딧·리필권
     private property <bool> extras-inline: root.room >= 760px;
@@ -1075,11 +1075,13 @@ export component AccountCard inherits Panel {
                 if root.entry.plan != "": CenterItem { Chip { text: root.entry.plan; accent: true; } }
                 if root.extras-inline && root.entry.credits != "": CenterItem { Chip { text: root.entry.credits; tone: 1; } }
                 if root.extras-inline && root.entry.refills != "": CenterItem { Chip { text: root.entry.refills; tone: 2; } }
+                if root.extras-inline && root.entry.coupons != "": CenterItem { Chip { text: root.entry.coupons; tone: 1; } }
                 Text { text: root.entry.details; vertical-alignment: center; color: Theme.sub; font-size: Theme.size-small; overflow: elide; horizontal-stretch: 1; }
             }
             if !root.extras-inline && root.has-extras: HorizontalLayout { height: 24px; spacing: Theme.gap-s; alignment: start;
                 if root.entry.credits != "": Chip { text: root.entry.credits; tone: 1; }
                 if root.entry.refills != "": Chip { text: root.entry.refills; tone: 2; }
+                if root.entry.coupons != "": Chip { text: root.entry.coupons; tone: 1; }
             }
         }
         if !root.alerts-page: CenterItem { UiButton {
@@ -1107,17 +1109,17 @@ export component AccountCard inherits Panel {
     // 로그아웃된 계정은 예전 값을 숨기므로 이유를 알림
     if root.entry.meters.length == 0 && !root.folded && root.entry.status != "out": VerticalLayout { padding-top: Theme.gap-l;
         Hint { text: @tr("사용량 정보 없음"); } }
-    // 리필권이 지금 없어도 미리 설정 가능 (모든 공급자)
+    // 리필권(ChatGPT·Claude)·쿠폰(Claude)이 지금 없어도 미리 설정 가능
     if root.alerts-page: VerticalLayout { padding-top: Theme.gap-l; SettingRow {
-        title: @tr("리필권 만료 알림");
+        title: root.entry.provider == "claude" ? @tr("리필권·쿠폰 만료 알림") : @tr("리필권 만료 알림");
         subtitle: (root.entry.refill-mode == "default" ? @tr("전체 설정과 동일") : root.entry.refill-mode == "off" ? @tr("이 계정은 알림 끔") : @tr("이 계정만 따로 설정"))
-            + (root.entry.refills == "" ? @tr(" · 현재 리필권 없음") : "");
+            + (root.entry.refills != "" || root.entry.coupons != "" ? "" : root.entry.provider == "claude" ? @tr(" · 현재 리필권·쿠폰 없음") : @tr(" · 현재 리필권 없음"));
         Segments { options: [@tr("기본값"), @tr("켜기"), @tr("끄기")];
             index: root.entry.refill-mode == "on" ? 1 : root.entry.refill-mode == "off" ? 2 : 0;
             selected(i) => { Actions.refill(root.entry.id, i == 1 ? "on" : i == 2 ? "off" : "default", root.entry.refill-lead); } }
     } }
     if root.alerts-page: Fold { k: root.refill-k; gap: Theme.gap-m; SettingRow {
-        title: @tr("알림 시점"); subtitle: @tr("이 계정의 리필권 만료 얼마 전에 알릴지 설정");
+        title: @tr("알림 시점"); subtitle: root.entry.provider == "claude" ? @tr("이 계정의 리필권·쿠폰 만료 얼마 전에 알릴지 설정") : @tr("이 계정의 리필권 만료 얼마 전에 알릴지 설정");
         LeadTime { minutes: root.entry.refill-lead; edited(v) => { Actions.refill(root.entry.id, "on", v); } }
     } }
     if root.entry.meters.length > 0 && root.meters-in-row: HorizontalLayout {

@@ -142,6 +142,21 @@ fn refill_noun(n: u64) -> &'static str {
     }
 }
 
+/// Claude 쿠폰 표시: 가장 먼저 만료되는 것 ("쿠폰 $50 · 12월 5일까지", 더 있으면 " 외 n장")
+fn coupon(c: &Value) -> String {
+    let (Some(amount), Some(expires)) = (c["amount"].as_str(), c["expires"].as_str()) else {
+        return String::new();
+    };
+    let date = expires.split('(').next().unwrap_or(expires).trim();
+    match c["more"].as_u64().unwrap_or(0) {
+        0 => tr!(format!("쿠폰 {amount} · {date}까지"), format!("{amount} coupon · until {date}")),
+        more => tr!(
+            format!("쿠폰 {amount} · {date}까지 외 {more}장"),
+            format!("{amount} coupon · until {date} (+{more} more)")
+        ),
+    }
+}
+
 fn account(v: &Value, previous: Option<Account>) -> Account {
     let login = &v["login"];
     let probe = &v["probe"];
@@ -238,6 +253,7 @@ fn account(v: &Value, previous: Option<Account>) -> Account {
         .into(),
         refill_lead: v["refill"]["lead"].as_f64().unwrap_or(1440.0).round() as i32,
         refills: refills.into(),
+        coupons: coupon(&v["coupons"]).into(),
         // 대체 폴더를 쓰는 중이면 두 폴더 모두
         folder: match text(login, "fallback") {
             "" => text(v, "dir").to_string(),

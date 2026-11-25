@@ -1242,7 +1242,7 @@ impl Controller {
 
     /// 한 페이지 설정만 기본값으로. 계정·로그인, 다른 페이지 설정, 시작 시 실행(시스템 등록)은 그대로
     /// - widget: 위젯 표시·위치·모니터·표시 값·막대 길이
-    /// - alerts: 알림 켜기·끄기, 리필권 알림(계정별 포함), 그래프별 알림 기준
+    /// - alerts: 알림 켜기·끄기, 리필권·쿠폰 알림(계정별 포함), 그래프별 알림 기준
     /// - general: 화면 테마·언어·로고 색·갱신 주기
     pub fn reset_scope(&mut self, scope: &str) -> Vec<Effect> {
         let previous = self.notices.state.clone();
@@ -1529,6 +1529,7 @@ mod tests {
                 credits: None,
                 refills: None,
                 extra: None,
+                coupons: Vec::new(),
             }],
             logins: Default::default(),
             probes: Default::default(),

@@ -53,6 +53,12 @@ pub struct BridgeFile {
     /// 사용량 조회의 추가 사용량·크레딧 안내
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<String>,
+    /// Claude 쿠폰, 만료가 빠른 순. None은 이번 기록에서 확인하지 않음 (저장할 때 예전 값을 이어 씀)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupons: Option<Vec<Coupon>>,
+    /// Claude 리필권 (한도 초기화권, Claude Code `/limit-reset`). None은 이번 기록에 없음 (예전 값을 이어 씀)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refills: Option<crate::codex::Refills>,
     /// 사용량 조회에서 온 기록인지 (저장하지 않음). 상태 표시줄에는 추가 사용량 안내가 없음
     #[serde(skip)]
     pub from_usage: bool,
@@ -98,6 +104,60 @@ impl Spend {
         };
         crate::tr!(format!("추가 사용 {amount}{period}"), format!("Extra usage {amount}{period}"))
     }
+}
+
+/// Claude 쿠폰: 사용 크레딧 잔액 중 만료일이 있는 프로모션 크레딧.
+/// Claude Code `/usage-credits`가 보여 주는 promo_tranches와 같은 값
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Coupon {
+    /// 남은 금액 (통화 기본 단위, 50.0 = $50)
+    pub amount: f64,
+    /// ISO 통화 코드 (USD 등)
+    pub currency: String,
+    pub expires_at: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Coupon {
+    /// 금액 표시: "$50", "$12.50", "₩70,000", 기호가 없는 통화는 "50 CHF"
+    pub fn amount_label(&self) -> String {
+        let cents = (self.amount * 100.0).round() as i64;
+        let whole = group_thousands(cents / 100);
+        let number = if cents % 100 == 0 { whole } else { format!("{whole}.{:02}", cents % 100) };
+        match self.currency.as_str() {
+            "USD" => format!("${number}"),
+            "EUR" => format!("€{number}"),
+            "GBP" => format!("£{number}"),
+            "JPY" => format!("¥{number}"),
+            "KRW" => format!("₩{number}"),
+            code => format!("{number} {code}"),
+        }
+    }
+}
+
+/// 서버 금액(최소 단위) → 기본 단위 배수. 원·엔처럼 소수 단위가 없는 통화는 1
+pub fn minor_per_unit(currency: &str) -> f64 {
+    if matches!(currency, "JPY" | "KRW" | "VND" | "CLP" | "ISK" | "PYG" | "UGX" | "XAF" | "XOF") {
+        1.0
+    } else {
+        100.0
+    }
+}
+
+fn group_thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -194,6 +254,16 @@ pub fn save(account_id: &str, mut file: BridgeFile) -> std::io::Result<()> {
     if !file.from_usage {
         file.extra = old.as_ref().and_then(|o| o.extra.clone());
     }
+    // 쿠폰은 가끔만 조회하고 상태 표시줄·CLI `/usage`에는 없음 → 확인하지 않은 기록은 예전 값 중 남은 것을 이어 씀
+    if file.coupons.is_none() {
+        let now = file.updated_at;
+        file.coupons = old.as_ref().and_then(|o| o.coupons.clone()).map(|list| list.into_iter().filter(|c| c.expires_at > now).collect());
+    }
+    // 리필권은 HTTPS 사용량 조회에만 옴 → 다른 기록은 만료 전까지 예전 값을 이어 씀
+    if file.refills.is_none() {
+        let now = file.updated_at;
+        file.refills = old.as_ref().and_then(|o| o.refills.clone()).filter(|r| r.expires_at.is_none_or(|at| at > now));
+    }
     // 상태 표시줄은 모델별 창을 모르므로, 마지막 `/usage` 값을 리셋 전까지 이어 씀
     if file.models.is_empty() {
         file.models = old
@@ -260,6 +330,45 @@ mod tests {
         let file = file.unwrap();
         assert!(file.five_hour.is_none()); // 리셋돼서 빠진 창
         assert_eq!(file.seven_day.unwrap().resets_at, None);
+    }
+
+    #[test]
+    fn coupon_amounts_use_the_currency_symbol() {
+        let c = |amount: f64, currency: &str| Coupon { amount, currency: currency.into(), expires_at: 0.0, name: None };
+        assert_eq!(c(50.0, "USD").amount_label(), "$50");
+        assert_eq!(c(12.5, "USD").amount_label(), "$12.50");
+        assert_eq!(c(70_000.0, "KRW").amount_label(), "₩70,000");
+        assert_eq!(c(1_234.5, "CHF").amount_label(), "1,234.50 CHF");
+        assert_eq!(minor_per_unit("USD"), 100.0);
+        assert_eq!(minor_per_unit("KRW"), 1.0);
+    }
+
+    #[test]
+    fn unchecked_records_keep_unexpired_coupons() {
+        let id = "coupon-carry-test";
+        let coupon = |expires_at: f64| Coupon { amount: 5.0, currency: "USD".into(), expires_at, name: None };
+        let first = BridgeFile { updated_at: 100.0, coupons: Some(vec![coupon(150.0), coupon(500.0)]), from_usage: true, ..Default::default() };
+        save(id, first).unwrap();
+        // 상태 표시줄·CLI 기록에는 쿠폰이 없음 → 남은 쿠폰만 이어 씀
+        save(id, BridgeFile { updated_at: 200.0, ..Default::default() }).unwrap();
+        assert_eq!(read(id).unwrap().coupons, Some(vec![coupon(500.0)]));
+        // 확인했는데 없으면 비움
+        save(id, BridgeFile { updated_at: 300.0, coupons: Some(Vec::new()), from_usage: true, ..Default::default() }).unwrap();
+        assert_eq!(read(id).unwrap().coupons, Some(Vec::new()));
+        let _ = std::fs::remove_file(path(id));
+    }
+
+    #[test]
+    fn unchecked_records_keep_refills_until_they_expire() {
+        let id = "refill-carry-test";
+        let refills = crate::codex::Refills { available: 1, expires_at: Some(250.0) };
+        let first = BridgeFile { updated_at: 100.0, refills: Some(refills.clone()), from_usage: true, ..Default::default() };
+        save(id, first).unwrap();
+        save(id, BridgeFile { updated_at: 200.0, ..Default::default() }).unwrap();
+        assert_eq!(read(id).unwrap().refills, Some(refills));
+        save(id, BridgeFile { updated_at: 300.0, ..Default::default() }).unwrap();
+        assert_eq!(read(id).unwrap().refills, None, "기한이 지나면 이어 쓰지 않음");
+        let _ = std::fs::remove_file(path(id));
     }
 
     #[test]

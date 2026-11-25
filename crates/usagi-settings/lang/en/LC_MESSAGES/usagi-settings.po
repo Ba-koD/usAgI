@@ -90,8 +90,8 @@ msgstr "The shown value goes back to its default"
 
 #: ui/settings.slint:147
 msgctxt "SettingsView"
-msgid "알림 켜기·끄기, 리필권 알림, 그래프별 알림 기준을 기본값으로 되돌림. 계정·로그인은 유지"
-msgstr "Alert switches, refill alerts and per-graph alerts go back to defaults. Accounts and logins stay"
+msgid "알림 켜기·끄기, 리필권·쿠폰 알림, 그래프별 알림 기준을 기본값으로 되돌림. 계정·로그인은 유지"
+msgstr "Alert switches, refill and coupon alerts and per-graph alerts go back to defaults. Accounts and logins stay"
 
 #: ui/settings.slint:147
 msgctxt "SettingsView"
@@ -210,13 +210,13 @@ msgstr "Reconnect"
 
 #: ui/settings.slint:209 ui/settings.slint:210
 msgctxt "SettingsView"
-msgid "리필권 만료 알림"
-msgstr "Refill expiry alerts"
+msgid "리필권·쿠폰 만료 알림"
+msgstr "Refill and coupon expiry alerts"
 
 #: ui/settings.slint:209
 msgctxt "SettingsView"
-msgid "리필권이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경"
-msgstr "Alerts once before refills expire. Each account can be set separately below"
+msgid "리필권과 Claude 쿠폰이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경"
+msgstr "Alerts once before refills or Claude coupons expire. Each account can be set separately below"
 
 #: ui/settings.slint:214
 msgctxt "SettingsView"
@@ -225,8 +225,8 @@ msgstr "Alert timing"
 
 #: ui/settings.slint:214
 msgctxt "SettingsView"
-msgid "리필권 만료 얼마 전에 알릴지 설정"
-msgstr "How long before refills expire to alert"
+msgid "리필권·쿠폰 만료 얼마 전에 알릴지 설정"
+msgstr "How long before refills or coupons expire to alert"
 
 #: ui/settings.slint:220 ui/settings.slint:228
 msgctxt "SettingsView"
@@ -968,6 +968,11 @@ msgctxt "AccountCard"
 msgid "리필권 만료 알림"
 msgstr "Refill expiry alerts"
 
+#: ui/components.slint
+msgctxt "AccountCard"
+msgid "리필권·쿠폰 만료 알림"
+msgstr "Refill and coupon expiry alerts"
+
 #: ui/components.slint:895
 msgctxt "AccountCard"
 msgid "전체 설정과 동일"
@@ -987,6 +992,11 @@ msgstr "Set for this account"
 msgctxt "AccountCard"
 msgid " · 현재 리필권 없음"
 msgstr " · No refills right now"
+
+#: ui/components.slint
+msgctxt "AccountCard"
+msgid " · 현재 리필권·쿠폰 없음"
+msgstr " · No refills or coupons right now"
 
 #: ui/components.slint:897
 msgctxt "AccountCard"
@@ -1012,6 +1022,11 @@ msgstr "Alert timing"
 msgctxt "AccountCard"
 msgid "이 계정의 리필권 만료 얼마 전에 알릴지 설정"
 msgstr "How long before this account's refills expire to alert"
+
+#: ui/components.slint
+msgctxt "AccountCard"
+msgid "이 계정의 리필권·쿠폰 만료 얼마 전에 알릴지 설정"
+msgstr "How long before this account's refills or coupons expire to alert"
 
 #: ui/components.slint:926
 msgctxt "AccountCard"

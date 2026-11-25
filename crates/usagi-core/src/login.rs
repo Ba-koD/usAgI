@@ -544,6 +544,11 @@ pub fn claude_tier(acc: &Account) -> Option<String> {
     claude_profiles(&acc.path()).find_map(|profile| profile.tier())
 }
 
+/// 이 Claude 프로필의 조직 ID (.claude.json의 oauthAccount.organizationUuid)
+pub(crate) fn claude_org_uuid(dir: &Path) -> Option<String> {
+    claude_profiles(dir).find_map(|profile| profile.organization_uuid.map(|id| id.trim().to_owned()).filter(|id| !id.is_empty()))
+}
+
 /// 기본 프로필(~/.claude)은 ~/.claude.json에 계정 정보가 있을 수 있습니다.
 fn claude_profiles(dir: &Path) -> impl Iterator<Item = ClaudeProfile> {
     #[derive(serde::Deserialize)]

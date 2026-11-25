@@ -146,6 +146,15 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
                     "available": r.available,
                     "expires": r.expires_at.filter(|&t| t > now).map(|t| texts::fmt_clock(t, now)),
                 })),
+                // Claude 쿠폰: 가장 먼저 만료되는 것과 나머지 개수
+                "coupons": view.and_then(|v| {
+                    let live: Vec<_> = v.coupons.iter().filter(|c| c.expires_at > now).collect();
+                    live.first().map(|c| json!({
+                        "amount": c.amount_label(),
+                        "expires": texts::fmt_clock(c.expires_at, now),
+                        "more": live.len() - 1,
+                    }))
+                }),
                 "managed": accounts::is_managed(a),
                 "name": view.map(|v| v.name.clone()).unwrap_or_else(|| if a.is_claude() { "Claude".into() } else { "Codex".into() }),
                 "exact": view.is_some_and(|v| v.meters.iter().any(|m| m.exact)),
@@ -369,7 +378,7 @@ pub fn clear_usage(a: &Account) {
 /// 계정 제거와 함께 저장할 알림·그래프 설정 정리.
 pub fn forget_account_settings(state: &mut State, a: &Account) {
     let prefix = format!("{}:", a.id);
-    for kind in ["login", "login-expiry", "refill", "nap"] {
+    for kind in ["login", "login-expiry", "refill", "coupon", "nap"] {
         state.0.remove(&format!("{kind}:{}", a.id));
     }
     state.0.retain(|k, _| !["soon:", "tired:"].iter().any(|p| k.strip_prefix(p).is_some_and(|rest| rest.starts_with(&prefix))));
