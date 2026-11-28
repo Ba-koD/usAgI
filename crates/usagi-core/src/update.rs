@@ -1,5 +1,5 @@
-//! 자동 업데이트 공통 부분: GitHub 릴리스 정보 읽기, 받을 파일 고르기, 서명 검증.
-//! 내려받기·바꿔 끼우기는 플랫폼마다 달라서 각 앱의 updater가 해요.
+//! 자동 업데이트 공통 부분: GitHub 릴리스 확인·받기([`check`], [`download`], [`fetch_text`]), 받을 파일 고르기, 서명 검증.
+//! 받은 파일을 두는 곳과 바꿔 끼우기는 플랫폼마다 달라서 각 앱의 updater가 해요.
 //!
 //! 서명: 체크섬은 실행 파일과 같은 릴리스에서 오므로 릴리스를 바꿔치기한 쪽이 함께 바꿀 수 있어요.
 //! 그래서 저장소에 없는 비밀 키(릴리스 워크플로의 비밀값)로 만든 minisign 서명(`<파일>.minisig`)을, 앱에 들어 있는 공개 키
@@ -10,6 +10,9 @@ use crate::version;
 use minisign_verify::{PublicKey, Signature};
 use serde_json::Value;
 use std::io::{self, Read};
+
+mod download;
+pub use download::{check, download, fetch_text, REPO};
 
 pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 

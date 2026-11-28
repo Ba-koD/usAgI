@@ -33,6 +33,9 @@
 4. 체크섬과 서명을 검증. 서명은 앱에 들어 있는 공개 키(`packaging/usagi-update.pub`)로 확인하며 서명 안의 버전과 파일 이름도 일치해야 함
 5. 실행 파일을 바꾸고 다시 시작 (설정 창이 열려 있으면 닫을 때까지 대기)
 
+확인과 내려받기는 Windows·macOS가 같은 코드(`usagi-core`의 `update`)로 하고, 실행 파일 바꾸기만 플랫폼마다 다름.
+처음 주소는 GitHub의 https만 허용하고, GitHub이 파일 서버로 넘기는 리다이렉트도 https만 최대 5번 따라감.
+
 체크섬이나 서명이 없거나 맞지 않으면 설치하지 않음. 서명 비밀 키는 저장소에 두지 않고 GitHub Actions 비밀값으로만 보관하므로, 릴리스 파일만 바꿔서는 통과할 수 없음.
 (공개 키 파일이 비어 있는 빌드는 체크섬만 확인.)
 
@@ -47,6 +50,7 @@ minisign -Vm usagi.exe -p packaging/usagi-update.pub
 - **로그인·토큰**: 공식 CLI가 관리. 직접 조회는 액세스 토큰을 메모리에서 읽어 해당 제공자의 고정 HTTPS 주소로 보냄. 토큰 파일 쓰기와 갱신은 CLI가 담당
 - **프로필 폴더**: usAgI가 계정마다 만드는 폴더는 이 사용자만 접근 (Windows는 상속 권한 차단, macOS는 0700)
 - **네트워크**: Claude·Codex 사용량 조회, GitHub 업데이트 확인·내려받기
+- **프록시**: 모든 HTTPS 요청이 OS 설정을 따름 (`usagi-core`의 `net`). 환경 변수 `HTTPS_PROXY`·`ALL_PROXY`(`NO_PROXY` 포함)가 있으면 우선, 없으면 Windows 인터넷 옵션(수동 프록시·예외 목록·PAC 주소·자동 검색), macOS 네트워크 설정(수동 프록시·예외 목록·PAC). PAC가 여러 경로를 주면 연결이 안 될 때 다음 경로로. 루프백 주소는 늘 직접, SOCKS는 지원하지 않음. 프록시 조회 결과는 주소마다 10분 기억
 - **업데이트**: 이 저장소의 GitHub 릴리스 파일만 허용, 체크섬과 서명 필수
 - **CLI 준비**: 유효한 파일이나 설치된 CLI를 사용. CLI가 필요한 경우 사용자 선택으로 공급자의 공식 설치 문서를 엶
 - **설정 창**: 별도 Slint 실행 파일을 열고 JSON 파이프로 통신. 계정·설정·알림은 본체가 읽고 저장
@@ -58,6 +62,7 @@ minisign -Vm usagi.exe -p packaging/usagi-update.pub
 
 ```powershell
 cargo test -p usagi-core
+cargo test -p usagi-core real_release -- --ignored  # 실제 GitHub 릴리스로 확인·받기·서명 검증 (네트워크)
 cargo build --release -p usagi-win -p usagi-settings  # 개발용, 두 파일을 같은 폴더에서 실행
 scripts\package-portable.ps1              # 로컬 포터블 묶음 dist\usAgI-portable-x.y.z.zip
 ```
@@ -119,11 +124,12 @@ Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UP
 ## 구조
 
 ```
-crates/usagi-core       공통 로직 (사용량 읽기, 계정, 알림 판단, 문구, 업데이트 서명 확인)
+crates/usagi-core       공통 로직 (사용량 읽기, 계정, 알림 판단, 문구, 상태 표시줄 명령)
                         + 설정 화면 컨트롤러(controller.rs): 화면 상태와 모든 명령 처리
+                        + 업데이트 확인·받기·서명 검증(update), OS 프록시를 따르는 HTTPS(net)
 crates/usagi-settings   Windows·macOS 공용 Slint 설정 화면과 호스트 통신
-apps/usagi-win          Windows 앱 (작업 표시줄 위젯, 알림 영역, 업데이트 적용)
-apps/usagi-mac          macOS 앱 (메뉴 막대 로고 + 사용량 막대, 앱 자체 알림, 업데이트 적용)
+apps/usagi-win          Windows 앱 (작업 표시줄 위젯, 알림 영역, 받은 exe 바꾸기)
+apps/usagi-mac          macOS 앱 (메뉴 막대 로고 + 사용량 막대, 앱 자체 알림, 받은 .app 바꾸기)
 tools/usagi-sign        릴리스 서명 도구 (키 만들기, 서명, 확인)
 scripts                 포터블 패키지 · macOS 앱 묶기 · 설치 · 릴리스 · 서명 스크립트
 packaging               업데이트 서명 공개 키, Homebrew Cask 틀
