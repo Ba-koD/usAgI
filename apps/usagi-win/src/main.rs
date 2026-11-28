@@ -18,9 +18,9 @@ mod updater;
 mod widget;
 mod win;
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::Command;
-use usagi_core::{accounts, bridge, config, engine, texts};
+use usagi_core::{bridge, config, engine, texts};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,7 +33,7 @@ fn main() {
     install_panic_log();
     match args.get(1).map(String::as_str) {
         Some("--settings-ui") => settings::run_standalone(),
-        Some("statusline") => statusline(&args),
+        Some("statusline") => bridge::statusline_main(&args, run_chain),
         Some("--widget-preview") => widget_preview(args.get(2).map(String::as_str).unwrap_or("widget-preview.bmp")),
         // 디자인 확인용: 설정 창 미리 보기에 보내는 것과 같은 자료를 예시 값으로 출력
         Some("--widget-preview-json") => widget_preview_json(&args[2..]),
@@ -100,24 +100,7 @@ fn main() {
     }
 }
 
-/// Claude Code가 부르는 상태 표시줄 명령. 사용량을 기록하고, 원래 쓰던 상태 표시줄이 있으면 그 출력을 그대로 보여 줌.
-fn statusline(args: &[String]) {
-    let account = args
-        .iter()
-        .position(|a| a == "--account")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "claude-1".into());
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let line = bridge::run_statusline(&input, &account);
-    let chain = accounts::load(&config::State::load()).into_iter().find(|a| a.usage_key() == account).and_then(|a| a.chain);
-    let out = chain.and_then(|cmd| run_chain(&cmd, &input)).unwrap_or(line);
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(out.as_bytes());
-    let _ = stdout.flush();
-}
-
+/// 원래 쓰던 상태 표시줄 실행 (`statusline` 명령 본문은 코어의 [`bridge::statusline_main`])
 fn run_chain(cmd: &str, input: &str) -> Option<String> {
     // Claude Code는 Windows에서 Git Bash로 상태 표시줄을 실행하므로 bash 우선, 없으면 cmd.
     // 셸은 절대 경로로만 (이름만 주면 Windows가 이 exe의 폴더를 먼저 찾음)
