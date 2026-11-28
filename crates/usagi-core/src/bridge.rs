@@ -313,7 +313,9 @@ pub fn statusline_main(args: &[String], run_chain: impl FnOnce(&str, &str) -> Op
         .into_iter()
         .find(|a| a.usage_key() == account)
         .and_then(|a| a.chain);
-    let out = statusline_reply(line, chain.as_deref(), &input, run_chain);
+    // 원래 상태 표시줄이 다시 usAgI를 부른 경우: 체인을 또 실행하면 끝없이 이어짐
+    let nested = std::env::var_os(crate::login::STATUSLINE_CHAIN_ENV).is_some();
+    let out = statusline_reply(line, chain.as_deref().filter(|_| !nested), &input, run_chain);
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(out.as_bytes());
     let _ = stdout.flush();

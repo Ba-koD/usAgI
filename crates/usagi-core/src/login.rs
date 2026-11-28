@@ -320,14 +320,21 @@ impl Drop for ChildJob {
     }
 }
 
+/// 원래 상태 표시줄로 실행한 명령에 붙이는 표시. 그 명령이 다시 `usagi statusline`을 부르면 체인을 건너뜀 (끝없는 반복 방지)
+pub const STATUSLINE_CHAIN_ENV: &str = "USAGI_STATUSLINE_CHAIN";
+
 /// Run the original status line with a fixed deadline and bounded output.
-pub fn run_statusline_chain(command: Command, input: &str) -> Option<String> {
+pub fn run_statusline_chain(mut command: Command, input: &str) -> Option<String> {
+    command.env(STATUSLINE_CHAIN_ENV, "1");
     run_bounded_command(command, input, Duration::from_secs(2))
 }
 
 /// Run a short-lived helper with bounded output and a deadline.
 pub fn run_bounded_command(mut command: Command, input: &str, timeout: Duration) -> Option<String> {
     use std::io::{Read as _, Write as _};
+    // Unix: 자기 프로세스 그룹에서 실행 → 시간 초과 때 `sh -c`가 띄운 손자 프로세스까지 끝냄 (Windows는 작업 개체)
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     #[cfg(windows)]
     let _job = ChildJob::attach(&child).ok();
@@ -348,11 +355,27 @@ pub fn run_bounded_command(mut command: Command, input: &str, timeout: Duration)
             }
             Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(15)),
             _ => {
+                #[cfg(unix)]
+                kill_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
         }
+    }
+}
+
+/// `process_group(0)`으로 띄운 자식의 그룹 전체에 SIGKILL
+#[cfg(unix)]
+fn kill_process_group(leader: u32) {
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    // 0이나 음수는 이 앱의 그룹·모든 프로세스를 가리키므로 실제 자식 번호만
+    if let Some(pid) = i32::try_from(leader).ok().filter(|&pid| pid > 0) {
+        // SAFETY: kill(2)은 메모리를 다루지 않음. 음수 pid는 그 번호의 프로세스 그룹
+        unsafe { kill(-pid, SIGKILL) };
     }
 }
 
@@ -686,6 +709,39 @@ pub fn login_args(acc: &Account) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_helper_takes_its_grandchildren_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut command = Command::new("/bin/sh");
+        // 손자(sleep)가 표준 출력을 물고 있어 시간 초과로 끝남
+        command.arg("-c").arg(r#"sleep 30 & echo $! > "$1"; wait"#).arg("sh").arg(&pid_file);
+        assert_eq!(run_bounded_command(command, "", Duration::from_millis(300)), None);
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        let alive = || unsafe { kill(pid, 0) } == 0;
+        let end = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = alive();
+        if survived {
+            unsafe { kill(pid, 9) };
+        }
+        assert!(!survived, "sh -c가 띄운 프로세스가 남음");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_chained_status_line_is_marked_so_it_cannot_recurse() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!("printf %s \"${STATUSLINE_CHAIN_ENV}\""));
+        assert_eq!(run_statusline_chain(command, "").as_deref(), Some("1"));
+    }
 
     #[test]
     fn cli_capture_drains_stderr_and_caps_captured_output() {
