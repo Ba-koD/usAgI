@@ -22,16 +22,22 @@ const MAX_REDIRECTS: usize = 5;
 /// 체크섬·서명 파일 크기 한도
 const MAX_TEXT_BYTES: u64 = 64 * 1024;
 
+/// 이름 찾기·연결 시간 제한
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 요청 하나(리다이렉트 한 번)의 전체 시간 제한: 작은 응답(릴리스 정보·검증 정보)과 새 버전 파일.
+/// ureq의 응답 대기 제한(`timeout_recv_response`)은 본문 읽기까지 끊어 느린 연결에서 다운로드가 실패하므로 쓰지 않고,
+/// 처음부터 본문 끝까지를 재는 전체 제한(`timeout_global`)을 요청마다 줌
+const SMALL_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     let config = ureq::Agent::config_builder()
         .https_only(true)
         // 리다이렉트는 직접 따라감 (주소마다 프록시를 고르고 https만 허용)
         .max_redirects(0)
         .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
-        // 느린 연결에서도 새 버전 파일(수 MB)을 끝까지 받도록
-        .timeout_recv_body(Some(Duration::from_secs(600)));
+        .timeout_resolve(Some(CONNECT_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT));
     crate::net::tls(config).build().new_agent()
 });
 
@@ -42,7 +48,7 @@ pub fn check(asset: &str) -> Result<Option<Release>, String> {
 
 fn latest(asset: &str, current: &str, headers: &[(&str, &str)]) -> Result<Option<Release>, String> {
     let mut body = Vec::new();
-    let status = get(&latest_api(REPO), "application/vnd.github+json", headers, &mut body, MAX_ASSET_BYTES)?;
+    let status = get(&latest_api(REPO), "application/vnd.github+json", headers, &mut body, MAX_ASSET_BYTES, SMALL_TIMEOUT)?;
     match status {
         200 => parse_latest(&body, current, REPO, asset),
         404 => Err(crate::tr!("올라온 릴리스 없음", "No release published").into()),
@@ -53,7 +59,7 @@ fn latest(asset: &str, current: &str, headers: &[(&str, &str)]) -> Result<Option
 
 /// 새 버전 파일을 `out`에 받음. 받은 뒤 [`Release::verify_asset`]으로 검증해야 함
 pub fn download(release: &Release, out: &mut impl Write) -> Result<(), String> {
-    let status = get(&release.asset_url, "application/octet-stream", &[], out, MAX_ASSET_BYTES)?;
+    let status = get(&release.asset_url, "application/octet-stream", &[], out, MAX_ASSET_BYTES, DOWNLOAD_TIMEOUT)?;
     if status != 200 {
         return Err(crate::tr!(format!("새 버전 수신 실패 ({status})"), format!("Couldn't download the new version ({status})")));
     }
@@ -63,18 +69,18 @@ pub fn download(release: &Release, out: &mut impl Write) -> Result<(), String> {
 /// 체크섬·서명 같은 검증 정보 받기 ([`Release::verify_asset`]에 넘김)
 pub fn fetch_text(url: &str) -> Result<String, String> {
     let mut body = Vec::new();
-    let status = get(url, "text/plain", &[], &mut body, MAX_TEXT_BYTES)?;
+    let status = get(url, "text/plain", &[], &mut body, MAX_TEXT_BYTES, SMALL_TIMEOUT)?;
     if status != 200 {
         return Err(crate::tr!("검증 정보 수신 실패", "Couldn't download verification information").into());
     }
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-fn get(url: &str, accept: &str, headers: &[(&str, &str)], out: &mut dyn Write, limit: u64) -> Result<u16, String> {
+fn get(url: &str, accept: &str, headers: &[(&str, &str)], out: &mut dyn Write, limit: u64, budget: Duration) -> Result<u16, String> {
     if !github_url(url) {
         return Err(crate::tr!("GitHub이 아닌 업데이트 주소", "Update address is not on GitHub").into());
     }
-    follow(&AGENT, url, accept, headers, out, limit, true)
+    follow(&AGENT, url, accept, headers, out, limit, budget, true)
 }
 
 /// GitHub의 https 주소인지 (업데이트 확인과 파일 받기를 시작하는 주소)
@@ -90,7 +96,8 @@ fn user_agent() -> String {
 }
 
 /// GET하고 리다이렉트를 따라감. 200이면 본문을 `out`에 쓰고, 상태 코드를 돌려줌.
-/// `headers`는 처음 주소에만 보냄 (다른 서버로 넘어갈 때 따라가지 않게)
+/// `headers`는 처음 주소에만 보냄 (다른 서버로 넘어갈 때 따라가지 않게). `budget`은 요청 하나의 전체 시간 (본문 끝까지)
+#[allow(clippy::too_many_arguments)]
 fn follow(
     agent: &ureq::Agent,
     url: &str,
@@ -98,6 +105,7 @@ fn follow(
     headers: &[(&str, &str)],
     out: &mut dyn Write,
     limit: u64,
+    budget: Duration,
     https_only: bool,
 ) -> Result<u16, String> {
     let agent_header = user_agent();
@@ -109,6 +117,7 @@ fn follow(
                 .get(&url)
                 .config()
                 .proxy(proxy)
+                .timeout_global(Some(budget))
                 .build()
                 .header("User-Agent", &agent_header)
                 .header("Accept", accept)
@@ -219,8 +228,42 @@ mod tests {
         format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
     }
 
+    /// 테스트 요청의 전체 시간 제한
+    const SECS: Duration = Duration::from_secs(5);
+
     fn plain_agent() -> ureq::Agent {
         ureq::Agent::config_builder().max_redirects(0).http_status_as_error(false).build().new_agent()
+    }
+
+    /// 머리는 바로, 본문은 `delay`마다 1바이트씩 `bytes`개 보내는 서버 (느린 연결)
+    fn trickle_server(bytes: usize, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/slow", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_head(&mut stream);
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {bytes}\r\nConnection: close\r\n\r\n");
+            for _ in 0..bytes {
+                std::thread::sleep(delay);
+                if stream.write_all(b"x").is_err() {
+                    return;
+                }
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn slow_bodies_finish_within_the_call_budget() {
+        // 머리를 받은 뒤 본문이 1.5초에 걸쳐 오는 경우: 예전 설정(응답 대기 제한)은 여기서 끊겼음
+        let url = trickle_server(6, Duration::from_millis(250));
+        let mut body = Vec::new();
+        assert_eq!(follow(&plain_agent(), &url, "*/*", &[], &mut body, 1024, Duration::from_secs(5), false), Ok(200));
+        assert_eq!(body, b"xxxxxx");
+        // 전체 제한은 본문 읽기까지 적용
+        let url = trickle_server(20, Duration::from_millis(250));
+        let error = follow(&plain_agent(), &url, "*/*", &[], &mut Vec::new(), 1024, Duration::from_secs(1), false).unwrap_err();
+        assert!(error.contains("연결 끊김") || error.contains("연결 실패"), "{error}");
     }
 
     #[test]
@@ -230,7 +273,7 @@ mod tests {
         assert!(!github_url("http://github.com/o/r"));
         assert!(!github_url("https://github.com.evil.example/o/r"));
         assert!(!github_url("https://evil.example/github.com"));
-        assert!(get("https://example.com/x", "*/*", &[], &mut Vec::new(), 10).is_err());
+        assert!(get("https://example.com/x", "*/*", &[], &mut Vec::new(), 10, SECS).is_err());
     }
 
     #[test]
@@ -251,7 +294,7 @@ mod tests {
             _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
         });
         let mut body = Vec::new();
-        let status = follow(&plain_agent(), &format!("{base}/start"), "*/*", &[("Authorization", "Bearer test")], &mut body, 1024, false).unwrap();
+        let status = follow(&plain_agent(), &format!("{base}/start"), "*/*", &[("Authorization", "Bearer test")], &mut body, 1024, SECS, false).unwrap();
         assert_eq!((status, body.as_slice()), (200, b"payload".as_slice()));
         let heads = heads.lock().unwrap();
         assert!(heads[0].to_ascii_lowercase().contains("authorization: bearer test"));
@@ -269,11 +312,11 @@ mod tests {
         });
         let agent = plain_agent();
         let mut sink = Vec::new();
-        assert!(follow(&agent, &format!("{base}/loop"), "*/*", &[], &mut sink, 1024, false).unwrap_err().contains("이동"));
-        assert!(follow(&agent, &format!("{base}/to-http"), "*/*", &[], &mut sink, 1024, true).unwrap_err().contains("https"));
-        assert!(follow(&agent, &format!("{base}/big"), "*/*", &[], &mut sink, 1024, false).unwrap_err().contains("크기"));
+        assert!(follow(&agent, &format!("{base}/loop"), "*/*", &[], &mut sink, 1024, SECS, false).unwrap_err().contains("이동"));
+        assert!(follow(&agent, &format!("{base}/to-http"), "*/*", &[], &mut sink, 1024, SECS, true).unwrap_err().contains("https"));
+        assert!(follow(&agent, &format!("{base}/big"), "*/*", &[], &mut sink, 1024, SECS, false).unwrap_err().contains("크기"));
         let mut body = Vec::new();
-        assert_eq!(follow(&agent, &format!("{base}/missing"), "*/*", &[], &mut body, 1024, false), Ok(404));
+        assert_eq!(follow(&agent, &format!("{base}/missing"), "*/*", &[], &mut body, 1024, SECS, false), Ok(404));
         assert!(body.is_empty(), "200이 아니면 본문을 쓰지 않음");
     }
 
@@ -282,7 +325,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         drop(listener);
-        let error = follow(&plain_agent(), &url, "*/*", &[], &mut Vec::new(), 1024, false).unwrap_err();
+        let error = follow(&plain_agent(), &url, "*/*", &[], &mut Vec::new(), 1024, SECS, false).unwrap_err();
         assert!(error.contains("연결 실패"), "{error}");
     }
 

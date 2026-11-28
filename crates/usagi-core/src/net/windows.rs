@@ -6,7 +6,7 @@
 use super::{bypassed, parse_proxy_list, Route};
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
-use windows_sys::Win32::Foundation::{GetLastError, GlobalFree};
+use windows_sys::Win32::Foundation::GlobalFree;
 use windows_sys::Win32::Networking::WinHttp::*;
 
 /// 인터넷 옵션의 프록시 설정
@@ -81,13 +81,9 @@ fn auto_proxy(url: &str, scheme: &str, detect: bool, pac_url: Option<&str>) -> O
         options.lpszAutoConfigUrl = pac.as_ptr();
     }
     let mut info = WINHTTP_PROXY_INFO { dwAccessType: 0, lpszProxy: null_mut(), lpszProxyBypass: null_mut() };
-    let mut ok = unsafe { WinHttpGetProxyForUrl(session as _, url.as_ptr(), &mut options, &mut info) } != 0;
-    // PAC 파일을 받는 데 로그인이 필요하면 지금 사용자의 자격으로 다시
-    if !ok && unsafe { GetLastError() } == ERROR_WINHTTP_LOGIN_FAILURE {
-        options.fAutoLogonIfChallenged = 1;
-        ok = unsafe { WinHttpGetProxyForUrl(session as _, url.as_ptr(), &mut options, &mut info) } != 0;
-    }
-    if !ok {
+    // PAC 서버가 로그인을 요구해도 Windows 자격 증명으로 다시 시도하지 않음
+    // (자동 검색으로 찾은 PAC는 네트워크의 누구나 낼 수 있어, 자격 응답을 가로채 쓸 수 있음) → 수동 설정으로
+    if unsafe { WinHttpGetProxyForUrl(session as _, url.as_ptr(), &mut options, &mut info) } == 0 {
         return None;
     }
     let (proxy, _bypass) = unsafe { (take(info.lpszProxy), take(info.lpszProxyBypass)) };
