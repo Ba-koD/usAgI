@@ -1613,6 +1613,7 @@ mod tests {
                 refills: None,
                 extra: None,
                 coupons: Vec::new(),
+                balance: None,
             }],
             logins: Default::default(),
             probes: Default::default(),

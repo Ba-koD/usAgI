@@ -99,6 +99,8 @@ pub struct ProviderView {
     pub extra: Option<String>,
     /// Claude 쿠폰 (만료되지 않은 것, 만료가 빠른 순)
     pub coupons: Vec<bridge::Coupon>,
+    /// Claude 사용 크레딧 잔액·자동 충전
+    pub balance: Option<bridge::Balance>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +294,7 @@ pub fn claude_view(acc: &Account, st: &Status, file: Option<&BridgeFile>) -> Pro
         refills: None,
         extra: None,
         coupons: Vec::new(),
+        balance: None,
     }
 }
 
@@ -325,6 +328,7 @@ pub fn codex_view(acc: &Account, s: &CodexSnapshot, now: f64) -> ProviderView {
         refills: s.refills.clone(),
         extra: None,
         coupons: Vec::new(),
+        balance: None,
     }
 }
 
@@ -836,6 +840,7 @@ impl Sources {
             view.coupons = file.and_then(|b| b.coupons.as_ref()).into_iter().flatten()
                 .filter(|c| c.expires_at > now).cloned().collect();
             view.coupons.sort_by(|a, b| a.expires_at.total_cmp(&b.expires_at));
+            view.balance = file.and_then(|b| b.balance.clone());
             view.refills = file.and_then(|b| b.refills.clone()).filter(|r| r.expires_at.is_none_or(|at| at > now));
             if let Some(b) = file.filter(|_| st.exact) {
                 for m in &b.models {
@@ -888,6 +893,7 @@ pub fn hide_logged_out(snap: &mut Snapshot) {
         p.credits = None;
         p.refills = None;
         p.coupons.clear();
+        p.balance = None;
         p.forecast = None;
     }
     snap.claude_statuses.retain(|id, _| !out.contains(id));
@@ -1425,7 +1431,7 @@ fn mock_snapshot(now: f64) -> Snapshot {
             workspace_id: None,
             plan: None,
             credits: None,
-            // Claude 카드의 리필권·쿠폰 표시 확인용
+            // Claude 카드의 리필권·쿠폰·잔액 표시 확인용
             refills: acc.is_claude().then(|| codex::Refills { available: 2, expires_at: Some(now + 6.0 * DAY) }),
             extra: None,
             coupons: if acc.is_claude() {
@@ -1433,6 +1439,7 @@ fn mock_snapshot(now: f64) -> Snapshot {
             } else {
                 Vec::new()
             },
+            balance: acc.is_claude().then(|| bridge::Balance { amount: 62.5, currency: "USD".into(), auto_reload: Some(true) }),
         });
         logins.insert(acc.id.clone(), LoginStatus { logged_in: Some(true), checked_at: now, ..Default::default() });
     }
@@ -1552,6 +1559,7 @@ mod tests {
                 refills: None,
                 extra: None,
                 coupons: Vec::new(),
+                balance: None,
             }],
             logins: HashMap::new(),
             probes: HashMap::new(),
@@ -1588,6 +1596,7 @@ mod tests {
                 refills: None,
                 extra: None,
                 coupons: vec![bridge::Coupon { amount: 50.0, currency: "USD".into(), expires_at, name: None }],
+                balance: None,
             }],
             logins: HashMap::new(),
             probes: HashMap::new(),
@@ -1654,6 +1663,7 @@ mod tests {
                 refills: None,
                 extra: None,
                 coupons: Vec::new(),
+                balance: None,
             }],
             logins: HashMap::new(),
             probes: HashMap::new(),
@@ -1797,6 +1807,7 @@ mod tests {
             refills: None,
             extra: Some("추가 사용 $12.30 / $50 · 월".into()),
             coupons: Vec::new(),
+            balance: None,
         };
         let st = Tracker::new().status(now);
         let mut snap = Snapshot { now, claude: Some(st.clone()), providers: vec![view("claude-1"), view("claude-2"), view("claude-3")], logins: HashMap::new(), probes: HashMap::new(), claude_statuses: HashMap::new(), revisions: HashMap::new() };

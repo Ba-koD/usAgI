@@ -155,6 +155,10 @@ pub fn accounts_json(state: &State, snap: Option<&Snapshot>, login_checking: boo
                         "more": live.len() - 1,
                     }))
                 }),
+                // Claude 사용 크레딧 잔액·자동 충전. 잔액이 없고 자동 충전도 꺼져 있으면 보이지 않음
+                "balance": view.and_then(|v| v.balance.as_ref())
+                    .filter(|b| b.amount > 0.0 || b.auto_reload == Some(true))
+                    .map(|b| json!({ "amount": b.amount_label(), "autoReload": b.auto_reload })),
                 "managed": accounts::is_managed(a),
                 "name": view.map(|v| v.name.clone()).unwrap_or_else(|| if a.is_claude() { "Claude".into() } else { "Codex".into() }),
                 "exact": view.is_some_and(|v| v.meters.iter().any(|m| m.exact)),

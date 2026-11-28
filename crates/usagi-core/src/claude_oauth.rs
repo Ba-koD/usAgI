@@ -1,6 +1,6 @@
 //! Read Claude quota with the access token in the selected Claude Code profile.
 use crate::accounts::Account;
-use crate::bridge::{BridgeFile, BridgeWindow, Coupon, ModelWindow};
+use crate::bridge::{Balance, BridgeFile, BridgeWindow, Coupon, ModelWindow};
 use crate::codex::Refills;
 use crate::usage_http::{self, read_bounded, RequestError, CLIENT};
 use crate::usage_retry::UsageError;
@@ -14,9 +14,9 @@ use std::sync::{LazyLock, Mutex};
 
 /// cedar_ember=1: 리필권(한도 초기화권) 상태를 같은 응답에 함께 받음 (Claude Code `/limit-reset`과 같은 표시)
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1";
-/// 쿠폰(만료일 있는 프로모션 크레딧) 조회 주소의 앞부분. Claude Code `/usage-credits`와 같은 경로
+/// 사용 크레딧(잔액·자동 충전·만료일 있는 쿠폰) 조회 주소의 앞부분. Claude Code `/usage-credits`와 같은 경로
 const API_BASE: &str = "https://api.anthropic.com";
-/// 쿠폰은 자주 바뀌지 않으므로 계정마다 이 간격으로만 조회 (로그인이 바뀌면 바로)
+/// 사용 크레딧은 자주 바뀌지 않으므로 계정마다 이 간격으로만 조회 (로그인이 바뀌면 바로)
 const COUPON_INTERVAL_SECS: f64 = 60.0 * 60.0;
 const BETA: &[(&str, &str)] = &[("anthropic-beta", "oauth-2025-04-20")];
 const EXPIRY_LEEWAY_SECS: f64 = 60.0;
@@ -311,12 +311,21 @@ pub(crate) fn read(acc: &Account, approved_fingerprint: Option<u64>) -> Result<O
         return Err(UsageError::ProfileChanged);
     }
     let mut usage = read_with(&CLIENT, USAGE_URL, &dir, session.as_ref())?;
-    // 사용량을 받은 로그인으로만 쿠폰 확인. 실패해도 사용량에는 영향 없음
+    // 사용량을 받은 로그인으로만 사용 크레딧 확인. 실패해도 사용량에는 영향 없음
     if let (Some(usage), Some(session)) = (usage.as_mut(), session.as_ref()) {
-        // .claude.json은 클 수 있어 쿠폰을 조회할 때만 읽음
-        usage.coupons = coupons(&CLIENT, API_BASE, &dir, || crate::login::claude_org_uuid(&dir), session, crate::time::now());
+        // .claude.json은 클 수 있어 사용 크레딧을 조회할 때만 읽음
+        if let Some(prepaid) = prepaid(&CLIENT, API_BASE, &dir, || crate::login::claude_org_uuid(&dir), session, crate::time::now()) {
+            usage.coupons = Some(prepaid.coupons);
+            usage.balance = prepaid.balance;
+        }
     }
     Ok(usage)
+}
+
+/// 사용 크레딧 조회 결과 (쿠폰과 잔액이 한 응답에 옴)
+struct Prepaid {
+    coupons: Vec<Coupon>,
+    balance: Option<Balance>,
 }
 
 /// 조직 ID는 주소에 들어가므로 UUID 모양만 받음
@@ -324,15 +333,15 @@ fn valid_org(org: &str) -> bool {
     org.len() == 36 && org.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-')
 }
 
-/// 쿠폰 조회 시점이면 조회. 건너뛰었거나 실패하면 None (저장된 값을 이어 씀)
-fn coupons(
+/// 사용 크레딧 조회 시점이면 조회. 건너뛰었거나 실패하면 None (저장된 값을 이어 씀)
+fn prepaid(
     client: &ureq::Agent,
     base: &str,
     dir: &Path,
     org: impl FnOnce() -> Option<String>,
     session: &Session,
     now: f64,
-) -> Option<Vec<Coupon>> {
+) -> Option<Prepaid> {
     {
         let fingerprint = session.fingerprint();
         let mut checks = COUPON_CHECKS.lock().unwrap_or_else(|e| e.into_inner());
@@ -348,7 +357,24 @@ fn coupons(
     let url = format!("{base}/api/oauth/organizations/{org}/prepaid/credits");
     let headers = [BETA[0], ("x-organization-uuid", org.as_str())];
     let value = usage_http::get_json(client, &url, &session.access_token, &headers).ok()?;
-    Some(parse_coupons(&value, now))
+    Some(Prepaid { coupons: parse_coupons(&value, now), balance: parse_balance(&value) })
+}
+
+/// 서버의 통화 코드 (USD 등 세 글자)만 받음
+fn currency_code(value: &Value) -> Option<String> {
+    let code = value.as_str()?.trim().to_ascii_uppercase();
+    (code.len() == 3 && code.bytes().all(|c| c.is_ascii_alphabetic())).then_some(code)
+}
+
+/// 잔액(최소 단위)과 자동 충전. Claude Code처럼 amount가 숫자가 아니면 사용 크레딧이 없는 계정으로 봄
+fn parse_balance(value: &Value) -> Option<Balance> {
+    let minor = value["amount"].as_f64().filter(|amount| amount.is_finite() && *amount >= 0.0)?;
+    let currency = currency_code(&value["currency"])?;
+    Some(Balance {
+        amount: minor / crate::bridge::minor_per_unit(&currency),
+        auto_reload: value["auto_reload_settings"]["enabled"].as_bool(),
+        currency,
+    })
 }
 
 /// promo_tranches → 남은 금액이 있고 아직 만료되지 않은 쿠폰, 만료가 빠른 순
@@ -358,10 +384,7 @@ fn parse_coupons(value: &Value, now: f64) -> Vec<Coupon> {
         .into_iter()
         .flatten()
         .filter_map(|tranche| {
-            let currency = tranche["currency"].as_str()?.trim().to_ascii_uppercase();
-            if currency.len() != 3 || !currency.bytes().all(|c| c.is_ascii_alphabetic()) {
-                return None;
-            }
+            let currency = currency_code(&tranche["currency"])?;
             let minor = tranche["remaining_amount_minor_units"]
                 .as_f64()
                 .filter(|amount| amount.is_finite() && *amount > 0.0)?;
@@ -594,7 +617,8 @@ mod tests {
             assert!(request.contains(&format!("\r\nx-organization-uuid: {ORG}\r\n")));
             assert!(request.contains("\r\nanthropic-beta: oauth-2025-04-20\r\n"));
             let response = json!({
-                "amount": 7000, "currency": "USD",
+                "amount": 7050, "currency": "USD",
+                "auto_reload_settings": {"enabled": true, "threshold_in_minor_units": 500, "reload_to_in_minor_units": 1500},
                 "promo_tranches": [
                     {"remaining_amount_minor_units": 5000, "currency": "usd", "expires_at": "2026-12-20T00:00:00Z", "name": "Launch credit"},
                     {"remaining_amount_minor_units": 70000, "currency": "KRW", "expires_at": "2026-12-05T00:00:00Z"},
@@ -611,21 +635,41 @@ mod tests {
         let session = test_session("sk-ant-oat01-fixture");
         let dir = tempfile::tempdir().unwrap();
         let now = crate::time::parse_iso("2026-11-25T00:00:00Z").unwrap();
-        let list = coupons(&client, &base, dir.path(), || Some(ORG.into()), &session, now).unwrap();
+        let found = prepaid(&client, &base, dir.path(), || Some(ORG.into()), &session, now).unwrap();
         server.join().unwrap();
         // 만료·0원·잘못된 통화·만료일 없음은 빼고, 만료가 빠른 순
+        let list = found.coupons;
         assert_eq!(list.len(), 2);
         assert_eq!((list[0].amount, list[0].currency.as_str()), (70_000.0, "KRW"));
         assert_eq!((list[1].amount, list[1].currency.as_str()), (50.0, "USD"));
         assert_eq!(list[1].name.as_deref(), Some("Launch credit"));
+        // 같은 응답의 잔액(최소 단위)과 자동 충전
+        assert_eq!(found.balance, Some(Balance { amount: 70.5, currency: "USD".into(), auto_reload: Some(true) }));
         // 한 시간 안에는 다시 조회하지 않고 .claude.json도 읽지 않음 (서버는 이미 닫힘)
-        let skipped = coupons(&client, &base, dir.path(), || panic!("조직 ID를 읽음"), &session, now + 1800.0);
+        let skipped = prepaid(&client, &base, dir.path(), || panic!("조직 ID를 읽음"), &session, now + 1800.0);
         assert!(skipped.is_none());
         // 조직 ID가 UUID 모양이 아니거나 없으면 요청하지 않음
         for org in [Some("../usage"), None] {
             let other = tempfile::tempdir().unwrap();
-            assert!(coupons(&client, &base, other.path(), || org.map(str::to_owned), &session, now).is_none());
+            assert!(prepaid(&client, &base, other.path(), || org.map(str::to_owned), &session, now).is_none());
         }
+    }
+
+    #[test]
+    fn balance_needs_a_numeric_amount_and_a_currency() {
+        let balance = |value: Value| parse_balance(&value);
+        assert_eq!(
+            balance(json!({"amount": 0, "currency": "usd", "auto_reload_settings": {"enabled": false}})),
+            Some(Balance { amount: 0.0, currency: "USD".into(), auto_reload: Some(false) })
+        );
+        // 원처럼 소수 단위가 없는 통화, 자동 충전 설정이 없는 응답
+        assert_eq!(balance(json!({"amount": 70000, "currency": "KRW"})), Some(Balance { amount: 70_000.0, currency: "KRW".into(), auto_reload: None }));
+        // Claude Code와 같이 amount가 숫자가 아니면 사용 크레딧이 없는 계정
+        assert!(balance(json!({"amount": null, "currency": "USD"})).is_none());
+        assert!(balance(json!({"amount": "12", "currency": "USD"})).is_none());
+        assert!(balance(json!({"amount": -5, "currency": "USD"})).is_none());
+        assert!(balance(json!({"amount": 500})).is_none());
+        assert!(balance(json!({"amount": 500, "currency": "US$"})).is_none());
     }
 
     #[test]

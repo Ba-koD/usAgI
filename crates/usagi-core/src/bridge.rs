@@ -56,6 +56,9 @@ pub struct BridgeFile {
     /// Claude 쿠폰, 만료가 빠른 순. None은 이번 기록에서 확인하지 않음 (저장할 때 예전 값을 이어 씀)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coupons: Option<Vec<Coupon>>,
+    /// Claude 사용 크레딧 잔액·자동 충전. 쿠폰과 같은 조회에서 옴 (쿠폰을 확인하지 않은 기록은 예전 값을 이어 씀)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<Balance>,
     /// Claude 리필권 (한도 초기화권, Claude Code `/limit-reset`). None은 이번 기록에 없음 (예전 값을 이어 씀)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refills: Option<crate::codex::Refills>,
@@ -121,19 +124,41 @@ pub struct Coupon {
 }
 
 impl Coupon {
-    /// 금액 표시: "$50", "$12.50", "₩70,000", 기호가 없는 통화는 "50 CHF"
     pub fn amount_label(&self) -> String {
-        let cents = (self.amount * 100.0).round() as i64;
-        let whole = group_thousands(cents / 100);
-        let number = if cents % 100 == 0 { whole } else { format!("{whole}.{:02}", cents % 100) };
-        match self.currency.as_str() {
-            "USD" => format!("${number}"),
-            "EUR" => format!("€{number}"),
-            "GBP" => format!("£{number}"),
-            "JPY" => format!("¥{number}"),
-            "KRW" => format!("₩{number}"),
-            code => format!("{number} {code}"),
-        }
+        money_label(self.amount, &self.currency)
+    }
+}
+
+/// Claude 사용 크레딧 잔액과 자동 충전 설정.
+/// Claude Code 추가 사용량 메뉴의 "$12.34 balance · auto-reload on"과 같은 값 (prepaid/credits)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Balance {
+    /// 잔액 (통화 기본 단위, 쿠폰 금액 포함)
+    pub amount: f64,
+    pub currency: String,
+    /// 자동 충전 켜짐. 응답에 설정이 없으면 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reload: Option<bool>,
+}
+
+impl Balance {
+    pub fn amount_label(&self) -> String {
+        money_label(self.amount, &self.currency)
+    }
+}
+
+/// 금액 표시: "$50", "$12.50", "₩70,000", 기호가 없는 통화는 "50 CHF"
+pub fn money_label(amount: f64, currency: &str) -> String {
+    let cents = (amount * 100.0).round() as i64;
+    let whole = group_thousands(cents / 100);
+    let number = if cents % 100 == 0 { whole } else { format!("{whole}.{:02}", cents % 100) };
+    match currency {
+        "USD" => format!("${number}"),
+        "EUR" => format!("€{number}"),
+        "GBP" => format!("£{number}"),
+        "JPY" => format!("¥{number}"),
+        "KRW" => format!("₩{number}"),
+        code => format!("{number} {code}"),
     }
 }
 
@@ -259,6 +284,8 @@ pub fn save(account_id: &str, mut file: BridgeFile) -> std::io::Result<()> {
     if file.coupons.is_none() {
         let now = file.updated_at;
         file.coupons = old.as_ref().and_then(|o| o.coupons.clone()).map(|list| list.into_iter().filter(|c| c.expires_at > now).collect());
+        // 잔액도 같은 조회에서만 옴
+        file.balance = old.as_ref().and_then(|o| o.balance.clone());
     }
     // 리필권은 HTTPS 사용량 조회에만 옴 → 다른 기록은 만료 전까지 예전 값을 이어 씀
     if file.refills.is_none() {
@@ -431,14 +458,23 @@ mod tests {
     fn unchecked_records_keep_unexpired_coupons() {
         let id = "coupon-carry-test";
         let coupon = |expires_at: f64| Coupon { amount: 5.0, currency: "USD".into(), expires_at, name: None };
-        let first = BridgeFile { updated_at: 100.0, coupons: Some(vec![coupon(150.0), coupon(500.0)]), from_usage: true, ..Default::default() };
+        let balance = Balance { amount: 62.5, currency: "USD".into(), auto_reload: Some(true) };
+        let first = BridgeFile {
+            updated_at: 100.0,
+            coupons: Some(vec![coupon(150.0), coupon(500.0)]),
+            balance: Some(balance.clone()),
+            from_usage: true,
+            ..Default::default()
+        };
         save(id, first).unwrap();
-        // 상태 표시줄·CLI 기록에는 쿠폰이 없음 → 남은 쿠폰만 이어 씀
+        // 상태 표시줄·CLI 기록에는 쿠폰·잔액이 없음 → 남은 쿠폰과 잔액을 이어 씀
         save(id, BridgeFile { updated_at: 200.0, ..Default::default() }).unwrap();
         assert_eq!(read(id).unwrap().coupons, Some(vec![coupon(500.0)]));
+        assert_eq!(read(id).unwrap().balance, Some(balance));
         // 확인했는데 없으면 비움
         save(id, BridgeFile { updated_at: 300.0, coupons: Some(Vec::new()), from_usage: true, ..Default::default() }).unwrap();
         assert_eq!(read(id).unwrap().coupons, Some(Vec::new()));
+        assert_eq!(read(id).unwrap().balance, None);
         let _ = std::fs::remove_file(path(id));
     }
 

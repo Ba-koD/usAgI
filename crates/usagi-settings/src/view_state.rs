@@ -157,6 +157,18 @@ fn coupon(c: &Value) -> String {
     }
 }
 
+/// Claude 잔액 표시: "잔액 $62.50 · 자동 충전 켜짐"
+fn balance(b: &Value) -> String {
+    let Some(amount) = b["amount"].as_str() else {
+        return String::new();
+    };
+    match b["autoReload"].as_bool() {
+        Some(true) => tr!(format!("잔액 {amount} · 자동 충전 켜짐"), format!("{amount} balance · auto-reload on")),
+        Some(false) => tr!(format!("잔액 {amount} · 자동 충전 꺼짐"), format!("{amount} balance · auto-reload off")),
+        None => tr!(format!("잔액 {amount}"), format!("{amount} balance")),
+    }
+}
+
 fn account(v: &Value, previous: Option<Account>) -> Account {
     let login = &v["login"];
     let probe = &v["probe"];
@@ -254,6 +266,7 @@ fn account(v: &Value, previous: Option<Account>) -> Account {
         refill_lead: v["refill"]["lead"].as_f64().unwrap_or(1440.0).round() as i32,
         refills: refills.into(),
         coupons: coupon(&v["coupons"]).into(),
+        balance: balance(&v["balance"]).into(),
         // 대체 폴더를 쓰는 중이면 두 폴더 모두
         folder: match text(login, "fallback") {
             "" => text(v, "dir").to_string(),
