@@ -62,7 +62,11 @@ fn entry_routes(entry: &CFDictionary) -> Vec<Route> {
     } else if is(unsafe { kCFProxyTypeHTTP }) || is(unsafe { kCFProxyTypeHTTPS }) {
         let host = string(entry, unsafe { kCFProxyHostNameKey });
         let port = number(entry, unsafe { kCFProxyPortNumberKey }).unwrap_or(80);
-        host.filter(|h| !h.is_empty()).map(|h| vec![Route::Proxy(format!("http://{h}:{port}"))]).unwrap_or_default()
+        // IPv6 주소는 대괄호로 감싸야 주소로 읽힘
+        host.filter(|h| !h.is_empty())
+            .map(|h| if h.contains(':') && !h.starts_with('[') { format!("[{h}]") } else { h })
+            .map(|h| vec![Route::Proxy(format!("http://{h}:{port}"))])
+            .unwrap_or_default()
     } else {
         Vec::new()
     }
