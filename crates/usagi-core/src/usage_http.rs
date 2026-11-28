@@ -8,20 +8,14 @@ use std::time::{Duration, SystemTime};
 
 const MAX_BYTES: u64 = 256 * 1024;
 
+/// 프록시는 요청마다 OS 설정을 따라 고름 ([`crate::net`])
 pub(crate) static CLIENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     let config = ureq::Agent::config_builder()
         .https_only(true)
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(8)));
-    #[cfg(any(windows, target_os = "macos"))]
-    let config = config.tls_config(
-        ureq::tls::TlsConfig::builder()
-            .provider(ureq::tls::TlsProvider::NativeTls)
-            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-            .build(),
-    );
-    config.build().new_agent()
+    crate::net::tls(config).build().new_agent()
 });
 
 pub(crate) fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
@@ -61,15 +55,21 @@ pub(crate) fn get_json(
     let mut authorization = ureq::http::HeaderValue::from_str(&format!("Bearer {access_token}"))
         .map_err(|_| RequestError::Unavailable)?;
     authorization.set_sensitive(true);
-    let mut request = client
-        .get(url)
-        .header("Authorization", authorization)
-        .header("Accept", "application/json")
-        .header("User-Agent", concat!("usAgI/", env!("CARGO_PKG_VERSION")));
-    for &(name, value) in headers {
-        request = request.header(name, value);
-    }
-    let mut response = request.call().map_err(|_| RequestError::Unavailable)?;
+    let mut response = crate::net::call(url, |proxy| {
+        let mut request = client
+            .get(url)
+            .config()
+            .proxy(proxy)
+            .build()
+            .header("Authorization", authorization.clone())
+            .header("Accept", "application/json")
+            .header("User-Agent", concat!("usAgI/", env!("CARGO_PKG_VERSION")));
+        for &(name, value) in headers {
+            request = request.header(name, value);
+        }
+        request.call()
+    })
+    .map_err(|_| RequestError::Unavailable)?;
     match response.status().as_u16() {
         200 => {}
         401 | 403 => return Err(RequestError::AuthRejected),

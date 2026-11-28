@@ -14,7 +14,8 @@
 //! - [`logos`]: 공급자 로고
 //! - [`config`], [`engine`]: 설정 파일, 백그라운드 폴링과 알림 판단
 //! - [`controller`], [`ui`]: 설정 화면 상태와 모든 명령 처리 (Windows·macOS·Linux가 같은 화면·같은 동작)
-//! - [`update`], [`version`]: 자동 업데이트 공통 부분
+//! - [`update`], [`version`]: 자동 업데이트 공통 부분 (확인·받기·서명 검증)
+//! - `net`: HTTPS 공통 (TLS, OS 프록시·PAC를 따르는 연결)
 
 pub mod accounts;
 pub mod alert_rules;
@@ -34,6 +35,7 @@ pub mod login;
 mod log_watch;
 pub mod logos;
 pub mod logs;
+mod net;
 pub mod private_dir;
 pub mod probe;
 pub mod rabbit;
