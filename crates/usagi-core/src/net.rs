@@ -8,6 +8,9 @@
 //!
 //! PAC가 경로를 여러 개 주면(`PROXY a; PROXY b; DIRECT`) 연결이 안 될 때 다음 경로로 넘어가요.
 //! OS 설정 조회는 주소(스킴+호스트)마다 잠깐 기억해 두고, SOCKS 프록시는 지원하지 않아 건너뜁니다.
+//!
+//! `http://` 프록시만 씁니다. `https://` 프록시를 거치면 ureq가 목적지와의 TLS를 생략해 토큰이 프록시에 평문으로 가므로,
+//! 그런 설정만 있으면 직접 연결로 우회하지 않고 연결하지 않아요 (fail closed).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -62,35 +65,36 @@ fn call_with<T>(
     Err(last)
 }
 
-/// 이 주소로 갈 때 시도할 프록시 목록 (`None`은 직접 연결). 늘 하나 이상.
+/// 이 주소로 갈 때 시도할 프록시 목록 (`None`은 직접 연결). 비었으면 쓸 수 있는 경로가 없음 (연결하지 않음).
 pub(crate) fn proxies_for(url: &str) -> Vec<Option<ureq::Proxy>> {
     let Some((scheme, host)) = scheme_host(url) else { return vec![None] };
     if is_loopback(&host) {
         return vec![None];
     }
     if let Some(proxy) = ureq::Proxy::try_from_env() {
-        return vec![Some(proxy)];
+        return if proxy.protocol() == ureq::ProxyProtocol::Http { vec![Some(proxy)] } else { Vec::new() };
     }
     to_proxies(&system_routes_cached(url, &scheme, &host))
 }
 
+/// 경로 목록 → 시도할 프록시. 설정이 없으면 직접, 설정은 있는데 쓸 수 있는 게 없으면 빈 목록 (직접으로 우회하지 않음)
 fn to_proxies(routes: &[Route]) -> Vec<Option<ureq::Proxy>> {
+    if routes.is_empty() {
+        return vec![None];
+    }
     let mut list = Vec::new();
     for route in routes {
         let proxy = match route {
             Route::Direct => None,
-            Route::Proxy(url) if url.starts_with("http://") || url.starts_with("https://") => match ureq::Proxy::new(url) {
-                Ok(proxy) => Some(proxy),
-                Err(_) => continue,
+            Route::Proxy(url) if url.starts_with("http://") => match ureq::Proxy::new(url) {
+                Ok(proxy) if proxy.protocol() == ureq::ProxyProtocol::Http => Some(proxy),
+                _ => continue,
             },
             Route::Proxy(_) => continue,
         };
         if !list.contains(&proxy) {
             list.push(proxy);
         }
-    }
-    if list.is_empty() {
-        list.push(None);
     }
     list
 }
@@ -184,7 +188,8 @@ fn proxy_route(value: &str) -> Option<Route> {
         None => ("http".to_string(), value),
     };
     let address = address.trim_end_matches('/');
-    (matches!(scheme.as_str(), "http" | "https") && !address.is_empty()).then(|| Route::Proxy(format!("{scheme}://{address}")))
+    // https:// 프록시는 목적지 TLS가 생략되므로 쓰지 않음 (모듈 설명 참고)
+    (scheme == "http" && !address.is_empty()).then(|| Route::Proxy(format!("http://{address}")))
 }
 
 /// Windows 예외 목록(`<local>;*.corp.example;10.*`)에 이 호스트가 있는지
@@ -255,7 +260,8 @@ pub(crate) mod tests {
         );
         assert_eq!(parse_proxy_list("socks=s:1080", "https"), vec![]);
         assert_eq!(parse_proxy_list("socks5://s:1080", "https"), vec![]);
-        assert_eq!(parse_proxy_list("HTTPS=https://tls-proxy:443/", "https"), vec![proxy("https://tls-proxy:443")]);
+        assert_eq!(parse_proxy_list("HTTPS=https://tls-proxy:443/", "https"), vec![], "https:// 프록시는 쓰지 않음");
+        assert_eq!(parse_proxy_list("HTTPS=http://plain-proxy:8080/", "https"), vec![proxy("http://plain-proxy:8080")]);
         assert_eq!(parse_proxy_list("a:1;DIRECT", "https"), vec![proxy("http://a:1"), Route::Direct]);
     }
 
@@ -291,7 +297,9 @@ pub(crate) mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].as_ref().map(|p| (p.host().to_string(), p.port())), Some(("a".into(), 1)));
         assert!(list[1].is_none());
-        assert_eq!(to_proxies(&[]), vec![None]);
+        assert_eq!(to_proxies(&[]), vec![None], "설정이 없으면 직접");
+        assert!(to_proxies(&[proxy("https://tls-proxy:443")]).is_empty(), "https:// 프록시만 있으면 직접으로 우회하지 않음");
+        assert!(to_proxies(&[proxy("socks5://s:1080")]).is_empty());
     }
 
     /// 아무 연결도 받지 않는 주소 (열었다 닫은 포트)
