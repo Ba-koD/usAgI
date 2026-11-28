@@ -21,9 +21,11 @@ Windows 10/11 · macOS 11 이상 (Apple Silicon·Intel)
 
 최신 버전은 [GitHub Releases](https://github.com/Ba-koD/usAgI/releases/latest)에서 받을 수 있습니다.
 
+설치한 뒤 업데이트는 앱에 맡기세요(**설정 → 정보**, 자동 업데이트 기본 켜짐). 앱은 내장된 공개 키로 업데이트의 Minisign 서명을 늘 확인합니다. 아래 설치 스크립트는 [minisign](https://jedisct1.github.io/minisign/)이 설치되어 있을 때만 서명을 확인하고, 없으면 같은 릴리스의 SHA-256만 확인합니다(처음 받은 파일을 그대로 믿는 설치). 그래서 업데이트할 때 스크립트를 다시 실행하는 것보다 앱 업데이트가 안전합니다.
+
 ### Windows
 
-릴리스의 `usagi.exe`를 받아 실행하세요. PowerShell로 설치하거나 업데이트할 수도 있습니다.
+릴리스의 `usagi.exe`를 받아 실행하세요. PowerShell로 설치할 수도 있습니다.
 
 ```powershell
 $installer = Join-Path $env:TEMP 'usagi-install.ps1'
@@ -34,7 +36,7 @@ if ($?) { powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer }
 
 ### macOS
 
-**터미널 설치를 권장합니다.** 아래 명령으로 최신 버전을 설치하고, 업데이트할 때도 같은 명령을 실행하세요. ZIP으로 설치하려면 릴리스에서 `usAgI-mac.zip`을 받으세요.
+**처음 설치는 터미널 설치를 권장합니다.** 아래 명령으로 최신 버전을 설치하세요. 이후 업데이트는 앱이 합니다. ZIP으로 설치하려면 릴리스에서 `usAgI-mac.zip`을 받으세요.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Ba-koD/usAgI/main/scripts/install-mac.sh | bash
@@ -71,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/Ba-koD/usAgI/main/scripts/install-m
 
 사용 가능한 로컬 로그인이 있으면 공급자의 사용량을 HTTPS로 조회합니다. 기본 갱신 주기는 5분이고, 필요할 때 공식 CLI로 조회합니다. 로그인과 토큰 갱신은 공식 CLI가 관리합니다.
 
-앱 업데이트는 **설정 → 정보**에서 확인합니다. GitHub 릴리스의 SHA-256과 Minisign 서명을 검증한 뒤 설치합니다. 최신 릴리스가 0.3.1 이상일 때 0.2.1 이하를 쓰고 있다면 앱 파일을 내려받아 한 번 업데이트하세요.
+앱 업데이트는 **설정 → 정보**에서 확인합니다. GitHub 릴리스의 SHA-256과 Minisign 서명을 검증한 뒤 설치하며, 설치 스크립트를 다시 실행하는 것보다 이 방법을 권장합니다. 검증에 실패한 버전은 바로 다시 받지 않고 간격을 늘려 다시 시도합니다. 최신 릴리스가 0.3.1 이상일 때 0.2.1 이하를 쓰고 있다면 앱 파일을 내려받아 한 번 업데이트하세요.
 
 ## 도움말
 

@@ -36,14 +36,36 @@
 확인과 내려받기는 Windows·macOS가 같은 코드(`usagi-core`의 `update`)로 하고, 실행 파일 바꾸기만 플랫폼마다 다름.
 처음 주소는 GitHub의 https만 허용하고, GitHub이 파일 서버로 넘기는 리다이렉트도 https만 최대 5번 따라감.
 
-체크섬이나 서명이 없거나 맞지 않으면 설치하지 않음. 서명 비밀 키는 저장소에 두지 않고 GitHub Actions 비밀값으로만 보관하므로, 릴리스 파일만 바꿔서는 통과할 수 없음.
-(공개 키 파일이 비어 있는 빌드는 체크섬만 확인.)
+체크섬이나 서명이 없거나 맞지 않으면 설치하지 않음. 서명 비밀 키는 저장소에 두지 않고 승인이 필요한 GitHub 환경의 비밀값으로만 보관하므로, 릴리스 파일만 바꿔서는 통과할 수 없음 (아래 [업데이트 서명이 막는 것과 못 막는 것](#업데이트-서명이-막는-것과-못-막는-것)).
+(공개 키 파일이 비어 있는 빌드는 체크섬만 확인. 릴리스 워크플로는 빈 공개 키로 빌드하지 않음.)
+
+- 정식 빌드는 미리보기 버전(`0.5.0-beta.1` 같은 태그나 GitHub에서 미리보기로 표시한 릴리스)을 받지 않음. 미리보기 빌드는 더 새 미리보기와 정식 버전을 받음
+- 같은 버전의 받기·검증이 실패하면 그 버전을 기억해(`state.json`의 `updateFailure`) 다음 자동 시도까지 6시간 → 1일 → 3일 → 7일 기다림. 새 버전이 나오면 바로 받고, **업데이트 확인**·**설치**를 직접 누르면 바로 다시 시도
+- 릴리스 정보(`releases/latest` 응답)는 1 MiB까지만 받음 (새 버전 파일은 64 MiB)
 
 내려받은 파일을 직접 확인하려면 본문의 서명을 `usagi.exe.minisig`에 저장하고 [minisign](https://jedisct1.github.io/minisign/) 사용:
 
 ```bash
 minisign -Vm usagi.exe -p packaging/usagi-update.pub
 ```
+
+## 업데이트 서명이 막는 것과 못 막는 것
+
+목표: 저장소나 릴리스를 손에 넣었더라도 서명 비밀 키가 없으면 설치된 앱에 코드를 보낼 수 없게.
+
+| 손에 넣은 것 | 할 수 있는 일 | 막는 것 |
+|---|---|---|
+| 릴리스 편집 (파일 교체·본문 수정, 예: `contents: write` 토큰) | 파일과 체크섬, 본문의 서명 바꾸기 | **서명**. 비밀 키 없이는 맞는 서명을 만들 수 없어 앱이 설치하지 않음. 변경 불가 릴리스를 켜면 게시된 파일과 태그 자체를 바꿀 수 없음 (본문은 바꿀 수 있지만 서명은 위조 불가) |
+| `main`에 푸시 (버전 올리기, 워크플로 수정) | 원하는 코드를 빌드시켜 서명 단계까지 진행 | **`release-signing` 환경 승인**. 승인 전에는 서명 작업이 비밀값을 읽지 못하고, `main`이 아닌 브랜치의 실행은 그 환경을 쓸 수 없음. 승인자가 실행의 커밋을 확인해야 막힘 |
+| 저장소 관리자 계정 (설정 변경·승인) | 환경 규칙을 바꾸거나 스스로 승인 | 막지 못함. 계정을 2단계 인증(가능하면 패스키)으로 지키고 계정 보안 로그 확인 |
+| 서명 비밀 키 | 아무 파일이나 서명 | 막지 못함. [서명 키 교체](#서명-키-교체) |
+
+- **체크섬**은 파일과 같은 릴리스에서 오므로 내려받다 깨진 파일만 걸러 냄. 바꿔치기는 서명이 막음
+- **예전 버전·다른 파일**: 서명 안의 설명(`usAgI <버전> <파일 이름>`)이 이 버전·이 파일이어야 해서 예전 서명 파일을 새 버전으로, Mac 파일을 Windows 파일로 내놓을 수 없음
+- **설치 스크립트**(처음 설치): `minisign`이 있으면 스크립트에 고정한 공개 키로 서명을 확인. 없으면 같은 릴리스의 SHA-256만 확인하는 trust-on-first-use이고 그렇다고 알림 (`USAGI_REQUIRE_SIGNATURE=1`·`-RequireSignature`로 거부 가능). 스크립트 자체를 `main`에서 받으므로 `main`에 푸시할 수 있으면 스크립트와 고정 키도 바꿀 수 있음. 그래서 설치한 뒤에는 앱의 자동 업데이트를 권장
+- **Homebrew**: brew는 탭 저장소(`<owner>/homebrew-usagi`)의 Cask에 적힌 SHA-256으로만 확인하고 minisign 서명은 보지 않음. 탭에 쓸 수 있는 사람(`HOMEBREW_TAP_TOKEN` 포함)은 brew 사용자에게 코드를 보낼 수 있음. brew로 설치한 앱은 스스로 업데이트하지 않으므로(`brew upgrade` 안내) 앱의 서명 확인도 적용되지 않음. 토큰을 등록한다면 탭 저장소 하나에만 쓰기 권한이 있는 fine-grained 토큰으로
+- **공개 키 고정**: `scripts/check-update-key.sh`가 `packaging/usagi-update.pub`와 설치 스크립트의 키를 고정 값과 비교 (CI와 릴리스 준비 단계). 키를 바꾸려면 세 곳을 함께 고쳐야 해서 키가 슬쩍 바뀌는 일이 눈에 띔
+- 가장 강한 방법은 비밀 키를 GitHub에 두지 않고 손으로 서명하는 것(`scripts\sign-release.ps1`). 대신 릴리스마다 서명할 PC가 필요해서 지금은 승인 환경 방식을 씀
 
 ## 보안
 
@@ -90,13 +112,13 @@ Windows 배포용 `dist/release/usagi.exe`는 포터블 패키지 스크립트�
 
 ```powershell
 cargo run -p usagi-sign -- keygen
-Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UPDATE_SIGNING_KEY
+Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UPDATE_SIGNING_KEY --env release-signing
 ```
 
 - 비밀 키: `%USERPROFILE%\.usagi\update-signing.key` (저장소 밖). 안전한 곳에 백업
-- 공개 키: `packaging/usagi-update.pub`에 기록. 이 파일을 커밋하면 다음 빌드부터 서명 없는 업데이트를 받지 않음
-- GitHub Actions 비밀값 `UPDATE_SIGNING_KEY`: 릴리스 때 서명에 사용. 키에 비밀번호를 걸었으면 `UPDATE_SIGNING_PASSWORD`도 등록
-- 키를 바꾸면 예전 키가 들어 있는 설치본은 새 버전을 받지 못하므로 바꾸지 않는 것이 원칙
+- 공개 키: `packaging/usagi-update.pub`에 기록. 이 파일을 커밋하면 다음 빌드부터 서명 없는 업데이트를 받지 않음. `scripts/check-update-key.sh`의 고정 값과 설치 스크립트의 키도 같은 값으로
+- 비밀값 `UPDATE_SIGNING_KEY`: `release-signing` 환경에 등록 (저장소 수준 비밀값으로 두지 않음, [저장소 설정](#저장소-설정)). 키에 비밀번호를 걸었으면 `UPDATE_SIGNING_PASSWORD`도 같은 환경에
+- 키를 바꾸면 예전 키가 들어 있는 설치본은 새 버전을 받지 못하므로 [서명 키 교체](#서명-키-교체) 절차를 따름
 
 ### 릴리스마다
 
@@ -106,12 +128,68 @@ Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UP
 4. GitHub Actions(`.github/workflows/release.yml`)가 자동 실행
    - **준비**: 아직 게시하지 않은 버전이고 `CHANGELOG.md`에 그 섹션이 있을 때만 진행. 같은 이름의 태그가 다른 커밋에 있으면 중단. 릴리스 노트 추출
    - **빌드**: Windows 본체·Windows 설정 창·Mac 본체(ARM·Intel)·Mac 설정 창(ARM·Intel)·공통 테스트(Windows)·서명 도구를 준비 단계를 기다리지 않고 각자 다른 러너에서 동시에. 묶기 단계에서 Windows는 본체에 설정 창을 합치고, Mac은 유니버설 ZIP 생성. macOS 테스트는 같은 커밋의 `ci.yml`이 실행 (무료 요금제의 macOS 동시 작업 5개 제한 때문에 릴리스 쪽에서는 빼서 Mac 빌드가 줄을 서지 않게)
-   - **게시**: 파일마다 서명(`.minisig`)을 만들고 릴리스 본문의 **파일 검증 정보** 접기 영역에 SHA-256과 서명을 넣음. 배포 파일을 올린 뒤 공개하고, `HOMEBREW_TAP_TOKEN` 비밀값이 있으면 Homebrew 탭 갱신
+   - **서명 (승인 필요)**: 빌드가 모두 끝나면 `release-signing` 환경 승인을 기다림. 실행 페이지의 **Review deployments**에서 커밋과 버전이 직접 올린 것인지 확인하고 승인. 승인하면 이 작업만 비밀 키를 받아 파일마다 서명(`.minisig`)을 만듦. 공개 키가 비었거나 고정 값과 다르거나 비밀값이 없으면 실패
+   - **게시**: 서명을 한 번 더 확인하고 릴리스 본문의 **파일 검증 정보** 접기 영역에 SHA-256과 서명을 넣음. 배포 파일을 올린 뒤 공개하고, `HOMEBREW_TAP_TOKEN` 비밀값이 있으면 Homebrew 탭 갱신. 이 작업은 서명 비밀값을 받지 않음
 
-공개 키가 저장소에 있는데 `UPDATE_SIGNING_KEY` 비밀값이 없으면 게시 단계가 실패 (서명 없는 릴리스는 설치된 앱이 받지 않음).
-이미 게시된 릴리스에 서명을 다시 올릴 때는 `scripts\sign-release.ps1 -Version x.y.z`. 본문의 체크섬(이전 릴리스는 `SHA256SUMS.txt`)으로 파일을 확인한 뒤 본문을 갱신. 검증 첨부가 있는 릴리스의 서명 첨부도 갱신. `-NoUpload`로 서명과 갱신할 본문을 로컬에서 확인 가능.
+승인하지 않거나 거절하면 아무것도 게시되지 않음 (빌드 산출물은 실행 페이지에 7일간 남음).
+이미 게시된 릴리스에 서명을 다시 올릴 때는 `scripts\sign-release.ps1 -Version x.y.z`. 본문에 서명이 이미 있으면(이전 릴리스는 `.minisig` 첨부) 먼저 확인하고 맞지 않으면 서명하지 않음. 파일마다 SHA-256을 보여 주고 태그 이름을 직접 입력해야 서명. 본문의 체크섬(이전 릴리스는 `SHA256SUMS.txt`)은 같은 릴리스에서 온 값이라 증거가 아니므로, 보여 준 SHA-256을 직접 빌드한 파일이나 그 버전을 빌드한 Actions 실행의 산출물·서명 작업 로그와 비교. 검증 첨부가 있는 릴리스의 서명 첨부도 갱신(변경 불가 릴리스는 본문만). `-NoUpload`로 서명과 갱신할 본문을 로컬에서 확인 가능.
 
-0.3.0은 기존 앱도 자동 업데이트할 수 있도록 `usagi.exe`와 `usAgI-mac.zip`의 `.sha256`·`.minisig`를 함께 첨부. 0.3.1부터 검증 정보는 본문에만 게시. 0.3.0을 지나친 0.2.1 이하 앱은 한 번 수동 업데이트 필요. macOS 설치 스크립트는 릴리스 본문에서 SHA-256을 읽고, 이전 릴리스는 첨부의 체크섬을 사용.
+0.3.0은 기존 앱도 자동 업데이트할 수 있도록 `usagi.exe`와 `usAgI-mac.zip`의 `.sha256`·`.minisig`를 함께 첨부. 0.3.1부터 검증 정보는 본문에만 게시. 0.3.0을 지나친 0.2.1 이하 앱은 한 번 수동 업데이트 필요. 설치 스크립트는 릴리스 본문에서 SHA-256과 서명을 읽고, 이전 릴리스는 첨부를 사용.
+
+### 서명 키 교체
+
+지금은 키가 하나(온라인 키 A, `release-signing` 환경)뿐이라 A를 잃거나 유출되면 설치본을 새 키로 옮길 방법이 없음 (모두 수동 재설치). 그래서 오프라인 예비 키를 미리 앱에 넣어 두는 계획:
+
+1. **준비 (한 번)**: 인터넷에 연결하지 않은 PC에서 예비 키 B를 만들고(`usagi-sign keygen --key <USB 경로>`, 공개 키 파일은 따로 보관) 비밀 키는 GitHub에 올리지 않음. 두 곳 이상에 백업
+2. **앱이 키 여러 개를 믿게**: `update.rs`·`usagi-sign`이 `packaging/usagi-update.pub`의 키 줄을 모두 읽고 그중 하나로 서명되면 통과하게 고친 뒤(현재는 한 줄만 읽음, 구현 필요) B의 공개 키를 추가. `scripts/check-update-key.sh`의 고정 값과 설치 스크립트도 두 키로. 이 버전을 A로 서명해 게시하면 그 뒤 설치본은 A와 B를 모두 믿음
+3. **A를 잃거나 유출되면**: `release-signing`의 `UPDATE_SIGNING_KEY`를 바로 삭제 → A를 빼고 새 예비 키 C를 넣은 버전을 빌드 → 오프라인 PC에서 B로 서명해 게시(`sign-release.ps1`) → 새 온라인 키를 만들어 환경에 등록하는 다음 교체도 같은 방식. 2단계 이전 버전을 쓰는 설치본은 수동 재설치 안내
+4. 유출된 키로 서명된 릴리스는 그 키를 믿는 설치본이 받으므로, 교체는 그 뒤의 피해를 막는 일. 평소에는 A가 승인 뒤에만 쓰이게 하는 것이 먼저
+
+### 저장소 설정
+
+릴리스 서명을 사람의 승인 뒤로 묶는 GitHub 설정. 워크플로(`release.yml`)는 이 설정이 없어도 동작하지만(환경은 처음 쓸 때 보호 규칙 없이 자동 생성) 그때는 승인 없이 서명됨. 순서: 이 워크플로를 `main`에 합친 뒤 1 → 2 (2를 먼저 하면 이전 워크플로의 게시가 비밀값을 못 찾아 실패).
+
+1. **`release-signing` 환경**: 승인자 = 저장소 관리자, `main`에서만 사용. 승인자가 한 명뿐이라 `prevent_self_review`는 끔(켜면 아무도 승인 못 함). 웹 설정(Settings → Environments → release-signing)에서 **Allow administrators to bypass configured protection rules**도 끔
+   ```bash
+   # 승인자 id: gh api users/Ba-koD -q .id
+   gh api -X PUT repos/Ba-koD/usAgI/environments/release-signing --input - <<'JSON'
+   {"wait_timer": 0, "prevent_self_review": false,
+    "reviewers": [{"type": "User", "id": 69419835}],
+    "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+   JSON
+   gh api -X POST repos/Ba-koD/usAgI/environments/release-signing/deployment-branch-policies -f name=main -f type=branch
+   ```
+2. **서명 비밀값을 환경으로 옮김**: GitHub 비밀값은 다시 읽을 수 없으므로 비밀 키 파일이 있는 PC에서. 파일이 없으면 저장소 수준 비밀값을 지우지 말고 [서명 키 교체](#서명-키-교체)부터
+   ```powershell
+   Get-Content "$env:USERPROFILE\.usagi\update-signing.key" -Raw | gh secret set UPDATE_SIGNING_KEY --env release-signing -R Ba-koD/usAgI
+   gh secret list --env release-signing -R Ba-koD/usAgI
+   gh secret delete UPDATE_SIGNING_KEY -R Ba-koD/usAgI
+   ```
+3. **`main` 규칙**: 삭제와 강제 푸시 금지 (평소처럼 `main`에 바로 푸시 가능). 커밋 서명 필수(`required_signatures`)나 PR 필수(`pull_request`)는 일하는 방식이 바뀌므로 따로 결정
+   ```bash
+   gh api -X POST repos/Ba-koD/usAgI/rulesets --input - <<'JSON'
+   {"name": "main 보호", "target": "branch", "enforcement": "active",
+    "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+    "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}], "bypass_actors": []}
+   JSON
+   ```
+4. **`v*` 태그 규칙**: 릴리스 태그 삭제·이동 금지. 만들기는 막지 않음 (게시 작업이 태그를 만듦)
+   ```bash
+   gh api -X POST repos/Ba-koD/usAgI/rulesets --input - <<'JSON'
+   {"name": "릴리스 태그 보호", "target": "tag", "enforcement": "active",
+    "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+    "rules": [{"type": "deletion"}, {"type": "non_fast_forward"},
+              {"type": "update", "parameters": {"update_allows_fetch_and_merge": false}}],
+    "bypass_actors": []}
+   JSON
+   ```
+5. **변경 불가 릴리스**: 게시한 릴리스의 파일과 태그를 바꿀 수 없음. 제목·본문은 고칠 수 있어 `sign-release.ps1`의 본문 갱신은 그대로 됨. 게시 작업은 초안에 파일을 모두 올린 뒤 공개하므로 영향 없음
+   ```bash
+   gh api -X PUT repos/Ba-koD/usAgI/immutable-releases
+   gh api repos/Ba-koD/usAgI/immutable-releases
+   ```
+
+확인: `gh api repos/Ba-koD/usAgI/environments`, `gh api repos/Ba-koD/usAgI/rulesets`, `gh secret list -R Ba-koD/usAgI` (저장소 수준에 `UPDATE_SIGNING_KEY`가 없어야 함).
 
 - main 푸시와 PR: `ci.yml`이 세 OS에서 테스트와 컴파일 확인만 실행 (2~3분). 릴리스 빌드는 버전을 올린 커밋에서 한 번만 실행
 - 캐시: 릴리스 빌드가 main에서 돌아 의존성 캐시를 main에 저장하고, 다음 릴리스가 그 캐시를 받아 씀 (태그에서 만든 캐시는 다른 태그가 못 읽어서 예전 구조는 매번 처음부터 빌드하기 쉬웠음). 캐시를 미리 데우는 수동 실행은 필요 없음
