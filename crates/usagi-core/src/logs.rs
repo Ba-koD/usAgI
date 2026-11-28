@@ -44,8 +44,11 @@ pub struct LimitEvent {
     pub ts: f64,
     pub kind: LimitKind,
     pub reset_at: Option<f64>,
+    /// 메시지 앞부분 (최대 [`LIMIT_TEXT_CHARS`]자). 한 줄이 수 MiB일 수 있어 통째로 들고 있지 않음
     pub text: String,
 }
+
+pub const LIMIT_TEXT_CHARS: usize = 200;
 
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
@@ -191,7 +194,7 @@ fn parse_clock(tok: &str, next: Option<&str>) -> Option<(u32, u32, bool)> {
     }
     let mut hour = h;
     match ap {
-        Some(true) if hour != 12 => hour += 12,
+        Some(true) if hour != 12 => hour = hour.checked_add(12)?,
         Some(false) if hour == 12 => hour = 0,
         _ => {}
     }
@@ -520,7 +523,8 @@ impl LogReader {
                         (low.contains("limit") && low.contains("reset")) || low.contains("usage limit reached");
                     if is_rate_limit || looks_like_limit {
                         let kind = limit_kind(&text);
-                        let ev = LimitEvent { ts, kind, reset_at: parse_reset(&text, ts), text: text.trim().to_string() };
+                        let text_head = text.trim().chars().take(LIMIT_TEXT_CHARS).collect();
+                        let ev = LimitEvent { ts, kind, reset_at: parse_reset(&text, ts), text: text_head };
                         self.limits.insert((ts.round() as i64, kind), ev);
                         return;
                     }
@@ -613,6 +617,38 @@ mod tests {
         assert_eq!(limit_kind(weekly), LimitKind::Weekly);
         assert_eq!(parse_reset(weekly, sent), Some(seoul(2026, 11, 25, 9, 0)));
         assert_eq!(parse_reset("Claude AI usage limit reached|1750000000", 0.0), Some(1_750_000_000.0));
+    }
+
+    #[test]
+    fn huge_clock_hours_are_rejected_instead_of_overflowing() {
+        assert_eq!(parse_clock("4294967295pm", None), None);
+        assert_eq!(parse_clock("4294967295", Some("pm")), None);
+        assert_eq!(parse_clock("9pm", None), Some((21, 0, false)));
+        assert_eq!(parse_reset("limit · resets 4294967295pm", 0.0), None);
+    }
+
+    #[test]
+    fn a_long_limit_message_keeps_only_its_head() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("s.jsonl");
+        let iso = {
+            let secs = time::now() as i64;
+            let (y, m, d) = time::civil_from_days(secs.div_euclid(86400));
+            let r = secs.rem_euclid(86400);
+            format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z", r / 3600, r % 3600 / 60, r % 60)
+        };
+        let text = format!("You've hit your session limit · resets 9:40pm (Asia/Seoul) {}", "x".repeat(2 << 20));
+        let line = serde_json::json!({"type":"assistant","error":"rate_limit","isApiErrorMessage":true,"timestamp":iso,
+            "message":{"id":"x","content":[{"type":"text","text":text}]}}).to_string() + "\n";
+        std::fs::write(&path, line).unwrap();
+        let mut reader = LogReader::new(vec![fixture.path().to_owned()]);
+        assert!(reader.rescan());
+        let limits = reader.limit_events();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].kind, LimitKind::Session);
+        assert!(limits[0].reset_at.is_some());
+        assert!(limits[0].text.chars().count() <= LIMIT_TEXT_CHARS, "{} bytes kept", limits[0].text.len());
+        assert!(limits[0].text.starts_with("You've hit your session limit"));
     }
 
     fn line(ts: &str, id: &str, out: u64) -> String {
