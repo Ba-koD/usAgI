@@ -8,8 +8,10 @@ cd "$(dirname "$0")/.."
 VER="${1:?버전 필요 (예: 0.1.0)}"
 VER="${VER#v}"
 
+# awk는 끝까지 읽음: 중간에 exit하면 앞의 tr이 SIGPIPE로 끝나 pipefail이 스크립트를 실패시킴
+# (파이프 버퍼보다 CHANGELOG가 크면, macOS는 16KB·Linux는 64KB)
 notes="$(tr -d '\r' < CHANGELOG.md | awk -v head="## [${VER}]" '
-  /^## \[/ { if (inside) exit; inside = (index($0, head) == 1); next }
+  /^## \[/ { if (inside) done = 1; inside = !done && (index($0, head) == 1); next }
   inside { print }
 ' | sed -e '/./,$!d')"
 
