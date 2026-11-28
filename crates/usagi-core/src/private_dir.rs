@@ -84,14 +84,14 @@ mod imp {
         SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation, IsWellKnownSid, TokenUser,
+        EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid, IsWellKnownSid, TokenUser,
         WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
         OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    /// 지금 사용자 (TOKEN_USER + SID, 최대 68바이트. 포인터 정렬을 맞추려고 u64 배열)
-    struct User([u64; 32]);
+    /// 지금 사용자의 SID (바이트를 복사해 둠: TOKEN_USER의 SID 포인터는 같은 버퍼 안을 가리켜서 버퍼를 옮기면 무효)
+    struct User(Vec<u8>);
 
     impl User {
         fn current() -> Option<Self> {
@@ -100,16 +100,25 @@ mod imp {
                 if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
                     return None;
                 }
-                let mut user = User([0; 32]);
+                // TOKEN_USER + SID (최대 68바이트). 포인터 정렬을 맞추려고 u64 배열
+                let mut buf = [0u64; 32];
                 let mut len = 0u32;
-                let ok = GetTokenInformation(token, TokenUser, user.0.as_mut_ptr().cast(), std::mem::size_of_val(&user.0) as u32, &mut len);
+                let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf) as u32, &mut len);
                 CloseHandle(token);
-                (ok != 0).then_some(user)
+                if ok == 0 {
+                    return None;
+                }
+                let sid = (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid;
+                if sid.is_null() || IsValidSid(sid) == 0 {
+                    return None;
+                }
+                Some(User(std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize).to_vec()))
             }
         }
 
+        /// 읽기 전용 API에만 넘김
         fn sid(&self) -> PSID {
-            unsafe { (*(self.0.as_ptr() as *const TOKEN_USER)).User.Sid }
+            self.0.as_ptr() as PSID
         }
 
         /// SID 문자열 ("S-1-5-21-…")
