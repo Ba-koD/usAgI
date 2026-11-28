@@ -49,6 +49,11 @@ fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
     a.split('.').count().cmp(&b.split('.').count())
 }
 
+/// 미리보기(prerelease) 버전인지 ("0.5.0-beta.1"). 읽을 수 없는 글자는 false
+pub fn is_prerelease(v: &str) -> bool {
+    parse(v).is_some_and(|(_, pre)| pre.is_some())
+}
+
 /// 태그에서 앞의 v를 뗀 표시용 버전
 pub fn clean(tag: &str) -> String {
     tag.trim().trim_start_matches(['v', 'V']).to_string()
@@ -71,5 +76,15 @@ mod tests {
         assert!(!is_newer("0.2.0-beta.1", "0.2.0"));
         assert!(!is_newer("nightly", "0.1.0"));
         assert_eq!(clean("v1.2.3"), "1.2.3");
+    }
+
+    #[test]
+    fn detects_prerelease_versions() {
+        assert!(is_prerelease("v0.5.0-beta.1"));
+        assert!(is_prerelease("0.5.0-rc.1+build"));
+        assert!(!is_prerelease("v0.5.0"));
+        assert!(!is_prerelease("0.5.0+build-1"));
+        assert!(!is_prerelease("nightly"));
+        assert!(!is_prerelease("0.5.0-"));
     }
 }

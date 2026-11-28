@@ -2,7 +2,7 @@
 //! 받은 파일을 두는 곳과 바꿔 끼우기는 플랫폼마다 달라서 각 앱의 updater가 해요.
 //!
 //! 서명: 체크섬은 실행 파일과 같은 릴리스에서 오므로 릴리스를 바꿔치기한 쪽이 함께 바꿀 수 있어요.
-//! 그래서 저장소에 없는 비밀 키(릴리스 워크플로의 비밀값)로 만든 minisign 서명(`<파일>.minisig`)을, 앱에 들어 있는 공개 키
+//! 그래서 저장소에 없는 비밀 키(승인이 필요한 릴리스 서명 환경의 비밀값)로 만든 minisign 서명(`<파일>.minisig`)을, 앱에 들어 있는 공개 키
 //! (`packaging/usagi-update.pub`)로 확인합니다. 서명 안의 설명(버전 + 파일 이름)도 맞아야 해서
 //! 예전 버전의 서명된 파일을 새 버전인 것처럼 내놓을 수 없어요.
 
@@ -15,6 +15,8 @@ mod download;
 pub use download::{check, download, fetch_text, REPO};
 
 pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+/// 릴리스 정보(`releases/latest` 응답) 크기 한도. 실제 응답은 수십 KB (GitHub 릴리스 노트 최대 길이로도 1 MiB 미만)
+pub const MAX_RELEASE_JSON_BYTES: u64 = 1024 * 1024;
 
 /// 새 버전 정보
 #[derive(Clone, Debug, PartialEq)]
@@ -231,12 +233,21 @@ pub fn parse_latest(body: &[u8], current: &str, repo: &str, asset: &str) -> Resu
 
 /// `require_signature`: 본문이나 첨부에 서명이 없는 릴리스를 받지 않음
 pub fn parse_latest_with(body: &[u8], current: &str, repo: &str, asset: &str, require_signature: bool) -> Result<Option<Release>, String> {
+    if body.len() as u64 > MAX_RELEASE_JSON_BYTES {
+        return Err(crate::tr!("릴리스 정보가 너무 큼", "The release info is too large").into());
+    }
     let v: Value =
         serde_json::from_slice(body).map_err(|_| crate::tr!("릴리스 정보 읽기 실패", "Failed to read the release info").to_string())?;
     let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
     let version = version::clean(tag);
     if !tag.is_empty() && !safe_version(&version) {
         return Err(crate::tr!("릴리스 버전 형식 오류", "Invalid release version format").into());
+    }
+    // 미리보기 버전은 미리보기 빌드만 받음. `releases/latest`는 원래 미리보기를 주지 않지만, 릴리스를 고칠 수 있는
+    // 사람이 미리보기를 최신으로 표시해도 정식 빌드가 따라가지 않게 (태그와 GitHub의 prerelease 표시 둘 다 봄)
+    let prerelease = version::is_prerelease(tag) || v.get("prerelease").and_then(Value::as_bool) == Some(true);
+    if prerelease && !version::is_prerelease(current) {
+        return Ok(None);
     }
     if !version::is_newer(tag, current) {
         return Ok(None);
@@ -343,8 +354,36 @@ mod tests {
         // 버전이 폴더 이름으로 쓰이므로 경로 글자는 안 됨
         let odd = BODY.replace("\"tag_name\":\"v0.2.0\"", "\"tag_name\":\"v0.2.0-../../x\"");
         assert!(parse_latest_with(odd.as_bytes(), "0.1.0", "o/r", "usagi.exe", false).is_err());
+    }
+
+    #[test]
+    fn prerelease_only_for_prerelease_builds() {
         let pre = BODY.replace("\"tag_name\":\"v0.2.0\"", "\"tag_name\":\"v0.2.0-beta.1\"");
-        assert_eq!(parse_latest_with(pre.as_bytes(), "0.1.0", "o/r", "usagi.exe", false).unwrap().unwrap().version, "0.2.0-beta.1");
+        // 정식 빌드는 미리보기 태그를 받지 않음
+        assert_eq!(parse_latest_with(pre.as_bytes(), "0.1.0", "o/r", "usagi.exe", false).unwrap(), None);
+        // 미리보기 빌드는 더 새 미리보기를 받음
+        assert_eq!(parse_latest_with(pre.as_bytes(), "0.2.0-beta.0", "o/r", "usagi.exe", false).unwrap().unwrap().version, "0.2.0-beta.1");
+        assert_eq!(parse_latest_with(pre.as_bytes(), "0.1.0-rc.1", "o/r", "usagi.exe", false).unwrap().unwrap().version, "0.2.0-beta.1");
+        // 태그는 정식이어도 GitHub에 미리보기로 표시된 릴리스는 정식 빌드가 받지 않음
+        let flagged = BODY.replace("\"body\":\"notes\"", "\"body\":\"notes\",\"prerelease\":true");
+        assert_eq!(parse_latest_with(flagged.as_bytes(), "0.1.0", "o/r", "usagi.exe", false).unwrap(), None);
+        assert!(parse_latest_with(flagged.as_bytes(), "0.1.0-beta.1", "o/r", "usagi.exe", false).unwrap().is_some());
+        let stable = BODY.replace("\"body\":\"notes\"", "\"body\":\"notes\",\"prerelease\":false");
+        assert!(parse_latest_with(stable.as_bytes(), "0.1.0", "o/r", "usagi.exe", false).unwrap().is_some());
+        // 미리보기 빌드도 같은 버전의 정식 릴리스로는 올라감
+        assert!(parse_latest_with(BODY.as_bytes(), "0.2.0-beta.3", "o/r", "usagi.exe", false).unwrap().is_some());
+    }
+
+    #[test]
+    fn rejects_oversized_release_info() {
+        let mut response: Value = serde_json::from_str(BODY).unwrap();
+        response["body"] = Value::String("x".repeat(MAX_RELEASE_JSON_BYTES as usize));
+        let big = serde_json::to_vec(&response).unwrap();
+        assert!(big.len() as u64 > MAX_RELEASE_JSON_BYTES);
+        assert!(parse_latest_with(&big, "0.1.0", "o/r", "usagi.exe", false).unwrap_err().contains("큼"));
+        // 한도 안이면 그대로 읽음
+        response["body"] = Value::String("x".repeat(MAX_RELEASE_JSON_BYTES as usize / 2));
+        assert!(parse_latest_with(&serde_json::to_vec(&response).unwrap(), "0.1.0", "o/r", "usagi.exe", false).unwrap().is_some());
     }
 
     #[test]
