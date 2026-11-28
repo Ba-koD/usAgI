@@ -92,7 +92,8 @@ fn keygen(args: &[String]) -> Result<(), String> {
     println!("공개 키: {}", public_key_path().display());
     println!("   {}", pk.to_base64());
     println!("   이 파일을 커밋하면 다음 빌드부터 앱이 서명 없는 업데이트를 받지 않음.");
-    println!("GitHub Actions에서 서명하려면 비밀값 등록: gh secret set UPDATE_SIGNING_KEY < <비밀 키 파일>");
+    println!("   scripts/check-update-key.sh의 고정 값과 설치 스크립트(install-mac.sh, install-windows.ps1)의 키도 이 값으로 바꿔야 CI가 통과.");
+    println!("GitHub Actions에서 서명하려면 승인 환경에 비밀값 등록: gh secret set UPDATE_SIGNING_KEY --env release-signing < <비밀 키 파일>");
     Ok(())
 }
 
