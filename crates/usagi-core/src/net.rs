@@ -140,7 +140,7 @@ fn system_routes(url: &str, scheme: &str, host: &str) -> Vec<Route> {
 }
 
 /// OS 설정을 다시 읽게 기억을 비움 (테스트에서 프록시 설정을 바꾼 뒤)
-#[cfg(test)]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 pub(crate) fn clear_cache() {
     if let Ok(mut cache) = CACHE.lock() {
         *cache = None;

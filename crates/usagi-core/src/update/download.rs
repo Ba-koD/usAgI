@@ -10,7 +10,7 @@
 use super::{latest_api, parse_latest, Release, MAX_ASSET_BYTES};
 use std::io::{Read, Write};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 업데이트를 받을 저장소 ("owner/name"). 릴리스 빌드(GitHub Actions)는 자기 저장소를 넣어 빌드함.
 pub const REPO: &str = match option_env!("USAGI_UPDATE_REPO") {
@@ -111,6 +111,8 @@ fn follow(
     let agent_header = user_agent();
     let mut url = url.to_string();
     for hop in 0..=MAX_REDIRECTS {
+        // ureq의 시간 제한은 읽기 한 번마다 기다리는 시간이라, 조금씩 계속 보내는 서버는 끊지 못함 → 본문은 직접 마감 시각을 확인
+        let deadline = Instant::now() + budget;
         let extra = if hop == 0 { headers } else { &[] };
         let mut response = crate::net::call(&url, |proxy| {
             let mut request = agent
@@ -145,7 +147,7 @@ fn follow(
             continue;
         }
         if status == 200 {
-            copy_limited(response.body_mut().with_config().limit(u64::MAX).reader(), out, limit)?;
+            copy_limited(response.body_mut().with_config().limit(u64::MAX).reader(), out, limit, deadline)?;
         }
         return Ok(status);
     }
@@ -175,11 +177,14 @@ fn redirect_target(base: &str, location: &str) -> Option<String> {
     Some(format!("{scheme}://{authority}{dir}/{location}"))
 }
 
-/// 본문을 크기 한도 안에서 옮김
-fn copy_limited(mut body: impl Read, out: &mut dyn Write, limit: u64) -> Result<(), String> {
+/// 본문을 크기 한도와 마감 시각 안에서 옮김
+fn copy_limited(mut body: impl Read, out: &mut dyn Write, limit: u64, deadline: Instant) -> Result<(), String> {
     let mut remaining = limit;
     let mut buf = vec![0; 64 * 1024];
     loop {
+        if Instant::now() >= deadline {
+            return Err(crate::tr!("내려받기 시간 초과 (인터넷 연결 확인 필요)", "Download timed out (check the internet connection)").into());
+        }
         let count = match body.read(&mut buf) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
@@ -263,7 +268,7 @@ mod tests {
         // 전체 제한은 본문 읽기까지 적용
         let url = trickle_server(20, Duration::from_millis(250));
         let error = follow(&plain_agent(), &url, "*/*", &[], &mut Vec::new(), 1024, Duration::from_secs(1), false).unwrap_err();
-        assert!(error.contains("연결 끊김") || error.contains("연결 실패"), "{error}");
+        assert!(error.contains("시간 초과") || error.contains("연결 끊김"), "{error}");
     }
 
     #[test]
