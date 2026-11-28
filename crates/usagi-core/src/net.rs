@@ -6,7 +6,8 @@
 //! 3. OS 설정: Windows는 인터넷 옵션(수동 프록시·PAC 주소·자동 검색), macOS는 네트워크 설정(수동 프록시·PAC·자동 검색)
 //! 4. 아무것도 없으면 직접 연결
 //!
-//! PAC가 경로를 여러 개 주면(`PROXY a; PROXY b; DIRECT`) 연결이 안 될 때 다음 경로로 넘어가요.
+//! PAC가 경로를 여러 개 주면(`PROXY a; PROXY b; DIRECT`) 연결이 안 될 때 다음 경로로 넘어가요 (앞에서 최대 4개).
+//! OS·PAC에는 `스킴://호스트/`만 넘겨요 (주소의 경로·쿼리에 든 조직 ID나 서명된 다운로드 주소를 PAC에 보이지 않게).
 //! OS 설정 조회는 주소(스킴+호스트)마다 잠깐 기억해 두고, SOCKS 프록시는 지원하지 않아 건너뜁니다.
 //!
 //! `http://` 프록시만 씁니다. `https://` 프록시를 거치면 ureq가 목적지와의 TLS를 생략해 토큰이 프록시에 평문으로 가므로,
@@ -23,6 +24,8 @@ mod windows;
 
 /// OS 설정을 다시 읽기 전까지 기억하는 시간 (자동 검색이 느린 PC에서 매번 기다리지 않게)
 const CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// 요청 하나가 시도하는 경로 수 (PAC가 경로를 아주 많이 줘도 경로마다 시간 제한을 기다리며 멈추지 않게)
+const MAX_ROUTES: usize = 4;
 
 /// 요청 하나가 거칠 경로 (OS 설정을 읽는 Windows·macOS가 만듦)
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,7 +77,7 @@ pub(crate) fn proxies_for(url: &str) -> Vec<Option<ureq::Proxy>> {
     if let Some(proxy) = ureq::Proxy::try_from_env() {
         return if proxy.protocol() == ureq::ProxyProtocol::Http { vec![Some(proxy)] } else { Vec::new() };
     }
-    to_proxies(&system_routes_cached(url, &scheme, &host))
+    to_proxies(&system_routes_cached(&scheme, &host))
 }
 
 /// 경로 목록 → 시도할 프록시. 설정이 없으면 직접, 설정은 있는데 쓸 수 있는 게 없으면 빈 목록 (직접으로 우회하지 않음)
@@ -95,6 +98,9 @@ fn to_proxies(routes: &[Route]) -> Vec<Option<ureq::Proxy>> {
         if !list.contains(&proxy) {
             list.push(proxy);
         }
+        if list.len() == MAX_ROUTES {
+            break;
+        }
     }
     list
 }
@@ -104,7 +110,7 @@ type RouteCache = HashMap<String, (Instant, Vec<Route>)>;
 
 static CACHE: Mutex<Option<RouteCache>> = Mutex::new(None);
 
-fn system_routes_cached(url: &str, scheme: &str, host: &str) -> Vec<Route> {
+fn system_routes_cached(scheme: &str, host: &str) -> Vec<Route> {
     let key = format!("{scheme}://{host}");
     let now = Instant::now();
     if let Some((at, routes)) = CACHE.lock().ok().and_then(|cache| cache.as_ref()?.get(&key).cloned()) {
@@ -112,7 +118,9 @@ fn system_routes_cached(url: &str, scheme: &str, host: &str) -> Vec<Route> {
             return routes;
         }
     }
-    let routes = system_routes(url, scheme, host);
+    // PAC에는 호스트까지만 (경로·쿼리는 보이지 않게). IPv6 주소는 대괄호로
+    let origin = if host.contains(':') { format!("{scheme}://[{host}]/") } else { format!("{scheme}://{host}/") };
+    let routes = system_routes(&origin, scheme, host);
     if let Ok(mut cache) = CACHE.lock() {
         let map = cache.get_or_insert_with(HashMap::new);
         map.retain(|_, (at, _)| now.duration_since(*at) < CACHE_TTL);
@@ -300,6 +308,8 @@ pub(crate) mod tests {
         assert_eq!(to_proxies(&[]), vec![None], "설정이 없으면 직접");
         assert!(to_proxies(&[proxy("https://tls-proxy:443")]).is_empty(), "https:// 프록시만 있으면 직접으로 우회하지 않음");
         assert!(to_proxies(&[proxy("socks5://s:1080")]).is_empty());
+        let many: Vec<Route> = (0..2000).map(|i| proxy(&format!("http://p{i}.example:8080"))).collect();
+        assert_eq!(to_proxies(&many).len(), MAX_ROUTES, "PAC가 경로를 많이 줘도 앞에서 몇 개만");
     }
 
     /// 아무 연결도 받지 않는 주소 (열었다 닫은 포트)

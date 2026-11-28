@@ -6348,6 +6348,7 @@ dependencies = [
  "objc2-user-notifications 0.3.2",
  "serde_json",
  "tao",
+ "tempfile",
  "tiny-skia 0.12.0",
  "tray-icon",
  "usagi-core",

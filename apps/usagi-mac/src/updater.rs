@@ -8,6 +8,7 @@
 //! 통신(네트워크 설정의 프록시·PAC 포함)과 검증은 코어의 [`usagi_core::update`].
 //! Homebrew로 설치했으면 brew가 버전을 관리하므로 스스로 바꾸지 않고 `brew upgrade`를 안내해요.
 
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,29 +48,36 @@ pub fn current_app() -> Option<PathBuf> {
     bundle.extension().is_some_and(|e| e == "app").then(|| bundle.to_path_buf())
 }
 
-/// 받아서 검증하고 임시 폴더에 푼 새 .app 경로
+/// 받아서 검증하고 임시 폴더에 푼 새 .app 경로.
+/// 폴더는 매번 새로 만드는 무작위 이름의 이 사용자 전용 폴더(0700)라, 검증한 뒤 압축을 풀고 적용하기 전까지
+/// 다른 사용자가 파일을 바꿔 끼울 수 없음 (TMPDIR이 공유 폴더여도). 실패하면 폴더째 지움
 pub fn download(rel: &Release) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("usagi-update-{}", rel.version));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let zip = dir.join(ASSET);
-    let mut file = std::fs::File::create(&zip).map_err(|error| error.to_string())?;
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("usagi-update-{}-", rel.version))
+        .tempdir()
+        .map_err(|e| e.to_string())?;
+    let zip = dir.path().join(ASSET);
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&zip).map_err(|e| e.to_string())?;
     usagi_core::update::download(rel, &mut file)?;
+    file.rewind().map_err(|e| e.to_string())?;
+    rel.verify_asset(&file, ASSET, usagi_core::update::fetch_text)?;
     drop(file);
-    let file = std::fs::File::open(&zip).map_err(|error| error.to_string())?;
-    rel.verify_asset(file, ASSET, usagi_core::update::fetch_text)?;
-    let ok = Command::new("/usr/bin/ditto").args(["-x", "-k"]).arg(&zip).arg(&dir).status().map_err(|e| e.to_string())?;
-    let app = dir.join("usAgI.app");
+    let ok = Command::new("/usr/bin/ditto").args(["-x", "-k"]).arg(&zip).arg(dir.path()).status().map_err(|e| e.to_string())?;
+    let app = dir.path().join("usAgI.app");
     if !ok.success() || !["usAgI", "usagi-settings"].iter().all(|name| app.join("Contents/MacOS").join(name).is_file()) {
         return Err(usagi_core::tr!("받은 압축 파일에 usAgI.app 없음", "usAgI.app not found in the downloaded archive").into());
     }
     let _ = std::fs::remove_file(zip);
-    if let Some(native) = stage_native_app(&app) {
-        let _ = std::fs::remove_dir_all(app);
-        Ok(native)
-    } else {
-        Ok(app)
-    }
+    let staged = match stage_native_app(&app) {
+        Some(native) => {
+            let _ = std::fs::remove_dir_all(app);
+            native
+        }
+        None => app,
+    };
+    // 적용할 때까지 남겨 둠 (적용은 설정 창이 닫힌 뒤일 수 있음)
+    let _ = dir.keep();
+    Ok(staged)
 }
 
 fn stage_native_app(app: &Path) -> Option<PathBuf> {
