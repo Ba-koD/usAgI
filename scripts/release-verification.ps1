@@ -48,6 +48,25 @@ function New-ReleaseVerificationBlock([string]$Directory, [string[]]$Names, [swi
     $lines -join "`n"
 }
 
+# 검증 정보 안의 `<이름>.minisig` 서명 글자 (앱의 update.rs fenced_text와 같은 규칙). 없으면 $null, 형식이 틀리면 오류
+function Get-ReleaseVerificationSignature([string]$Content, [string]$Name) {
+    $lines = [string[]]($Content -split '\r?\n')
+    $heading = [array]::IndexOf($lines, ('**`{0}.minisig`**' -f $Name))
+    if ($heading -lt 0) { return $null }
+    $i = $heading + 1
+    while ($i -lt $lines.Count -and -not $lines[$i].Trim()) { $i++ }
+    if ($i -ge $lines.Count -or $lines[$i] -cne '```text') { throw "$Name.minisig 서명 형식 오류" }
+    $value = [System.Collections.Generic.List[string]]::new()
+    for ($i++; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -ceq '```') {
+            if (-not ($value -join '').Trim()) { throw "$Name.minisig 서명 내용 없음" }
+            return ($value -join "`n") + "`n"
+        }
+        $value.Add($lines[$i])
+    }
+    throw "$Name.minisig 서명 형식 오류"
+}
+
 function Set-ReleaseVerificationBlock([string]$Body, [string]$Block) {
     $previous = Find-ReleaseVerificationBlock $Body
     if ($previous) { return $Body.Remove($previous.Index, $previous.Length).Insert($previous.Index, $Block) }
