@@ -15,6 +15,11 @@ sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 
     echo "== $f"
     tr -d '\r' < "$f" | grep -v '^version = "' || true
   done
+  # 빌드 플래그(rustflags)가 바뀌면 모든 의존성을 다시 빌드하므로 지문에 포함
+  if [ -f .cargo/config.toml ]; then
+    echo "== .cargo/config.toml"
+    tr -d '\r' < .cargo/config.toml
+  fi
   rustc -V
   echo "${1:-}"
 } | sha | cut -c1-16

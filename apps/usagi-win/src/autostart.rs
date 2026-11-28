@@ -80,18 +80,71 @@ fn task_xml(exe: &Path, user: &str) -> String {
 
 fn create_task(exe: &Path) -> bool {
     let Some(user) = current_user() else { return false };
-    // schtasks /XML은 UTF-16 파일을 읽음
+    let Ok(file) = write_task_file(&task_xml(exe, &user)) else { return false };
+    schtasks(&["/Create", "/TN", TASK, "/XML", &file.to_string_lossy(), "/F"])
+    // file이 사라지면서 임시 파일도 지움
+}
+
+/// schtasks /XML이 읽을 UTF-16 파일. 임시 폴더에 임의 이름으로 새로 만듦: 미리 만들어 둔 같은 이름의 파일·링크를 열지 않음
+fn write_task_file(xml: &str) -> std::io::Result<tempfile::TempPath> {
+    use std::io::Write;
     let mut bytes = vec![0xFF, 0xFE];
-    for u in task_xml(exe, &user).encode_utf16() {
+    for u in xml.encode_utf16() {
         bytes.extend_from_slice(&u.to_le_bytes());
     }
-    let path = std::env::temp_dir().join(format!("usagi-task-{}.xml", std::process::id()));
-    if std::fs::write(&path, bytes).is_err() {
-        return false;
+    let mut file = tempfile::Builder::new().prefix("usagi-task-").suffix(".xml").tempfile()?;
+    file.write_all(&bytes)?;
+    file.flush()?;
+    // 핸들을 닫아 schtasks가 읽을 수 있게 (경로는 남고, 값이 사라질 때 지움)
+    Ok(file.into_temp_path())
+}
+
+/// 작업 스케줄러에 등록된 usAgI 작업이 실행하는 파일 (작업이 없거나 읽을 수 없으면 None)
+fn task_target() -> Option<PathBuf> {
+    use windows::core::{Interface, BSTR};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    use windows::Win32::System::TaskScheduler::{IExecAction, ITaskService, TaskScheduler, TASK_ACTION_EXEC};
+    use windows::Win32::System::Variant::VARIANT;
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let target = (|| -> windows::core::Result<Option<PathBuf>> {
+            let service: ITaskService = CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)?;
+            service.Connect(&VARIANT::default(), &VARIANT::default(), &VARIANT::default(), &VARIANT::default())?;
+            let task = service.GetFolder(&BSTR::from("\\"))?.GetTask(&BSTR::from(TASK))?;
+            let actions = task.Definition()?.Actions()?;
+            let mut count = 0;
+            actions.Count(&mut count)?;
+            for index in 1..=count {
+                let action = actions.get_Item(index)?;
+                let mut kind = Default::default();
+                action.Type(&mut kind)?;
+                if kind == TASK_ACTION_EXEC {
+                    let mut path = BSTR::new();
+                    action.cast::<IExecAction>()?.Path(&mut path)?;
+                    let path = path.to_string();
+                    let path = path.trim().trim_matches('"');
+                    return Ok((!path.is_empty()).then(|| PathBuf::from(path)));
+                }
+            }
+            Ok(None)
+        })()
+        .ok()
+        .flatten();
+        if initialized {
+            CoUninitialize();
+        }
+        target
     }
-    let ok = schtasks(&["/Create", "/TN", TASK, "/XML", &path.to_string_lossy(), "/F"]);
-    let _ = std::fs::remove_file(&path);
-    ok
+}
+
+/// 대상 exe가 없어진 등록(로그온 작업·Run 값)을 지움. 그 경로에 나중에 다른 파일이 생기면 로그인할 때 실행되므로
+fn remove_missing() {
+    if task_target().is_some_and(|target| !target.is_file()) {
+        schtasks(&["/Delete", "/TN", TASK, "/F"]);
+    }
+    if win::reg_string(RUN_KEY, RUN_VALUE).and_then(|value| run_value_exe(&value)).is_some_and(|target| !target.is_file()) {
+        win::reg_delete(RUN_KEY, RUN_VALUE);
+    }
 }
 
 /// 켜져 있는지 (처음 한 번만 확인하고 기억)
@@ -108,8 +161,12 @@ pub fn enabled() -> bool {
 }
 
 /// 켜기: 로그온 작업 등록 (실패하면 Run 등록). 끄기: 둘 다 지움.
+/// 내려받기·임시 폴더에서 실행 중이면 켜지 않고 이유를 돌려줌 (그 경로의 파일은 지워지거나 바뀌기 쉬움)
 pub fn set(on: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    if let Some(kind) = usagi_core::location::transient(&exe).filter(|_| on) {
+        return Err(kind.blocked(("시작 시 실행", "start with Windows")));
+    }
     let applied = if on {
         if create_task(&exe) {
             win::reg_delete(RUN_KEY, RUN_VALUE);
@@ -147,11 +204,13 @@ fn same_file(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
-/// 앱이 뜰 때 (백그라운드): 이 exe를 가리키는 예전 Run 등록을 로그온 작업으로 옮김.
-/// 다른 위치의 usAgI(설치본·포터블·개발 빌드)를 가리키는 등록은 건드리지 않음.
+/// 앱이 뜰 때 (백그라운드): 대상 exe가 없어진 등록을 지우고, 이 exe를 가리키는 예전 Run 등록을 로그온 작업으로 옮김.
+/// 다른 위치에 있는 usAgI(설치본·포터블·개발 빌드)를 가리키는 등록은 건드리지 않음.
+/// 내려받기·임시 폴더에서 실행 중이면 옮기지 않음 ([`set`]이 거절).
 /// 실행 중인 작업을 다시 등록해도 지금 프로세스는 그대로 (확인함).
 pub fn refresh() {
     let _ = std::thread::Builder::new().name("usagi-autostart".into()).spawn(|| {
+        remove_missing();
         STATE.store(0, Ordering::Relaxed);
         let Ok(exe) = std::env::current_exe() else { return };
         let ours = win::reg_string(RUN_KEY, RUN_VALUE)
@@ -175,6 +234,20 @@ mod tests {
         assert!(xml.contains("<UserId>PC\\user&apos;1</UserId>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"), "실행 시간 제한 없음 (기본 72시간이면 앱이 꺼짐)");
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"), "관리자 권한 없이");
+    }
+
+    #[test]
+    fn task_file_gets_a_fresh_random_name_and_is_removed() {
+        let first = write_task_file("<Task/>").unwrap();
+        let second = write_task_file("<Task/>").unwrap();
+        assert_ne!(first.to_path_buf(), second.to_path_buf(), "실행마다 다른 이름");
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("usagi-task-") && name.ends_with(".xml") && name != format!("usagi-task-{}.xml", std::process::id()), "{name}");
+        let bytes = std::fs::read(&first).unwrap();
+        assert_eq!(&bytes[..4], &[0xFF, 0xFE, b'<', 0], "UTF-16 LE BOM");
+        let path = first.to_path_buf();
+        drop(first);
+        assert!(!path.exists(), "끝나면 지움");
     }
 
     #[test]

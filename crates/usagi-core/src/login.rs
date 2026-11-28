@@ -11,6 +11,7 @@
 
 use crate::accounts::{default_claude_dir, default_codex_dir, Account};
 use crate::time;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -187,16 +188,46 @@ pub(crate) fn program_candidates(provider: &str) -> Vec<PathBuf> {
 }
 
 /// PATH에서 찾기 (경로가 붙은 이름은 그 파일이 있는지만). Windows는 확장자 없는 이름에 .exe를 붙여 찾음 (std::process::Command와 같게).
+/// 항상 절대 경로를 돌려줌: 이름만 넘기면 Windows의 Command가 이 exe의 폴더(내려받기 등)를 먼저 찾음
 fn which(name: &Path) -> Option<PathBuf> {
+    which_in(name, std::env::var_os("PATH"))
+}
+
+fn which_in(name: &Path, path: Option<OsString>) -> Option<PathBuf> {
+    // 경로가 붙은 이름은 절대 경로만 (작업 폴더 기준 상대 경로는 쓰지 않음)
     if name.is_absolute() || name.components().count() > 1 {
-        return name.is_file().then(|| name.to_path_buf());
+        return (name.is_absolute() && name.is_file()).then(|| name.to_path_buf());
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
+    // 빈 항목·`.`·상대 경로는 작업 폴더 기준이라 건너뜀 (그 폴더의 같은 이름 파일이 먼저 실행되지 않게)
+    std::env::split_paths(&path?).filter(|dir| dir.is_absolute()).find_map(|dir| {
         let p = dir.join(name);
         let p = if cfg!(windows) && p.extension().is_none() { p.with_extension("exe") } else { p };
         p.is_file().then_some(p)
     })
+}
+
+/// PATH 값에서 절대 경로가 아닌 항목(빈 항목·`.`·상대 경로)과 중복을 뺌. 남는 항목이 없으면 None
+pub fn absolute_paths(value: &OsStr) -> Option<OsString> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in std::env::split_paths(value).filter(|dir| dir.is_absolute()) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    if dirs.is_empty() { None } else { std::env::join_paths(dirs).ok() }
+}
+
+const PATH_START: &str = "__USAGI_PATH_START__";
+const PATH_END: &str = "__USAGI_PATH_END__";
+
+/// macOS 앱이 로그인 셸에서 PATH를 받는 스크립트 (`$SHELL -lc`). rc 파일이 출력한 글자와 섞이지 않게 표시 사이에 출력
+pub const LOGIN_PATH_SCRIPT: &str = r#"printf '\n__USAGI_PATH_START__%s__USAGI_PATH_END__\n' "$PATH""#;
+
+/// [`LOGIN_PATH_SCRIPT`] 출력에서 PATH 값 (절대 경로 항목만)
+pub fn parse_login_path(output: &str) -> Option<OsString> {
+    let start = output.rfind(PATH_START)? + PATH_START.len();
+    let value = &output[start..];
+    absolute_paths(OsStr::new(&value[..value.find(PATH_END)?]))
 }
 
 /// 실제로 설치돼 있는 CLI 실행 파일들 (찾은 순서대로, 중복 없음)
@@ -222,17 +253,32 @@ pub(crate) fn remember_program(provider: &str, path: PathBuf) {
     }
 }
 
+/// 공식 CLI 실행 명령. 모든 CLI 실행은 이 함수를 거침
 pub(crate) fn quiet_command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
+    // 작업 폴더는 이 사용자 전용 설정 폴더로 고정: usAgI를 실행한 위치(내려받기 폴더 등)의 파일을 CLI나
+    // CLI가 띄우는 셸이 읽거나 실행하지 않게. Claude Code의 프로젝트 설정·CLAUDE.md도 읽지 않음
+    cmd.current_dir(child_dir());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
+        // cmd.exe가 이름만 적힌 명령(npm의 codex.cmd 안 `node` 등)을 작업 폴더에서 먼저 찾지 않게
+        cmd.env("NoDefaultCurrentDirectoryInExePath", "1");
     }
     if crate::desktop::previously_installed("claude").as_deref() == Some(program) {
         cmd.env("DISABLE_UPDATES", "1");
     }
     cmd
+}
+
+/// CLI 작업 폴더: 설정 폴더 (없으면 만듦). 만들 수 없으면 이 사용자의 임시 폴더
+fn child_dir() -> PathBuf {
+    let dir = crate::config::config_dir();
+    if dir.is_absolute() && std::fs::create_dir_all(&dir).is_ok() {
+        return dir;
+    }
+    std::env::temp_dir()
 }
 
 /// 자식 프로세스와 그 자식(.cmd·node가 띄운 실제 CLI 등)을 한 묶음으로: 이 값이 없어지면 모두 종료.
@@ -667,6 +713,48 @@ mod tests {
         assert!(which(&std::env::temp_dir().join("usagi-no-such-cli-xyz")).is_none(), "없는 절대 경로");
         assert!(install_hint("codex").contains("Codex CLI"));
         assert!(install_hint("claude").contains("Claude Code CLI"));
+    }
+
+    #[test]
+    fn which_ignores_relative_and_empty_path_entries() {
+        // 테스트는 크레이트 폴더에서 실행: Cargo.toml과 src/lib.rs가 작업 폴더 기준으로 있음
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = |dirs: &[&Path]| Some(std::env::join_paths(dirs).unwrap());
+        assert_eq!(which_in(Path::new("Cargo.toml"), path(&[Path::new("")])), None, "빈 항목 = 작업 폴더");
+        assert_eq!(which_in(Path::new("Cargo.toml"), path(&[Path::new(".")])), None);
+        assert_eq!(which_in(Path::new("lib.rs"), path(&[Path::new("src")])), None, "상대 경로 항목");
+        assert_eq!(which_in(Path::new("lib.rs"), path(&[Path::new("src"), &crate_dir.join("src")])), Some(crate_dir.join("src/lib.rs")));
+        assert_eq!(which_in(Path::new("src/lib.rs"), None), None, "작업 폴더 기준 상대 경로");
+        assert_eq!(which_in(&crate_dir.join("src/lib.rs"), None), Some(crate_dir.join("src/lib.rs")));
+    }
+
+    #[test]
+    fn absolute_paths_drop_relative_entries_and_duplicates() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = crate_dir.join("src");
+        let value = std::env::join_paths([crate_dir, Path::new(""), Path::new("."), Path::new("bin"), &src, crate_dir]).unwrap();
+        assert_eq!(absolute_paths(&value), Some(std::env::join_paths([crate_dir, &src]).unwrap()));
+        assert_eq!(absolute_paths(&std::env::join_paths([Path::new("."), Path::new("bin")]).unwrap()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_path_is_read_between_markers() {
+        let output = "Last login: today\nwelcome __USAGI_PATH_START__ /tmp\n\n__USAGI_PATH_START__/opt/homebrew/bin::.:node_modules/.bin:/usr/bin__USAGI_PATH_END__\n";
+        assert_eq!(parse_login_path(output).as_deref(), Some(OsStr::new("/opt/homebrew/bin:/usr/bin")));
+        assert_eq!(parse_login_path("no markers"), None);
+        assert_eq!(parse_login_path("__USAGI_PATH_START__.:bin__USAGI_PATH_END__"), None);
+        // 실제 셸 스크립트도 같은 표시를 출력
+        let out = Command::new("/bin/sh").args(["-c", LOGIN_PATH_SCRIPT]).env("PATH", "/usr/bin:.:/bin").output().unwrap();
+        assert_eq!(parse_login_path(&String::from_utf8_lossy(&out.stdout)).as_deref(), Some(OsStr::new("/usr/bin:/bin")));
+    }
+
+    #[test]
+    fn cli_children_run_in_the_private_config_dir() {
+        let cmd = quiet_command(Path::new("fixture-cli"));
+        assert_eq!(cmd.get_current_dir(), Some(crate::config::config_dir().as_path()));
+        let no_cwd_lookup = cmd.get_envs().any(|(key, value)| key == "NoDefaultCurrentDirectoryInExePath" && value == Some(OsStr::new("1")));
+        assert_eq!(no_cwd_lookup, cfg!(windows));
     }
 
     #[test]

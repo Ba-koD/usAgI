@@ -28,6 +28,11 @@ const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../crates/usagi-core/src/rabbit.rs");
+    // exe가 가져다 쓰는 DLL(dwmapi·winhttp·secur32 등)은 System32에서만 찾음. exe 폴더의 같은 이름 DLL은 무시
+    // (0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32, Windows 10 1607 이상). 확인: scripts/check-windows-pe.ps1
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    }
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
 
     // ---- 아이콘 (.ico 안에 PNG로)

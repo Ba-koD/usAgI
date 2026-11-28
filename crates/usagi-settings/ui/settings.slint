@@ -57,6 +57,9 @@ export component SettingsView inherits Window {
     in property <string> install-help;
     in property <bool> windows;
     in property <bool> portable;
+    // 내려받기·임시 폴더에서 실행 중일 때: 등록하지 않는 것과 이유. 설치 위치로 옮길 수 있으면 단추
+    in property <string> location-note;
+    in property <bool> can-install;
     in-out property <int> page;
     callback preview-visibility(bool);
     changed page => { scroll.viewport-y = 0px; root.preview-visibility(root.page == 1); }
@@ -342,6 +345,10 @@ export component SettingsView inherits Window {
                             }
                             Rule {}
                             PrefToggle { title: root.windows ? @tr("Windows 시작 시 실행") : @tr("로그인 시 실행"); key: "autostart"; checked: root.prefs.autostart; }
+                            if root.location-note != "": Rule {}
+                            if root.location-note != "": SettingRow { title: @tr("실행 위치"); subtitle: root.location-note; alert: true;
+                                if root.can-install: UiButton { text: @tr("설치 위치로 옮기기"); clicked => { Actions.command("installCopy"); } }
+                            }
                         }
                         if root.page == 3: Group {
                             title: @tr("데이터");

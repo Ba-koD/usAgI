@@ -318,13 +318,43 @@ pub fn bridge_command(exe: &Path, account_id: &str) -> String {
 }
 
 /// 이 위치의 실행 파일을 상태 표시줄 명령으로 걸어도 되는지.
-/// Windows는 큰따옴표 안에서도 Git Bash가 `$(…)`·백틱·`$변수`를, cmd가 `%변수%`를 풀어 쓰므로 그런 글자가 든 경로는 걸지 않음
+/// - Windows는 큰따옴표 안에서도 Git Bash가 `$(…)`·백틱·`$변수`를, cmd가 `%변수%`를 풀어 쓰므로 그런 글자가 든 경로는 걸지 않음
+/// - 내려받기·임시 폴더의 exe는 걸지 않음: Claude Code가 상태 표시줄을 그릴 때마다 실행하는 경로라,
+///   지워지거나 같은 이름의 다른 파일로 바뀌기 쉬운 곳이면 안 됨
 pub fn linkable(exe: &Path) -> bool {
-    !cfg!(windows) || !exe.to_string_lossy().chars().any(|c| matches!(c, '$' | '`' | '%' | '"'))
+    link_blocker(exe).is_none()
+}
+
+fn link_blocker(exe: &Path) -> Option<String> {
+    if cfg!(windows) && exe.to_string_lossy().chars().any(|c| matches!(c, '$' | '`' | '%' | '"')) {
+        return Some(crate::tr!("실행 파일 경로에 $ ` % 글자가 있어 연결 불가", "Can't link: the app path contains $, ` or %").into());
+    }
+    crate::location::transient(exe).map(|kind| kind.blocked(("Claude Code 실시간 연결", "the Claude Code live link")))
 }
 
 pub fn is_our_command(cmd: &str) -> bool {
     cmd.contains("statusline --account")
+}
+
+/// 상태 표시줄 명령에 적힌 usAgI 실행 파일 경로 ([`bridge_command`]의 반대)
+fn bridge_exe(cmd: &str) -> Option<PathBuf> {
+    let (exe, _) = cmd.rsplit_once(" statusline --account ")?;
+    if let Some(path) = exe.strip_prefix('"').and_then(|e| e.strip_suffix('"')) {
+        return Some(PathBuf::from(path));
+    }
+    let path = exe.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(PathBuf::from(path.replace("'\\''", "'")))
+}
+
+/// 이 계정의 상태 표시줄에 걸린 usAgI 실행 파일이 없어졌는지 (옮기거나 지운 exe)
+pub fn bridge_missing(acc: &Account) -> bool {
+    acc.is_claude()
+        && read_settings(&settings_path(acc)).ok().is_some_and(|map| {
+            statusline_command(&map)
+                .filter(|cmd| owns_statusline(cmd, acc))
+                .and_then(bridge_exe)
+                .is_some_and(|exe| !exe.is_file())
+        })
 }
 
 fn statusline_command(map: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
@@ -418,8 +448,8 @@ pub fn needs_link(acc: &Account, exe: &Path) -> bool {
 
 /// Claude Code 프로필에 브리지를 넣습니다. 처음 한 번은 settings.json을 백업합니다.
 pub fn link(acc: &mut Account, exe: &Path) -> std::io::Result<()> {
-    if !linkable(exe) {
-        return Err(std::io::Error::other(crate::tr!("실행 파일 경로에 $ ` % 글자가 있어 연결 불가", "Can't link: the app path contains $, ` or %")));
+    if let Some(reason) = link_blocker(exe) {
+        return Err(std::io::Error::other(reason));
     }
     let path = settings_path(acc);
     let mut map = read_settings(&path)?;
@@ -561,6 +591,45 @@ mod tests {
         for bad in [r"C:\Tools\$(calc)\usagi.exe", r"C:\Tools\`x`\usagi.exe", r"C:\Tools\%TEMP%\usagi.exe"] {
             assert_eq!(linkable(Path::new(bad)), !cfg!(windows), "{bad}");
         }
+    }
+
+    #[test]
+    fn executables_in_temporary_folders_are_not_linked() {
+        let exe = tempfile::NamedTempFile::new().unwrap();
+        assert!(!linkable(exe.path()), "임시 폴더의 exe");
+        let mut acc = Account { id: "claude-1".into(), provider: "claude".into(), dir: String::new(), label: String::new(), show: true, chain: None, revision: 0, statusline_original: None, identity: None };
+        let error = link(&mut acc, exe.path()).unwrap_err().to_string();
+        // 다른 테스트가 잠시 영어로 바꿀 수 있어 두 언어 모두 허용
+        assert!(error.contains("임시 폴더") || error.contains("temporary folder"), "{error}");
+    }
+
+    #[test]
+    fn bridge_exe_reads_the_quoted_path_back() {
+        let exe = if cfg!(windows) { r"C:\Program Files\it's usAgI\usagi.exe" } else { "/Applications/us $(x)'AgI/usAgI" };
+        let read = bridge_exe(&bridge_command(Path::new(exe), "claude-1-r5")).unwrap();
+        assert_eq!(read, PathBuf::from(if cfg!(windows) { "C:/Program Files/it's usAgI/usagi.exe" } else { exe }));
+        assert_eq!(bridge_exe("~/.claude/mine.sh"), None);
+        assert_eq!(bridge_exe("usagi statusline --account claude-1"), None, "따옴표 없는 명령은 usAgI가 건 것이 아님");
+    }
+
+    #[test]
+    fn detects_a_bridge_whose_executable_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = tempfile::tempdir().unwrap();
+        let acc = Account { id: "claude-1".into(), provider: "claude".into(), dir: dir.path().to_string_lossy().into(), label: String::new(), show: true, chain: None, revision: 0, statusline_original: None, identity: None };
+        let write = |exe: &Path| {
+            let settings = serde_json::json!({ "statusLine": { "type": "command", "command": bridge_command(exe, &acc.usage_key()) } });
+            std::fs::write(dir.path().join("settings.json"), settings.to_string()).unwrap();
+        };
+        let exe = app.path().join(if cfg!(windows) { "usagi.exe" } else { "usagi" });
+        std::fs::write(&exe, "").unwrap();
+        write(&exe);
+        assert!(!bridge_missing(&acc));
+        std::fs::remove_file(&exe).unwrap();
+        assert!(bridge_missing(&acc));
+        assert!(!bridge_missing(&Account { id: "claude-2".into(), ..acc.clone() }), "다른 계정의 브리지");
+        std::fs::write(dir.path().join("settings.json"), r#"{"statusLine":{"type":"command","command":"~/.claude/mine.sh"}}"#).unwrap();
+        assert!(!bridge_missing(&acc), "usAgI가 건 명령이 아님");
     }
 
     #[test]

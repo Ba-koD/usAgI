@@ -483,6 +483,36 @@ pub fn apply(view: &SettingsView, state: &Value) {
     view.set_version(text(state, "version").into());
     view.set_folder(text(state, "dataDir").into());
     view.set_portable(flag(state, "portable"));
+    view.set_location_note(location_note(state).into());
+    view.set_can_install(!text(&state["location"], "installDir").is_empty());
+}
+
+/// 내려받기·임시 폴더에서 실행 중일 때 등록하지 않는 것과 이유, 옮기는 방법 (없으면 빈 글자)
+pub fn location_note(state: &Value) -> String {
+    let location = &state["location"];
+    let (ko, en) = match text(location, "transient") {
+        "downloads" => ("내려받기 폴더", "the Downloads folder"),
+        "temp" => ("임시 폴더", "a temporary folder"),
+        _ => return String::new(),
+    };
+    let windows = text(state, "platform") == "windows";
+    let (what_ko, what_en) = if windows {
+        ("시작 시 실행, 시작 메뉴 바로 가기, Claude Code 실시간 연결", "start with Windows, the Start menu shortcut and the Claude Code live link")
+    } else {
+        ("로그인 시 실행, Claude Code 실시간 연결", "start at login and the Claude Code live link")
+    };
+    let install = text(location, "installDir");
+    let (how_ko, how_en) = if !install.is_empty() {
+        (format!("옮기기: {install}에 복사하고 그 사본으로 다시 시작"), format!("Move: copies usAgI to {install} and restarts from there"))
+    } else if windows {
+        ("data 폴더와 함께 고정 위치로 옮긴 뒤 실행".into(), "Move it with its data folder to a permanent folder".into())
+    } else {
+        ("응용 프로그램 폴더로 옮긴 뒤 실행".into(), "Move usAgI to the Applications folder".into())
+    };
+    tr!(
+        format!("{ko}에서 실행 중이라 {what_ko}을 등록하지 않음 (지워지거나 바뀌기 쉬운 위치). {how_ko}"),
+        format!("Running from {en}, so {what_en} are not set up (files there are easily removed or replaced). {how_en}")
+    )
 }
 
 /// Windows 호스트가 그려 보낸 위젯 그림. {keep}이면 그대로 두고, 없으면 비움.
@@ -509,5 +539,23 @@ pub fn apply_widget_preview(view: &SettingsView, preview: &Value) {
                 view.set_has_preview(false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn location_note_explains_and_offers_the_install_folder() {
+        assert_eq!(location_note(&json!({"platform": "windows", "location": null})), "");
+        let downloads = location_note(&json!({"platform": "windows", "location": {"transient": "downloads", "installDir": r"C:\Users\me\AppData\Local\Programs\usAgI"}}));
+        assert!(downloads.starts_with("내려받기 폴더에서 실행 중이라 시작 시 실행, 시작 메뉴 바로 가기, Claude Code 실시간 연결을 등록하지 않음"), "{downloads}");
+        assert!(downloads.ends_with(r"C:\Users\me\AppData\Local\Programs\usAgI에 복사하고 그 사본으로 다시 시작"), "{downloads}");
+        let portable = location_note(&json!({"platform": "windows", "location": {"transient": "temp", "installDir": null}}));
+        assert!(portable.starts_with("임시 폴더에서") && portable.ends_with("data 폴더와 함께 고정 위치로 옮긴 뒤 실행"), "{portable}");
+        let mac = location_note(&json!({"platform": "mac", "location": {"transient": "temp"}}));
+        assert!(mac.contains("로그인 시 실행") && mac.ends_with("응용 프로그램 폴더로 옮긴 뒤 실행"), "{mac}");
     }
 }

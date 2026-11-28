@@ -1,0 +1,10 @@
+# Windows(MSVC) 실행 파일은 C 런타임을 정적으로 링크.
+# 동적 런타임(VCRUNTIME140.dll, api-ms-win-crt-*)은 KnownDLLs가 아니라서 exe 폴더(내려받기 폴더 등)에 같은 이름의
+# DLL이 있으면 그것을 먼저 읽음. 정적 링크하면 그 DLL을 아예 찾지 않음.
+# 프로필별 rustflags는 아직 안정 기능이 아니라 개발 빌드에도 같이 적용 (Rust는 디버그 빌드에도 릴리스 CRT를 쓰므로 차이 없음).
+# 확인: scripts/check-windows-pe.ps1 (CI)
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

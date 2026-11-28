@@ -488,6 +488,16 @@ msgctxt "SettingsView"
 msgid "로그인 시 실행"
 msgstr "Open at login"
 
+#: ui/settings.slint:348
+msgctxt "SettingsView"
+msgid "실행 위치"
+msgstr "App location"
+
+#: ui/settings.slint:349
+msgctxt "SettingsView"
+msgid "설치 위치로 옮기기"
+msgstr "Move to install folder"
+
 #: ui/settings.slint:325
 msgctxt "SettingsView"
 msgid "데이터"

@@ -10,7 +10,6 @@
 
 use crate::accounts::Account;
 use crate::bridge::{BridgeFile, BridgeWindow};
-use crate::config::config_dir;
 use crate::login::{capture_child_output, profile_env, programs_or_hint};
 use crate::time;
 use std::process::Stdio;
@@ -99,9 +98,9 @@ pub fn run(acc: &Account) -> Result<ProbeOutcome, String> {
 pub(crate) fn run_cli(acc: &Account, args: &[&str], timeout_secs: u64) -> Result<String, String> {
     let mut last_err = String::from(crate::tr!("Claude Code CLI 찾기 실패", "Claude Code CLI not found"));
     for prog in programs_or_hint("claude")? {
+        // 작업 폴더(설정 폴더)는 quiet_command가 정함: 프로젝트 설정·CLAUDE.md를 읽지 않음
         let mut cmd = crate::login::quiet_command(&prog);
         cmd.args(args)
-            .current_dir(config_dir()) // 프로젝트 설정·CLAUDE.md를 읽지 않게
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

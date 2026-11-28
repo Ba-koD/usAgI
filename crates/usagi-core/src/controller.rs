@@ -62,6 +62,9 @@ pub enum Effect {
     Notify(String, String),
     /// 시작(로그인) 시 실행 켜기/끄기. 실패하면 플랫폼이 [`Controller::set_error`]
     SetAutostart(bool),
+    /// 내려받기·임시 폴더에서 실행 중인 exe를 설치 위치([`HostInfo::install_dir`])로 복사하고 그 사본으로 다시 시작.
+    /// 성공하면 앱 종료, 실패하면 플랫폼이 [`Controller::set_error`]
+    InstallCopy,
     /// 설정 창 닫기 → 닫은 뒤 [`Controller::settings_closed`]
     CloseSettings,
     /// 앱 종료
@@ -102,6 +105,8 @@ pub struct HostInfo {
     pub taskbar_light: Option<bool>,
     /// 위젯 미리 보기 (Windows가 지금 설정대로 그린 그림: {w, h, scale, light, rgba}). 바뀌지 않았으면 {keep: true}, 보일 게 없으면 None
     pub widget_preview: Option<Value>,
+    /// 내려받기·임시 폴더에서 실행 중일 때 옮길 설치 위치 (Windows 설치형: %LOCALAPPDATA%\Programs\usAgI). 옮길 수 없으면 None
+    pub install_dir: Option<String>,
 }
 
 #[derive(Default)]
@@ -230,6 +235,16 @@ impl Controller {
         }
         if let Some(err) = self.engine.config().error {
             fx.push(Effect::Notify(crate::tr!("usAgI 설정 오류", "usAgI config error").into(), err));
+        }
+        if let Some(ignored) = config::ignored_portable_dir() {
+            let (dir, fallback) = (ignored.display(), config::config_dir().display().to_string());
+            fx.push(Effect::Notify(
+                crate::tr!("포터블 data 폴더 사용 안 함", "Portable data folder not used").into(),
+                crate::tr!(
+                    format!("{dir}: 링크이거나 다른 사용자가 만들었거나 바꿀 수 있는 폴더. 대신 {fallback} 사용"),
+                    format!("{dir} is a link, or another user created it or can change it. Using {fallback} instead")
+                ),
+            ));
         }
         let last = self.notices.state.get_str("last_version").map(str::to_string);
         if last.as_deref() != Some(crate::VERSION) {
@@ -392,6 +407,11 @@ impl Controller {
             "update": self.update_json(),
             "portable": config::is_portable(),
             "dataDir": config::config_dir().to_string_lossy(),
+            // 내려받기·임시 폴더에서 실행 중이면 시작 시 실행·바로 가기·실시간 연결을 등록하지 않음 (화면에 이유와 옮기기 단추)
+            "location": crate::location::current().map(|kind| json!({
+                "transient": kind.key(),
+                "installDir": host.install_dir,
+            })),
             "prefs": {
                 "widget": st.pref_bool("widget", true),
                 "side": st.pref_str("side", "right"),
@@ -633,6 +653,11 @@ impl Controller {
                 "codex" => fx.push(Effect::Open(USAGE_URL_CODEX.into())),
                 _ => {}
             },
+            "installCopy" => {
+                if crate::location::current().is_some() {
+                    fx.push(Effect::InstallCopy);
+                }
+            }
             "openFolder" => {
                 let dir = config::config_dir();
                 let _ = std::fs::create_dir_all(&dir);
@@ -805,12 +830,20 @@ impl Controller {
     }
 
     /// 가능한 Claude 계정을 연결하고, 앱이나 프로필이 바뀌면 브리지 명령을 갱신.
+    /// 이 위치(내려받기·임시 폴더)로는 걸 수 없는데 브리지가 가리키는 exe가 없어졌으면 원래 상태 표시줄로 되돌림
     fn ensure_links(&mut self, target: Option<&str>) {
         let Ok(exe) = std::env::current_exe() else { return };
         let mut list = accounts::load(&self.notices.state);
         let mut updated = Vec::new();
+        let mut unlinked = false;
         for (index, a) in list.iter_mut().enumerate() {
-            if target.is_some_and(|id| a.id != id) || !accounts::needs_link(a, &exe) {
+            if target.is_some_and(|id| a.id != id) {
+                continue;
+            }
+            if !accounts::needs_link(a, &exe) {
+                if accounts::bridge_missing(a) {
+                    unlinked |= accounts::unlink(a).is_ok();
+                }
                 continue;
             }
             let before = (a.chain.clone(), a.statusline_original.clone());
@@ -818,7 +851,7 @@ impl Controller {
                 updated.push(index);
             }
         }
-        if !updated.is_empty() && !self.store_accounts(&list) {
+        if (unlinked || !updated.is_empty()) && !self.store_accounts(&list) {
             for index in updated {
                 if let Err(error) = accounts::unlink(&mut list[index]) {
                     let prior = self.last_error.as_deref().unwrap_or_default();
@@ -2034,8 +2067,17 @@ mod tests {
     }
 
     #[test]
+    fn install_copy_is_offered_only_from_a_transient_location() {
+        // 테스트 실행 파일은 target 폴더에 있으므로 내려받기·임시 폴더가 아님
+        let mut c = ctl("windows", None);
+        let state = c.settings_state(&HostInfo { install_dir: Some(r"C:\Users\me\AppData\Local\Programs\usAgI".into()), ..HostInfo::default() });
+        assert_eq!(state["location"], Value::Null);
+        assert!(!ipc(&mut c, json!({"cmd": "installCopy"})).contains(&Effect::InstallCopy));
+    }
+
+    #[test]
     fn same_state_shape_on_every_platform() {
-        let win = ctl("windows", None).settings_state(&HostInfo { autostart: true, urgent_supported: true, urgent_allowed: Some(false), monitors: vec![json!({"id": "D1", "label": "모니터 1"})], taskbar_light: Some(true), bar_range: None, widget_preview: None });
+        let win = ctl("windows", None).settings_state(&HostInfo { autostart: true, urgent_supported: true, urgent_allowed: Some(false), monitors: vec![json!({"id": "D1", "label": "모니터 1"})], taskbar_light: Some(true), bar_range: None, widget_preview: None, install_dir: None });
         assert_eq!(win["taskbarLight"], true);
         let mac = ctl("mac", None).settings_state(&HostInfo::default());
         assert_eq!(win["platform"], "windows");

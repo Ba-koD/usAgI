@@ -110,8 +110,36 @@ pub fn write_icon(path: &Path, light: bool) -> bool {
         .is_some_and(|bytes| std::fs::write(path, bytes).is_ok())
 }
 
+fn shortcut_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA").map(|appdata| Path::new(&appdata).join(r"Microsoft\Windows\Start Menu\Programs\usAgI.lnk"))
+}
+
+/// 가리키는 exe가 없어진 시작 메뉴 바로 가기를 지움 (그 경로에 나중에 다른 파일이 생기면 시작 메뉴에서 실행되므로)
+pub fn remove_stale_shortcut() {
+    let Some(lnk) = shortcut_path().filter(|lnk| lnk.is_file()) else { return };
+    if shortcut_target(&lnk).is_some_and(|target| !target.is_file()) {
+        let _ = std::fs::remove_file(&lnk);
+    }
+}
+
+/// 바로 가기가 실행하는 파일 (읽을 수 없거나 비어 있으면 None)
+fn shortcut_target(lnk: &Path) -> Option<std::path::PathBuf> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        link.cast::<IPersistFile>().ok()?.Load(&HSTRING::from(lnk.as_os_str()), STGM_READ).ok()?;
+        let mut buf = vec![0u16; 32 * 1024];
+        link.GetPath(&mut buf, std::ptr::null_mut(), 0).ok()?;
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        (len > 0).then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+    }
+}
+
 /// 시작 메뉴 바로 가기 (앱 ID 포함). 설치형 데스크톱 앱이 Windows 알림 설정 목록에 나타나는 공식 방법.
 /// 이게 있어야 Windows 설정 > 알림에서 usAgI를 우선 순위 앱으로 고르거나 중요 알림을 허용할 수 있음.
+/// 내려받기·임시 폴더의 exe로는 만들지 않음 (호출하는 쪽이 확인)
 pub fn ensure_shortcut(exe: &Path) -> windows::core::Result<()> {
     use windows::core::Interface;
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
@@ -119,10 +147,10 @@ pub fn ensure_shortcut(exe: &Path) -> windows::core::Result<()> {
     use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-    let Some(appdata) = std::env::var_os("APPDATA") else { return Ok(()) };
-    let dir = Path::new(&appdata).join(r"Microsoft\Windows\Start Menu\Programs");
-    let _ = std::fs::create_dir_all(&dir);
-    let lnk = dir.join("usAgI.lnk");
+    let Some(lnk) = shortcut_path() else { return Ok(()) };
+    if let Some(dir) = lnk.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         link.SetPath(&HSTRING::from(exe.as_os_str()))?;
