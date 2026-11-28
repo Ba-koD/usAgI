@@ -97,7 +97,8 @@ pub fn parse(text: &str, now: f64) -> Option<BridgeFile> {
         let Some(colon) = rest.find(':') else { continue };
         let (head, tail) = (rest[..colon].trim(), &rest[colon + 1..]);
         let Some(pct) = tail.trim_start().split('%').next().and_then(|p| p.trim().parse::<f64>().ok()) else { continue };
-        let resets_at = tail.to_lowercase().find("reset").and_then(|i| parse_reset(&tail[i..], now));
+        // parse_reset가 직접 "reset"을 찾음. 소문자로 바꾼 글자의 위치로 원문을 자르면 글자 중간에서 패닉
+        let resets_at = parse_reset(tail, now);
         let w = BridgeWindow { used_percentage: pct, resets_at };
         if head.eq_ignore_ascii_case("session") {
             file.five_hour = Some(w);
@@ -171,6 +172,15 @@ Extra usage: $3.20 of $50.00 used
         assert_eq!(f.models[0].name, "Fable");
         assert_eq!(f.models[0].window.used_percentage, 0.0);
         assert_eq!(f.weekly_anchor, seoul(10));
+    }
+
+    #[test]
+    fn letters_that_shrink_when_lowercased_do_not_break_the_reset_search() {
+        // 켈빈 기호(U+212A, 3바이트)는 소문자 k(1바이트)가 됨
+        let file = parse("Current session: 30% \u{212A} resets 9pm (Asia/Seoul)", 1_795_000_000.0).unwrap();
+        let window = file.five_hour.unwrap();
+        assert_eq!(window.used_percentage, 30.0);
+        assert!(window.resets_at.is_some_and(|at| at > 1_795_000_000.0));
     }
 
     #[test]
