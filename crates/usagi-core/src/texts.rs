@@ -381,17 +381,14 @@ pub fn soon_notice(name: &str, label: &str, resets_at: f64, now: f64) -> (String
     )
 }
 
-pub fn nap_notice(st: &Status) -> (String, String) {
-    let what = if st.nap_kind == Some(LimitKind::Weekly) {
+pub fn nap_notice(kind: LimitKind, wake: f64, now: f64) -> (String, String) {
+    let what = if kind == LimitKind::Weekly {
         crate::tr!("주간 한도", "Weekly limit")
     } else {
         crate::tr!("세션 한도", "Session limit")
     };
-    let mut msg = crate::tr!(format!("{what} 도달."), format!("{what} reached."));
-    if let Some(w) = st.wake_at {
-        let (left, at) = (fmt_duration(w - st.now), fmt_clock(w, st.now));
-        msg += &crate::tr!(format!(" {left} 뒤({at}) 리셋."), format!(" Resets in {left} ({at})."));
-    }
+    let (left, at) = (fmt_duration(wake - now), fmt_clock(wake, now));
+    let msg = crate::tr!(format!("{what} 도달. {left} 뒤({at}) 리셋."), format!("{what} reached. Resets in {left} ({at})."));
     (crate::tr!("한도 도달", "Limit reached").into(), msg)
 }
 

@@ -430,6 +430,28 @@ pub struct Notices {
     pub state: State,
 }
 
+/// 한도 도달 (종류, 다시 쓸 수 있는 시각).
+/// Claude는 토끼 상태(거절 메시지 또는 정확한 값 100%), Codex는 다 쓴 창 중 리셋이 가장 늦은 것
+fn limit_hit(snap: &Snapshot, p: &ProviderView) -> Option<(crate::logs::LimitKind, f64)> {
+    use crate::logs::LimitKind;
+    match p.id {
+        ProviderId::Claude => snap.claude_statuses.get(&p.account_id).and_then(|st| Some((st.nap_kind?, st.wake_at?))),
+        ProviderId::Codex => p.meters.iter()
+            .filter(|m| m.exact && texts::spent(m.ratio))
+            .filter_map(|m| Some((m, m.resets_at.filter(|&reset| reset > snap.now)?)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(m, reset)| (if m.label == "주간" { LimitKind::Weekly } else { LimitKind::Session }, reset)),
+    }
+}
+
+/// 이미 알린 한도 도달인지. 리셋 시각이 조회마다 조금씩 달라져도 10분 안쪽이면 같은 창으로 봄
+fn same_limit_hit(seen: Option<&str>, revision: u64, kind: crate::logs::LimitKind, wake: f64) -> bool {
+    let Some(seen) = seen else { return false };
+    let mut parts = seen.splitn(3, ':');
+    let (Some(rev), Some(seen_kind), Some(at)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    rev == revision.to_string() && seen_kind == format!("{kind:?}") && at.parse::<f64>().is_ok_and(|at| (at - wake).abs() <= 600.0)
+}
+
 impl Notices {
     pub fn load() -> Self {
         Self { state: State::load() }
@@ -445,21 +467,22 @@ impl Notices {
         // 한도 도달·리셋은 선택 사항. 로그인 만료 알림은 기본으로 켬.
         let nap_on = self.state.pref_bool("napNotify", false);
         let login_on = self.state.pref_bool("loginNotify", true);
-        for (id, st) in snap.claude_statuses.iter().filter(|_| nap_on) {
-            let Some(provider) = snap.providers.iter().find(|p| p.account_id == *id) else { continue };
+        for provider in snap.providers.iter().filter(|p| nap_on && !snap.logged_out(&p.account_id)) {
+            let id = &provider.account_id;
             let state_key = format!("nap:{id}");
-            if let (Some(kind), Some(wake)) = (st.nap_kind, st.wake_at) {
-                let key = format!("{}:{kind:?}:{}", snap.revisions.get(id).copied().unwrap_or(0), wake as i64);
-                if self.state.get_str(&state_key) != Some(key.as_str()) {
-                    self.state.set_str(&state_key, &key);
+            let revision = snap.revisions.get(id).copied().unwrap_or(0);
+            if let Some((kind, wake)) = limit_hit(snap, provider) {
+                if !same_limit_hit(self.state.get_str(&state_key), revision, kind, wake) {
+                    self.state.set_str(&state_key, &format!("{revision}:{kind:?}:{}", wake as i64));
                     dirty = true;
-                    let (title, body) = texts::nap_notice(st);
+                    let (title, body) = texts::nap_notice(kind, wake, snap.now);
                     out.push((title, format!("{} · {body}", provider.name)));
                 }
             } else if prev.is_some_and(|previous| {
                 previous.revisions.get(id) == snap.revisions.get(id)
-                    && previous.claude_statuses.get(id).and_then(|status| status.wake_at)
-                        .is_some_and(|wake| wake <= snap.now)
+                    && previous.providers.iter().find(|p| p.account_id == *id)
+                        .and_then(|p| limit_hit(previous, p))
+                        .is_some_and(|(_, wake)| wake <= snap.now)
             }) {
                 let (title, body) = texts::wake_notice();
                 out.push((title, format!("{} · {body}", provider.name)));
@@ -1669,6 +1692,73 @@ mod tests {
             probes: HashMap::new(),
             claude_statuses: HashMap::new(), revisions: HashMap::new(),
         }
+    }
+
+    /// Codex 카드와 같은 모양: 리셋이 지난 창은 0%, 리셋 시각 없음
+    fn codex_snap(now: f64, windows: &[(&str, f64, f64)]) -> Snapshot {
+        let mut snap = reset_snap(now, now + HOUR, 0.0);
+        let view = &mut snap.providers[0];
+        (view.id, view.account_id, view.name) = (ProviderId::Codex, "codex-1".into(), "Codex".into());
+        view.meters = windows.iter().map(|&(label, ratio, reset)| {
+            let live = reset > now;
+            Meter { label: label.into(), ratio: if live { ratio } else { 0.0 }, resets_at: live.then_some(reset), exact: live }
+        }).collect();
+        snap
+    }
+
+    #[test]
+    fn codex_limit_reached_and_reset_alerts() {
+        let mut n = Notices { state: State::default() };
+        n.state.set_pref("loginNotify", serde_json::json!(false));
+        let cfg = Config::default();
+        let reset = time::now() + 2.0 * HOUR;
+        let weekly = reset + 3.0 * DAY;
+        let at = |now: f64, week_ratio: f64, five_reset: f64| codex_snap(now, &[("5시간", 1.0, five_reset), ("주간", week_ratio, weekly)]);
+        let first = at(reset - HOUR, 0.4, reset);
+        assert!(n.check(None, &first, &cfg).is_empty(), "기본은 한도 도달·리셋 알림 꺼짐");
+        n.state.set_pref("napNotify", serde_json::json!(true));
+        let sent = n.check(None, &first, &cfg);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "한도 도달");
+        assert!(sent[0].1.starts_with("Codex · 세션 한도 도달. "), "{}", sent[0].1);
+        // 다음 조회에서 리셋 시각이 몇 초 달라져도 같은 창은 한 번만
+        let later = at(reset - 1800.0, 0.4, reset + 3.0);
+        assert!(n.check(Some(&first), &later, &cfg).is_empty());
+        // 리셋 시각이 지나면 한 번 알림
+        let after = at(reset + 5.0, 0.4, reset + 3.0);
+        let woke = n.check(Some(&later), &after, &cfg);
+        assert_eq!(woke.len(), 1);
+        assert_eq!(woke[0], ("한도 리셋".into(), "Codex · 한도 리셋 완료. 다시 사용 가능.".into()));
+        assert!(n.check(Some(&after), &at(reset + 60.0, 0.4, reset + 3.0), &cfg).is_empty());
+        // 5시간·주간을 모두 다 쓰면 다시 쓸 수 있는 늦은 리셋(주간)으로 알림
+        let both = at(reset + 120.0, 1.0, reset + 5.0 * HOUR);
+        let sent = n.check(None, &both, &cfg);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].1.starts_with("Codex · 주간 한도 도달. "), "{}", sent[0].1);
+        // 로그아웃된 계정은 알리지 않음
+        let mut quiet = Notices { state: State::default() };
+        quiet.state.set_pref("loginNotify", serde_json::json!(false));
+        quiet.state.set_pref("napNotify", serde_json::json!(true));
+        let mut out = at(reset - HOUR, 0.4, reset);
+        out.logins.insert("codex-1".into(), LoginStatus { logged_in: Some(false), ..Default::default() });
+        assert!(quiet.check(None, &out, &cfg).is_empty());
+    }
+
+    #[test]
+    fn claude_limit_alerts_follow_the_rabbit_status() {
+        let mut n = Notices { state: State::default() };
+        n.state.set_pref("loginNotify", serde_json::json!(false));
+        n.state.set_pref("napNotify", serde_json::json!(true));
+        let cfg = Config::default();
+        let now = time::now();
+        let mut snap = reset_snap(now, now + HOUR, 0.3);
+        let mut st = Tracker::new().status(now);
+        (st.nap_kind, st.wake_at) = (Some(crate::logs::LimitKind::Weekly), Some(now + DAY));
+        snap.claude_statuses.insert("claude-1".into(), st);
+        let sent = n.check(None, &snap, &cfg);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].1.starts_with("Claude · 주간 한도 도달. "), "{}", sent[0].1);
+        assert!(n.check(Some(&snap), &snap, &cfg).is_empty(), "같은 창은 한 번만");
     }
 
     #[test]

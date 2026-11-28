@@ -221,14 +221,14 @@ export component SettingsView inherits Window {
                         if root.page == 2: Group {
                             PrefToggle { title: @tr("알림 받기"); subtitle: @tr("끄면 usAgI 알림이 모두 꺼짐"); key: "notify"; checked: root.prefs.notify; }
                             Rule {}
-                            PrefToggle { title: @tr("한도 도달·리셋 알림"); subtitle: @tr("Claude 한도에 도달했을 때와 한도가 리셋됐을 때 알림"); key: "napNotify"; checked: root.prefs.nap; }
+                            PrefToggle { title: @tr("한도 도달·리셋 알림"); subtitle: @tr("한도에 도달했을 때와 한도가 리셋됐을 때 알림"); key: "napNotify"; checked: root.prefs.nap; }
                             Rule {}
                             PrefToggle { title: @tr("로그인 만료 알림");
-                                subtitle: @tr("Claude는 만료 예정일 {}일 전부터 한 번 알림. 날짜를 모르면 다시 연결이 필요할 때 알림", root.prefs.login-warning-days);
+                                subtitle: @tr("만료 예정일을 알면 {}일 전부터 한 번 알림. 날짜를 모르면 다시 연결이 필요할 때 알림", root.prefs.login-warning-days);
                                 key: "loginNotify"; checked: root.prefs.login; }
                             Rule {}
                             VerticalLayout {
-                                SettingRow { title: @tr("리필권·쿠폰 만료 알림"); subtitle: @tr("리필권과 Claude 쿠폰이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경");
+                                SettingRow { title: @tr("리필권·쿠폰 만료 알림"); subtitle: @tr("리필권과 쿠폰이 만료되기 전에 한 번 알림. 계정별 설정은 아래에서 변경");
                                     Toggle { label: @tr("리필권·쿠폰 만료 알림"); checked: root.prefs.refill;
                                         clicked => { Actions.pref("refillNotify", !root.prefs.refill ? "true" : "false"); } }
                                 }
