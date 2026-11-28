@@ -81,11 +81,12 @@ pub struct Spend {
 
 impl Spend {
     fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let finite = |key| v.get(key).and_then(|r| r.as_f64()).filter(|n| n.is_finite());
         Some(Spend {
-            used_percentage: v.get("used_percentage")?.as_f64()?,
-            resets_at: v.get("resets_at").and_then(|r| r.as_f64()),
-            used_usd: v.get("used_usd").and_then(|r| r.as_f64()),
-            limit_usd: v.get("limit_usd").and_then(|r| r.as_f64()),
+            used_percentage: finite("used_percentage")?,
+            resets_at: v.get("resets_at").and_then(|r| r.as_f64()).and_then(time::timestamp),
+            used_usd: finite("used_usd"),
+            limit_usd: finite("limit_usd"),
             period: v.get("period").and_then(|r| r.as_str()).map(str::to_string),
         })
     }
@@ -192,8 +193,8 @@ pub fn read(account_id: &str) -> Option<BridgeFile> {
 
 fn window(v: &serde_json::Value) -> Option<BridgeWindow> {
     Some(BridgeWindow {
-        used_percentage: v.get("used_percentage")?.as_f64()?,
-        resets_at: v.get("resets_at").and_then(|r| r.as_f64()),
+        used_percentage: v.get("used_percentage")?.as_f64().filter(|p| p.is_finite())?,
+        resets_at: v.get("resets_at").and_then(|r| r.as_f64()).and_then(time::timestamp),
     })
 }
 
@@ -388,6 +389,18 @@ mod tests {
         assert_eq!(spend.label(), "추가 사용 $12.30 / $50 · 월");
         let pct_only = Spend { used_percentage: 37.0, resets_at: None, used_usd: None, limit_usd: None, period: None };
         assert_eq!(pct_only.label(), "추가 사용 37%");
+    }
+
+    #[test]
+    fn absurd_reset_times_are_clamped_to_a_sane_window() {
+        let input = r#"{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1e300},
+            "seven_day":{"used_percentage":20,"resets_at":-1e300},
+            "spend_limit":{"used_percentage":5,"resets_at":1e300}}}"#;
+        let (file, _) = parse_statusline(input, 1_900_000_000.0);
+        let file = file.unwrap();
+        assert_eq!(file.five_hour.unwrap().resets_at, Some(time::MAX_TIMESTAMP));
+        assert_eq!(file.seven_day.unwrap().resets_at, Some(0.0));
+        assert_eq!(file.spend.unwrap().resets_at, Some(time::MAX_TIMESTAMP));
     }
 
     #[test]

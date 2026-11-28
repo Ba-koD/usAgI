@@ -12,6 +12,24 @@ pub fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
+/// 외부에서 받은 시각(epoch 초)으로 믿을 수 있는 가장 늦은 값: 2100-01-01
+pub const MAX_TIMESTAMP: f64 = 4_102_444_800.0;
+
+/// 공급자·CLI·로그가 준 시각을 받아들일 때: 숫자가 아니거나 무한이면 버리고, 나머지는 1970~2100으로 맞춤.
+/// 터무니없는 값이 남은 시간 계산(`Duration`)까지 가서 앱이 멈추지 않게
+pub fn timestamp(at: f64) -> Option<f64> {
+    at.is_finite().then(|| at.clamp(0.0, MAX_TIMESTAMP))
+}
+
+/// 초 → `Duration`. 음수·NaN은 0, 너무 크면 `Duration::MAX` (`Duration::from_secs_f64`는 이런 값에서 패닉)
+pub fn duration_secs(seconds: f64) -> std::time::Duration {
+    std::time::Duration::try_from_secs_f64(seconds).unwrap_or(if seconds > 0.0 {
+        std::time::Duration::MAX
+    } else {
+        std::time::Duration::ZERO
+    })
+}
+
 fn system_tz() -> &'static TimeZone {
     static TZ: OnceLock<TimeZone> = OnceLock::new();
     TZ.get_or_init(TimeZone::system)
@@ -141,6 +159,21 @@ mod tests {
         assert_eq!(parse_iso("1970-01-01T00:00:00Z"), Some(0.0));
         assert_eq!(parse_iso("2026-06-18T08:10:56.000Z"), Some(1_781_770_256.0));
         assert_eq!(parse_iso("2026-06-18T17:10:56+09:00"), Some(1_781_770_256.0));
+    }
+
+    #[test]
+    fn untrusted_times_never_reach_a_panicking_duration() {
+        assert_eq!(timestamp(f64::NAN), None);
+        assert_eq!(timestamp(f64::INFINITY), None);
+        assert_eq!(timestamp(1e300), Some(MAX_TIMESTAMP));
+        assert_eq!(timestamp(-5.0), Some(0.0));
+        assert_eq!(timestamp(1_795_000_000.0), Some(1_795_000_000.0));
+        use std::time::Duration;
+        assert_eq!(duration_secs(f64::NAN), Duration::ZERO);
+        assert_eq!(duration_secs(-1.0), Duration::ZERO);
+        assert_eq!(duration_secs(1e300), Duration::MAX);
+        assert_eq!(duration_secs(f64::INFINITY), Duration::MAX);
+        assert_eq!(duration_secs(1.5), Duration::from_millis(1500));
     }
 
     #[test]

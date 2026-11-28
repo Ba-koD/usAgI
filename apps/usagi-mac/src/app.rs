@@ -181,8 +181,8 @@ pub fn run() {
             app.tray = None;
             *control_flow = ControlFlow::Exit;
         } else {
-            scheduled_tick = app.ctl.next_tick_delay(time::now()).map(|delay| {
-                let next = Instant::now() + delay;
+            // 아주 먼 시각은 Instant에 더하면 넘침 → 예약하지 않음 (다음 이벤트 때 다시 계산)
+            scheduled_tick = app.ctl.next_tick_delay(time::now()).and_then(|delay| Instant::now().checked_add(delay)).map(|next| {
                 scheduled_tick.map_or(next, |previous| previous.min(next))
             });
             *control_flow = scheduled_tick.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
