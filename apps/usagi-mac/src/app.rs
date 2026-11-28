@@ -2,6 +2,7 @@
 //!
 //! - 메뉴 막대: [로고] 5h 53%  7d 64%  │  [로고] 7d 92% (토끼 없이, 공급자 로고만)
 //! - 누르면: 설정 열기, 새로고침, 보기 바꾸기, 종료
+//! - 우클릭: 퍼센트 ↔ 남은 시간 (Windows 위젯 우클릭과 같음)
 //! - 설정 창: Windows와 같은 Slint 화면, 화면 상태와 명령 처리도 Windows와 같은
 //!   usagi-core 컨트롤러. 이 파일은 메뉴 막대·창·알림·로그인할 때 실행·업데이트 적용만 맡음.
 
@@ -13,7 +14,7 @@ use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use usagi_core::accounts::{self, Account};
 use usagi_core::config;
 use usagi_core::controller::{Controller, Effect, HostInfo, Platform};
@@ -24,6 +25,8 @@ use usagi_core::{b64, texts, time, ui};
 pub enum UserEvent {
     Snapshot,
     Menu(MenuEvent),
+    /// 메뉴 막대 항목 우클릭 (버튼을 놓을 때)
+    RightClick,
     SettingsInput,
     Update(UpdateEvent),
     /// 알림을 누름
@@ -108,6 +111,16 @@ pub fn run() {
             let _ = proxy.send_event(UserEvent::Menu(e));
         }));
     }
+    {
+        // 메뉴 막대 항목을 만들기 전에 등록 (먼저 이벤트가 나면 등록이 무시됨).
+        // 처리기가 없으면 tray-icon이 마우스 이동·클릭을 아무도 읽지 않는 큐에 계속 쌓으므로, 우클릭만 넘기고 나머지는 버림
+        let proxy = proxy.clone();
+        TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+            if let TrayIconEvent::Click { button: MouseButton::Right, button_state: MouseButtonState::Up, .. } = e {
+                let _ = proxy.send_event(UserEvent::RightClick);
+            }
+        }));
+    }
     let latest: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
     let engine = {
         let latest = latest.clone();
@@ -158,6 +171,7 @@ pub fn run() {
                 }
             }
             Event::UserEvent(UserEvent::Menu(e)) => app.on_menu(e.id().0.as_str()),
+            Event::UserEvent(UserEvent::RightClick) => app.on_right_click(),
             // 실행 중에 Finder·Launchpad에서 다시 열면 설정 창 (Windows에서 한 번 더 실행할 때와 같음)
             Event::Reopen { .. } | Event::UserEvent(UserEvent::OpenSettings) => app.open_settings(),
             Event::UserEvent(UserEvent::SettingsInput) => {
@@ -192,8 +206,14 @@ pub fn run() {
 
 impl App {
     fn create_tray(&mut self) {
-        // 토끼 아이콘 없이 글자만 (공급자 로고는 글자 안에)
-        match TrayIconBuilder::new().with_menu(Box::new(base_menu())).with_title("usAgI").with_tooltip("usAgI").build() {
+        // 토끼 아이콘 없이 글자만 (공급자 로고는 글자 안에). 메뉴는 왼쪽 클릭으로만, 우클릭은 보기 전환
+        match TrayIconBuilder::new()
+            .with_menu(Box::new(base_menu()))
+            .with_menu_on_right_click(false)
+            .with_title("usAgI")
+            .with_tooltip("usAgI")
+            .build()
+        {
             Ok(t) => {
                 log("메뉴 막대 항목 만듦");
                 self.tray = Some(t);
@@ -385,6 +405,15 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 우클릭: 퍼센트 ↔ 남은 시간 (메뉴의 "보기 바꾸기"와 같음)
+    fn on_right_click(&mut self) {
+        if let Some(t) = &self.tray {
+            crate::title::unhighlight(t);
+        }
+        let fx = self.ctl.toggle_mode();
+        self.run(fx);
     }
 
     // -------------------------------------------------------------- 설정 창

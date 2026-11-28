@@ -387,7 +387,7 @@ impl Controller {
         self.engine.check_logins();
     }
 
-    /// 퍼센트 ↔ 남은 시간 (위젯 우클릭, 메뉴 막대 메뉴)
+    /// 퍼센트 ↔ 남은 시간 (위젯·메뉴 막대 항목 우클릭, 메뉴 막대 메뉴)
     pub fn toggle_mode(&mut self) -> Vec<Effect> {
         let next = if self.time_mode() { "percent" } else { "time" };
         self.set_pref("mode", json!(next))

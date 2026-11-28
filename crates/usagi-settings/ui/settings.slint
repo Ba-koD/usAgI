@@ -281,7 +281,7 @@ export component SettingsView inherits Window {
                         }
                         if root.page == 1: Group {
                             title: @tr("모양"); dim: root.windows && !root.prefs.widget;
-                            SettingRow { title: @tr("표시 값"); subtitle: root.windows ? @tr("위젯을 우클릭해도 전환 가능") : @tr("메뉴 막대 메뉴에서도 변경 가능");
+                            SettingRow { title: @tr("표시 값"); subtitle: root.windows ? @tr("위젯을 우클릭해도 전환 가능") : @tr("메뉴 막대 항목을 우클릭해도 전환 가능");
                                 Segments { options: [@tr("퍼센트"), @tr("남은 시간")]; index: root.prefs.mode == "time" ? 1 : 0;
                                     selected(i) => { Actions.pref("mode", i == 0 ? "percent" : "time"); } } }
                             Rule {}

@@ -335,8 +335,8 @@ msgstr "Can also be switched by right-clicking the widget"
 
 #: ui/settings.slint:268
 msgctxt "SettingsView"
-msgid "메뉴 막대 메뉴에서도 변경 가능"
-msgstr "Can also be changed from the menu bar menu"
+msgid "메뉴 막대 항목을 우클릭해도 전환 가능"
+msgstr "Can also be switched by right-clicking the menu bar item"
 
 #: ui/settings.slint:269
 msgctxt "SettingsView"

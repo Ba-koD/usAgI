@@ -288,6 +288,13 @@ fn system_dark() -> bool {
         .is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark"))
 }
 
+/// 메뉴 막대 항목의 눌림 표시 끄기. tray-icon은 오른쪽 버튼을 누를 때 켜기만 하고 끄지 않음
+pub fn unhighlight(tray: &TrayIcon) {
+    if let Some(button) = MainThreadMarker::new().and_then(|mtm| tray.ns_status_item().and_then(|i| i.button(mtm))) {
+        button.highlight(false);
+    }
+}
+
 /// 지금 메뉴 막대가 어두운지 (로고 색을 바꿀 때)
 pub fn is_dark(tray: &TrayIcon) -> bool {
     system_dark()
