@@ -3,11 +3,12 @@
 //! - 처음 주소는 GitHub(`api.github.com`, `github.com`)의 https만. 리다이렉트도 https만, 최대 5번
 //!   (GitHub이 릴리스 파일을 다른 서버로 넘김)
 //! - 리다이렉트마다 프록시를 다시 골라요 ([`crate::net`], PAC는 호스트마다 답이 다를 수 있음)
-//! - 받는 크기는 [`MAX_ASSET_BYTES`]까지. 받은 파일 검증은 [`Release::verify_asset`]
+//! - 받는 크기는 릴리스 정보 [`MAX_RELEASE_JSON_BYTES`], 새 버전 파일 [`MAX_ASSET_BYTES`], 검증 정보 64 KiB까지.
+//!   받은 파일 검증은 [`Release::verify_asset`]
 //!
 //! 받은 파일을 어디에 두고 어떻게 바꿔 끼우는지는 플랫폼마다 달라서 각 앱의 updater가 해요.
 
-use super::{latest_api, parse_latest, Release, MAX_ASSET_BYTES};
+use super::{latest_api, parse_latest, Release, MAX_ASSET_BYTES, MAX_RELEASE_JSON_BYTES};
 use std::io::{Read, Write};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -48,7 +49,7 @@ pub fn check(asset: &str) -> Result<Option<Release>, String> {
 
 fn latest(asset: &str, current: &str, headers: &[(&str, &str)]) -> Result<Option<Release>, String> {
     let mut body = Vec::new();
-    let status = get(&latest_api(REPO), "application/vnd.github+json", headers, &mut body, MAX_ASSET_BYTES, SMALL_TIMEOUT)?;
+    let status = get(&latest_api(REPO), "application/vnd.github+json", headers, &mut body, MAX_RELEASE_JSON_BYTES, SMALL_TIMEOUT)?;
     match status {
         200 => parse_latest(&body, current, REPO, asset),
         404 => Err(crate::tr!("올라온 릴리스 없음", "No release published").into()),

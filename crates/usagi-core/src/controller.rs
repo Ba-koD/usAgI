@@ -34,6 +34,12 @@ const LOGIN_DONE_SHOW_SECS: f64 = 6.0;
 /// 자동 업데이트 확인: 시작 1분 뒤, 그다음 6시간마다
 const UPDATE_FIRST_SECS: f64 = 60.0;
 const UPDATE_EVERY_SECS: f64 = 6.0 * 60.0 * 60.0;
+/// 같은 버전의 받기·검증이 실패한 뒤 다음 자동 받기까지 기다리는 시간 (실패 횟수 순, 마지막 값에서 멈춤).
+/// 첫 실패는 평소 확인 주기와 같아 잠깐의 네트워크 오류로는 늦어지지 않고, 서명·체크섬이 맞지 않는 릴리스처럼
+/// 계속 실패하는 버전은 6시간마다 다시 받지 않아요. 직접 확인·설치를 누르면 바로 다시 시도.
+const UPDATE_RETRY_SECS: [f64; 4] = [UPDATE_EVERY_SECS, 24.0 * 3600.0, 3.0 * 24.0 * 3600.0, 7.0 * 24.0 * 3600.0];
+/// state.json에 남기는 마지막 업데이트 실패 ({version, failures, retryAt, error}). 앱을 다시 켜도 이어짐
+const UPDATE_FAILURE_KEY: &str = "updateFailure";
 
 /// 플랫폼 앱이 실행할 일
 #[derive(Debug, Clone, PartialEq)]
@@ -1327,17 +1333,56 @@ impl Controller {
             && (self.update.manual_install || self.auto_update())
     }
 
+    /// 이 버전의 자동 받기를 미루는 중이면 다음 자동 시도 시각과 지난 오류
+    fn update_backoff(&self, version: &str, now: f64) -> Option<(f64, String)> {
+        let failure = self.notices.state.0.get(UPDATE_FAILURE_KEY)?;
+        let retry_at = failure.get("retryAt").and_then(Value::as_f64)?;
+        (failure.get("version").and_then(Value::as_str) == Some(version) && now < retry_at)
+            .then(|| (retry_at, failure.get("error").and_then(Value::as_str).unwrap_or_default().to_string()))
+    }
+
+    /// 받기·검증 실패 기록. 같은 버전이 연달아 실패할수록 다음 자동 시도까지 오래 기다림
+    fn record_update_failure(&mut self, version: &str, error: &str, now: f64) {
+        let previous = self.notices.state.0.get(UPDATE_FAILURE_KEY)
+            .filter(|failure| failure.get("version").and_then(Value::as_str) == Some(version))
+            .and_then(|failure| failure.get("failures").and_then(Value::as_u64))
+            .unwrap_or(0);
+        let failures = previous.saturating_add(1);
+        let wait = UPDATE_RETRY_SECS[(failures as usize - 1).min(UPDATE_RETRY_SECS.len() - 1)];
+        self.notices.state.0.insert(
+            UPDATE_FAILURE_KEY.into(),
+            json!({"version": version, "failures": failures, "retryAt": now + wait, "error": error}),
+        );
+        self.notices.state.save();
+    }
+
+    fn clear_update_failure(&mut self) {
+        if self.notices.state.0.remove(UPDATE_FAILURE_KEY).is_some() {
+            self.notices.state.save();
+        }
+    }
+
     /// 업데이트 확인 결과 (manual = 사용자가 눌러서 확인)
     pub fn update_checked(&mut self, result: Result<Option<Release>, String>, manual: bool) -> Vec<Effect> {
+        let now = time::now();
         self.update.busy = None;
-        self.update.checked_at = Some(time::now());
+        self.update.checked_at = Some(now);
         let mut fx = Vec::new();
         match result {
             Ok(Some(rel)) => {
                 let ver = rel.version.clone();
                 let first = self.update.latest.as_ref().map(|x| &x.version) != Some(&ver);
                 self.update.latest = Some(rel);
-                if self.auto_update() && self.update.staged.is_none() {
+                let auto = self.auto_update() && self.update.staged.is_none();
+                let backoff = if manual { None } else { self.update_backoff(&ver, now) };
+                if let (true, Some((retry_at, error))) = (auto, backoff) {
+                    // 지난번 받기·검증이 실패한 버전: 다음 시도 시각까지 다시 받지 않고 지난 오류를 보여 줌
+                    let when = texts::fmt_clock(retry_at, now);
+                    self.update.error = Some(crate::tr!(
+                        format!("{error} (다음 자동 시도 {when})"),
+                        format!("{error} (next automatic try {when})")
+                    ));
+                } else if auto {
                     fx.extend(self.download_update(true));
                 } else if first || manual {
                     let how = self.managed_hint().unwrap_or_else(|| crate::tr!("설정 → 정보에서 업데이트 가능.", "Update from Settings → About.").into());
@@ -1347,7 +1392,10 @@ impl Controller {
                     ));
                 }
             }
-            Ok(None) => self.update.latest = None,
+            Ok(None) => {
+                self.update.latest = None;
+                self.clear_update_failure();
+            }
             Err(e) => self.update.error = Some(e),
         }
         fx.push(Effect::Push);
@@ -1360,6 +1408,7 @@ impl Controller {
         let mut fx = Vec::new();
         match result {
             Ok(path) => {
+                self.clear_update_failure();
                 self.update.staged = Some(path.clone());
                 self.update.latest = Some(release);
                 // 설정 창을 보고 있으면 끊지 않고 기다림 (닫을 때 적용)
@@ -1369,6 +1418,7 @@ impl Controller {
             }
             Err(e) => {
                 self.update.manual_install = false;
+                self.record_update_failure(&release.version, &e, time::now());
                 self.update.error = Some(e);
             }
         }
@@ -2049,6 +2099,50 @@ mod tests {
         assert!(!effects.iter().any(|e| matches!(e, Effect::ApplyUpdate(_))));
         let effects = ipc(&mut c, json!({"cmd": "installUpdate"}));
         assert!(effects.contains(&Effect::ApplyUpdate(PathBuf::from("new"))));
+    }
+
+    #[test]
+    fn failed_update_version_backs_off_and_is_remembered() {
+        let mut c = ctl("windows", None);
+        let downloads = |fx: &[Effect]| fx.iter().any(|e| matches!(e, Effect::DownloadUpdate { .. }));
+        let wait = |c: &Controller| c.state().0[UPDATE_FAILURE_KEY]["retryAt"].as_f64().unwrap() - time::now();
+        let near = |a: f64, b: f64| (a - b).abs() < 60.0;
+
+        // 첫 실패: 평소 확인 주기만큼 기다림
+        assert!(downloads(&c.update_checked(Ok(Some(rel("9.0.0"))), false)));
+        c.update_downloaded(rel("9.0.0"), Err("업데이트 서명 확인 실패".into()), true);
+        assert_eq!(c.state().0[UPDATE_FAILURE_KEY]["failures"], 1);
+        assert!(near(wait(&c), UPDATE_EVERY_SECS));
+
+        // 다음 자동 확인: 같은 버전은 다시 받지 않고 지난 오류와 다음 시도 시각을 보여 줌
+        assert!(!downloads(&c.update_checked(Ok(Some(rel("9.0.0"))), false)));
+        let st = c.settings_state(&HostInfo::default());
+        assert_eq!(st["update"]["status"], "error");
+        assert!(st["update"]["error"].as_str().unwrap().contains("업데이트 서명 확인 실패"));
+
+        // 앱을 다시 켜도 기록이 이어짐 (state.json)
+        let reopened = Controller::new(Engine::idle(), Platform { name: "windows", repo: "o/r", managed_update: None });
+        assert!(reopened.update_backoff("9.0.0", time::now()).is_some());
+        assert!(reopened.update_backoff("9.0.1", time::now()).is_none(), "다른 버전은 미루지 않음");
+
+        // 설치 단추와 직접 확인은 바로 다시 시도하고, 실패할수록 오래 기다림
+        assert!(downloads(&ipc(&mut c, json!({"cmd": "installUpdate"}))));
+        c.update_downloaded(rel("9.0.0"), Err("x".into()), true);
+        assert!(near(wait(&c), 24.0 * 3600.0));
+        assert!(downloads(&c.update_checked(Ok(Some(rel("9.0.0"))), true)));
+        c.update_downloaded(rel("9.0.0"), Err("x".into()), true);
+        assert!(near(wait(&c), 3.0 * 24.0 * 3600.0));
+        c.notices.state.0[UPDATE_FAILURE_KEY]["failures"] = json!(10);
+        c.notices.state.0[UPDATE_FAILURE_KEY]["retryAt"] = json!(time::now() - 1.0);
+        // 기다릴 시각이 지나면 자동으로 다시 받음
+        assert!(downloads(&c.update_checked(Ok(Some(rel("9.0.0"))), false)));
+        c.update_downloaded(rel("9.0.0"), Err("x".into()), true);
+        assert!(near(wait(&c), 7.0 * 24.0 * 3600.0), "최대 7일");
+
+        // 새 버전은 바로 받고, 성공하면 기록을 지움
+        assert!(downloads(&c.update_checked(Ok(Some(rel("9.0.1"))), false)));
+        c.update_downloaded(rel("9.0.1"), Ok(PathBuf::from("new")), false);
+        assert!(!c.state().0.contains_key(UPDATE_FAILURE_KEY));
     }
 
     #[test]
