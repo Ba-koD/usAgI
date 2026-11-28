@@ -139,8 +139,9 @@ pub(crate) fn apply(state: &mut State, key: &str, msg: &Value) {
 pub(crate) fn due(state: &mut State, key: &str, meter: &Meter, now: f64) -> Vec<Rule> {
     if !meter.exact || meter.resets_at.is_some_and(|reset| reset <= now) { return Vec::new(); }
     let Some(graph) = state.0.get_mut("alerts").and_then(|v| v.get_mut(key)) else { return Vec::new() };
-    if graph["on"].as_bool() == Some(false) { return Vec::new(); }
-    let Some(items) = graph["rules"].as_array_mut() else { return Vec::new() };
+    if graph.get("on").and_then(Value::as_bool) == Some(false) { return Vec::new(); }
+    // Mutable indexing panics when the stored entry is not an object.
+    let Some(items) = graph.get_mut("rules").and_then(Value::as_array_mut) else { return Vec::new() };
     // Use the provider's reset time when available, otherwise keep the legacy daily window.
     let stamp = stamp(meter, now);
     let mut triggered = Vec::new();
@@ -241,6 +242,17 @@ mod tests {
         assert!(due(&mut state, KEY, &meter, 68_000.0).is_empty());
         state.0.get_mut("alerts").unwrap()[KEY]["on"] = json!(true);
         assert_eq!(due(&mut state, KEY, &meter, 68_000.0).len(), 2);
+    }
+
+    #[test]
+    fn a_graph_entry_that_is_not_an_object_has_no_due_rules() {
+        let meter = Meter { label: "5시간".into(), ratio: 0.82, resets_at: Some(50_000.0), exact: true };
+        for entry in [json!(5), json!("on"), json!([1]), json!(null), json!({"rules": 7})] {
+            let mut state = State::default();
+            state.0.insert("alerts".into(), json!({KEY: entry}));
+            assert!(due(&mut state, KEY, &meter, 40_000.0).is_empty());
+            assert!(rules(&state, KEY).is_empty());
+        }
     }
 
     #[test]
