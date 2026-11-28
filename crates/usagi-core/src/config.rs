@@ -298,16 +298,15 @@ impl State {
         }
     }
 
+    /// 파일이 없으면 빈 설정. 읽지 못한 파일도 화면에는 빈 설정으로 보이지만, 저장은 [`Self::save_to`]가 막음
     pub fn load() -> Self {
         let path = Self::path();
-        let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
-        match serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.as_object().cloned()) {
+        let Ok(bytes) = std::fs::read(&path) else { return Self::default() };
+        match parse_state(&bytes) {
             Some(map) => State(map),
             None => {
-                // 읽을 수 없는 파일: 빈 설정으로 덮어쓰기 전에 보관해 둠 (설정이 사라지지 않게)
-                if !text.trim().is_empty() {
-                    let _ = std::fs::copy(&path, path.with_extension(format!("json.bad-{}", crate::time::now() as i64)));
-                }
+                // 형식이 깨진 파일: 빈 설정으로 덮어쓰기 전에 한 번 보관해 둠 (설정이 사라지지 않게)
+                let _ = back_up_unparsable(&path, &bytes);
                 Self::default()
             }
         }
@@ -322,7 +321,37 @@ impl State {
     }
 
     fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        // 읽지 못한 파일(권한 등)은 내용을 모르므로 덮어쓰지 않음. 깨진 파일은 보관본이 있어야 덮어씀
+        match std::fs::read(path) {
+            Ok(bytes) if parse_state(&bytes).is_none() => back_up_unparsable(path, &bytes)?,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         write_json(path, &self.0)
+    }
+}
+
+fn parse_state(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_slice::<serde_json::Value>(bytes).ok()? {
+        serde_json::Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// 깨진 state.json을 `state.json.bad-<내용 해시>`로 보관. 같은 내용은 한 번만 (불러올 때마다 쌓이지 않게)
+fn back_up_unparsable(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if bytes.trim_ascii().is_empty() {
+        return Ok(());
+    }
+    let hash = crate::sha256::hex(bytes);
+    let backup = path.with_extension(format!("json.bad-{}", &hash[..16]));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup) {
+        Ok(mut file) => std::io::Write::write_all(&mut file, bytes).inspect_err(|_| {
+            let _ = std::fs::remove_file(&backup);
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -480,6 +509,56 @@ mod tests {
         assert_eq!(mac_portable_dir(&executable_dir), Some(Portable::at(source.clone())));
         assert_eq!(std::fs::read(source.join("state.json")).unwrap(), b"state");
         assert_eq!(std::fs::read(destination.join("unrelated")).unwrap(), b"keep");
+    }
+
+    fn backups(path: &std::path::Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.bad-", path.file_name().unwrap().to_string_lossy());
+        let mut list: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap()).unwrap().flatten().map(|e| e.path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&prefix)).collect();
+        list.sort();
+        list
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_state_file_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = State::path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"prefs":{"locale":"en"},"accounts":[1]}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read(&path).is_ok(); // root는 권한과 상관없이 읽음
+        let mut state = State::load();
+        state.set_str("touched", "yes");
+        let saved = state.try_save();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        if readable { return; }
+        assert!(saved.is_err(), "읽지 못한 파일 위에 저장하면 안 됨");
+        assert_eq!(after, br#"{"prefs":{"locale":"en"},"accounts":[1]}"#);
+    }
+
+    #[test]
+    fn an_unparsable_state_file_is_backed_up_once_before_it_is_replaced() {
+        let path = State::path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for old in backups(&path) { let _ = std::fs::remove_file(old); }
+        std::fs::write(&path, b"{\"prefs\": broken").unwrap();
+        for _ in 0..3 {
+            assert!(State::load().0.is_empty());
+        }
+        let list = backups(&path);
+        assert_eq!(list.len(), 1, "같은 내용은 한 번만 보관");
+        assert_eq!(std::fs::read(&list[0]).unwrap(), b"{\"prefs\": broken");
+        // 보관본이 지워졌어도 저장 전에 다시 보관
+        std::fs::remove_file(&list[0]).unwrap();
+        let mut state = State::default();
+        state.set_str("fresh", "1");
+        state.try_save().unwrap();
+        assert_eq!(backups(&path).len(), 1);
+        assert_eq!(State::load().get_str("fresh"), Some("1"));
+        for file in backups(&path).into_iter().chain([path]) { let _ = std::fs::remove_file(file); }
     }
 
     #[test]
