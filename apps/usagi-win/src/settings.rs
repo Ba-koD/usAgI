@@ -36,18 +36,29 @@ const MARKER: &[u8; 16] = b"USAGISETTINGS001";
 const FOOTER_SIZE: u64 = 8 + MARKER.len() as u64;
 const MAX_UI_SIZE: u64 = 64 * 1024 * 1024;
 
+/// exe 옆의 usagi-settings.exe를 써도 되는 빌드: 개발(디버그)·테스트(mock) 빌드만.
+/// 배포 exe는 내려받기 폴더에서 실행되기도 하므로, 옆에 있는 같은 이름의 파일을 실행하지 않고 내장된 설정 창만 씀
+const SIBLING_ALLOWED: bool = cfg!(any(debug_assertions, feature = "mock"));
+
 fn program(host: &Path) -> io::Result<SettingsProgram> {
     let mut exe = File::open(host)?;
     let Some(size) = packed_size(&mut exe)? else {
         // Cargo builds both binaries side by side for local development.
         let sibling = host.with_file_name(SETTINGS_EXE);
-        if sibling.is_file() {
+        if SIBLING_ALLOWED && sibling.is_file() {
             return Ok(SettingsProgram::new(sibling));
         }
-        return Err(io::Error::new(io::ErrorKind::NotFound, usagi_core::tr!(
-            "설정 실행 파일 없음. 배포 파일을 다시 받거나 usagi-settings를 함께 빌드",
-            "Settings executable missing. Download usAgI again or build usagi-settings alongside it"
-        )));
+        return Err(io::Error::new(io::ErrorKind::NotFound, if SIBLING_ALLOWED {
+            usagi_core::tr!(
+                "설정 실행 파일 없음. 배포 파일을 다시 받거나 usagi-settings를 함께 빌드",
+                "Settings executable missing. Download usAgI again or build usagi-settings alongside it"
+            )
+        } else {
+            usagi_core::tr!(
+                "설정 창이 들어 있지 않은 실행 파일. 배포 파일을 다시 받거나 scripts\\package-portable.ps1로 묶기",
+                "This executable has no settings window. Download usAgI again or bundle it with scripts\\package-portable.ps1"
+            )
+        }));
     };
     let directory = tempfile::Builder::new().prefix("usagi-settings-").tempdir()?;
     let path = directory.path().join(SETTINGS_EXE);

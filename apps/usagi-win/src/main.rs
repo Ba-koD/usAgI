@@ -2,6 +2,7 @@
 //!
 //!   usagi.exe                               앱 실행 (이미 떠 있으면 설정 창을 엶)
 //!   usagi.exe --autostart                   로그인할 때 자동 실행 (이미 떠 있으면 조용히 끝냄)
+//!   usagi.exe --installed <pid>             설치 위치로 옮긴 사본의 첫 실행 (예전 프로세스를 기다린 뒤 설정 창)
 //!   usagi.exe statusline --account <id>     Claude Code 상태 표시줄 브리지 (stdin JSON → 사용량 기록)
 //!   usagi.exe --status                      현재 상태를 출력 (확인용)
 //!   usagi.exe --monitors                    모니터 목록 출력 (확인용)
@@ -10,6 +11,7 @@
 
 mod app;
 mod autostart;
+mod install;
 mod settings;
 mod toast;
 mod tray;
@@ -23,6 +25,12 @@ use std::process::Command;
 use usagi_core::{bridge, config, engine, texts};
 
 fn main() {
+    // 가장 먼저: 실행 중에 읽는 DLL은 System32에서만 찾음. 이 exe의 폴더(내려받기 등)와 작업 폴더는 찾지 않음.
+    // exe가 가져다 쓰는 DLL은 링크 설정(/DEPENDENTLOADFLAG, build.rs)이 같은 규칙을 적용
+    unsafe {
+        use windows_sys::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|arg| arg == uia::HELPER_ARG) {
         if uia::run_helper(&args[2..]).is_err() {
@@ -73,9 +81,16 @@ fn main() {
             if let Some(pid) = args.get(2).and_then(|p| p.parse().ok()) {
                 updater::wait_for(pid);
             }
-            app::run(false);
+            app::run(app::Start::Normal);
         }
-        Some(autostart::ARG) => app::run(true),
+        Some(install::ARG) => {
+            // 설치 위치로 옮긴 사본: 예전 프로세스가 끝나길 기다린 뒤 설정 창을 열어 이어서 설정
+            if let Some(pid) = args.get(2).and_then(|p| p.parse().ok()) {
+                updater::wait_for(pid);
+            }
+            app::run(app::Start::Installed);
+        }
+        Some(autostart::ARG) => app::run(app::Start::Autostart),
         Some("--check-update") => match updater::check() {
             Ok(Some(r)) => println!("새 버전 v{} (지금 v{}) · {}", r.version, usagi_core::VERSION, r.page),
             Ok(None) => println!("최신 버전 (v{}) · {}", usagi_core::VERSION, updater::REPO),
@@ -96,7 +111,7 @@ fn main() {
                 Err(e) => println!("{e}"),
             }
         }
-        _ => app::run(false),
+        _ => app::run(app::Start::Normal),
     }
 }
 

@@ -31,6 +31,7 @@ pub mod controller;
 pub mod engine;
 pub mod fallback;
 pub mod i18n;
+pub mod location;
 pub mod login;
 mod log_watch;
 pub mod logos;

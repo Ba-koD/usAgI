@@ -63,18 +63,26 @@ pub fn log(msg: &str) {
     }
 }
 
-/// Finder에서 실행한 앱은 터미널의 PATH를 모름 → 로그인 셸에서 PATH를 받아 옴 (claude, codex, node 찾기)
+/// Finder에서 실행한 앱은 터미널의 PATH를 모름 → 로그인 셸에서 PATH를 받아 옴 (claude, codex, node 찾기).
+/// rc 파일이 다른 글자를 출력해도 표시 사이의 값만 읽고, 상대 경로 항목(빈 항목·`.` 등)은 뺌. 셸이 멈추면 5초 뒤 포기
 fn fix_path() {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    if let Ok(out) = Command::new(&shell).args(["-lc", "printf %s \"$PATH\""]).output() {
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !p.is_empty() {
-            std::env::set_var("PATH", p);
-            return;
-        }
+    let shell = std::env::var_os("SHELL")
+        .map(std::path::PathBuf::from)
+        .filter(|shell| shell.is_absolute() && shell.is_file())
+        .unwrap_or_else(|| "/bin/zsh".into());
+    let mut command = Command::new(&shell);
+    command.args(["-lc", usagi_core::login::LOGIN_PATH_SCRIPT]);
+    let found = usagi_core::login::run_bounded_command(command, "", std::time::Duration::from_secs(5))
+        .as_deref()
+        .and_then(usagi_core::login::parse_login_path);
+    if let Some(path) = found {
+        std::env::set_var("PATH", path);
+        return;
     }
     let cur = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{cur}"));
+    let fallback = format!("/opt/homebrew/bin:/usr/local/bin:{cur}");
+    let path = usagi_core::login::absolute_paths(fallback.as_ref()).unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    std::env::set_var("PATH", path);
 }
 
 pub fn run() {
@@ -227,6 +235,8 @@ impl App {
                         self.ctl.set_error(e);
                     }
                 }
+                // macOS 앱은 Finder·설치 스크립트로 옮김 (화면에도 옮기기 단추를 보이지 않음)
+                Effect::InstallCopy => {}
                 Effect::CloseSettings => {
                     self.settings = None;
                     queue.extend(self.ctl.settings_closed());
@@ -536,6 +546,10 @@ fn set_autostart(on: bool) -> Result<(), String> {
                 format!("Could not turn off start at login ({error})")
             )),
         };
+    }
+    // 내려받기·임시 폴더(격리된 앱이 옮겨져 실행되는 App Translocation 포함)의 경로는 등록하지 않음
+    if let Some(kind) = usagi_core::location::current() {
+        return Err(kind.blocked(("로그인 시 실행", "start at login")));
     }
     let app = app_path().ok_or(usagi_core::tr!("앱 위치 찾기 실패", "Couldn't find the app location"))?;
     let target = app.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;");

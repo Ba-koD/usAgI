@@ -16,7 +16,7 @@ mock = ["usagi-core/mock"]
 [dependencies]
 usagi-core = { path = "../../crates/usagi-core" }
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }
-windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Storage_EnhancedStorage", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Accessibility"] }
+windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Storage_EnhancedStorage", "Win32_Storage_FileSystem", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_TaskScheduler", "Win32_System_Variant", "Win32_UI_Accessibility"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 flate2 = "1"

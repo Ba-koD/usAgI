@@ -84,16 +84,42 @@ minisign -Vm usagi.exe -p packaging/usagi-update.pub
 - 프로필과 캐시 삭제는 계정 목록과 알림 설정을 저장한 후 시작. 저장 실패 시 등록과 프로필 유지
 - **신규 로그인 취소**: 등록 전 프로필은 대체 프로필로 사용하지 않으며, 취소하면 해당 폴더 정리. 남은 미등록 폴더는 설정의 **일반 → 보관된 프로필**에서 정리 가능
 
+### 실행 위치를 믿지 않음
+
+Windows `usagi.exe`는 설치 없이 내려받기 폴더에서 바로 실행하기도 함. 그 폴더와 작업 폴더에는 다른 파일이 쉽게 생기므로, 실행 파일 옆이나 작업 폴더의 파일을 읽거나 실행하지 않음. exe는 자주 다시 실행되므로(작업 표시줄 좌표 확인, 상태 표시줄 갱신, 로그온 작업) 처음 실행한 뒤에 생긴 파일도 같은 규칙.
+
+- **DLL 검색**: 두 Windows 실행 파일(`usagi.exe`, `usagi-settings.exe`)
+  - C 런타임 정적 링크 (`.cargo/config.toml`의 `+crt-static`, MSVC 전체 빌드). `VCRUNTIME140.dll`·`api-ms-win-crt-*`를 찾지 않음
+  - 링크할 때 `/DEPENDENTLOADFLAG:0x800` (각 `build.rs`): 가져다 쓰는 DLL(`dwmapi`·`winhttp`·`secur32`·`ncrypt`·`crypt32` 등)은 System32에서만
+  - `main` 맨 처음 `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`: 실행 중에 읽는 DLL도 System32에서만
+  - CI(`ci.yml` Windows, `release.yml` Windows 빌드)가 `scripts/check-windows-pe.ps1`로 `dumpbin /dependents /loadconfig` 결과를 출력하고, 플래그가 0x800이 아니거나 동적 C 런타임을 쓰면 실패
+- **CLI 실행**: 공식 CLI는 모두 `login::quiet_command`로 실행
+  - 작업 폴더는 설정 폴더(이 사용자 전용)로 고정. Claude Code의 프로젝트 설정·`CLAUDE.md`도 읽지 않음
+  - Windows는 `NoDefaultCurrentDirectoryInExePath=1`: npm의 `codex.cmd`가 부르는 `node`를 cmd.exe가 작업 폴더에서 먼저 찾지 않게
+  - PATH에서 찾을 때 빈 항목·`.`·상대 경로는 건너뛰고 항상 절대 경로로 실행 (이름만 주면 Windows는 exe 폴더를 먼저 찾음)
+  - macOS는 로그인 셸에서 PATH를 받을 때 5초 제한, 표시 사이의 값만 읽고 상대 경로 항목은 뺌
+- **포터블 data 폴더**: exe 옆 `data`(macOS는 앱 옆 `<앱 이름>.data`)는 `usagi.portable`·`config.toml`·`state.json` 중 하나가 있고 아래를 모두 만족할 때만 사용 (`state.json`이 상태 표시줄 명령과 실행할 CLI 위치를 정하므로)
+  - 링크(심볼릭 링크·정션)가 아닌 실제 폴더, `config.toml`·`state.json`도 링크가 아닌 파일
+  - 소유자가 지금 사용자 (Windows는 SYSTEM·관리자 그룹도 허용)
+  - 다른 사용자에게 쓰기 권한이 없음 (Unix: 그룹·기타 쓰기 비트 없음, Windows: 다른 계정에 파일 만들기·삭제·권한 변경 허용 없음. 권한이 없는 FAT·exFAT 드라이브는 사용 안 함)
+  - 쓰기로 하면 data 폴더 전체를 이 사용자 전용으로 바꿈 (이미 전용이면 그대로). 조건에 맞지 않으면 기본 설정 폴더를 쓰고 시작할 때 알림
+  - exe 옆의 예전 표시 파일 `usagi.portable`만으로는 포터블 모드가 되지 않음
+- **설정 실행 파일**: 배포 빌드는 exe에 내장된 설정 창만 실행. exe 옆 `usagi-settings.exe`는 디버그·`mock` 빌드에서만 사용
+- **등록**: 내려받기·임시 폴더(macOS App Translocation 포함)에서 실행 중이면 시작 시 실행, 시작 메뉴 바로 가기, Claude Code 상태 표시줄 명령을 등록하지 않음 (`usagi_core::location`)
+  - 설정 → 일반에 이유를 표시. Windows 설치형은 **설치 위치로 옮기기**로 `%LOCALAPPDATA%\Programs\usAgI`(`scripts/install-windows.ps1`과 같은 위치)에 복사하고 그 사본으로 다시 시작
+  - 시작할 때 대상 exe가 없어진 로그온 작업·Run 값·시작 메뉴 바로 가기를 지움. 상태 표시줄은 지금 위치로 다시 걸거나, 걸 수 없으면 원래 상태 표시줄로 되돌림
+- **로그온 작업 XML**: `schtasks /XML`에 넘기는 파일은 임시 폴더에 임의 이름으로 새로 만들고(같은 이름의 파일·링크를 열지 않음) 등록 후 지움
+
 ## 빌드
 
 ```powershell
 cargo test -p usagi-core
 cargo test -p usagi-core real_release -- --ignored  # 실제 GitHub 릴리스로 확인·받기·서명 검증 (네트워크)
-cargo build --release -p usagi-win -p usagi-settings  # 개발용, 두 파일을 같은 폴더에서 실행
+cargo build -p usagi-win -p usagi-settings  # 개발용(디버그), 두 파일을 같은 폴더에서 실행
 scripts\package-portable.ps1              # 로컬 포터블 묶음 dist\usAgI-portable-x.y.z.zip
 ```
 
-Windows 배포용 `dist/release/usagi.exe`는 포터블 패키지 스크립트가 설정 실행 파일을 압축해 내장함. macOS는 `bash scripts/package-mac.sh`가 본체와 설정 실행 파일을 같은 앱에 넣고 `dist/release/usAgI-mac.zip`을 생성함.
+Windows 배포용 `dist/release/usagi.exe`는 포터블 패키지 스크립트가 설정 실행 파일을 압축해 내장함. 릴리스 프로필로 빌드한 `usagi.exe`는 옆의 `usagi-settings.exe`를 실행하지 않으므로 패키지 스크립트로 묶어서 확인. macOS는 `bash scripts/package-mac.sh`가 본체와 설정 실행 파일을 같은 앱에 넣고 `dist/release/usAgI-mac.zip`을 생성함.
 
 빌드 프로필 (`Cargo.toml`)
 - `release`: 로컬 개발용. thin LTO라 다시 빌드가 빠름
@@ -101,8 +127,8 @@ Windows 배포용 `dist/release/usagi.exe`는 포터블 패키지 스크립트�
 - `settings-release`: 설정 창. 크기 우선(`opt-level = "z"`), 코드는 16개로 나눠 병렬 생성하고 링크 때 fat LTO로 다시 최적화
 
 테스트 빌드
-- 포터블 사본(exe 옆 `data\usagi.portable`)은 데이터 폴더마다 따로 실행되므로, 설치형을 그대로 둔 채 옆에서 띄워 확인 가능
-- `cargo build --release -p usagi-win --features mock`: 가짜 사용량만 보내는 화면 확인용 빌드 (CLI·네트워크·로그 읽기 없음, 자동 실행·알림 등록·업데이트는 건드리지 않음, 포터블 data 폴더가 있어야 실행)
+- 포터블 사본(exe 옆 `data\usagi.portable`)은 데이터 폴더마다 따로 실행되므로, 설치형을 그대로 둔 채 옆에서 띄워 확인 가능. data 폴더는 이 사용자만 쓸 수 있는 NTFS 폴더여야 함 (보안 참고)
+- `cargo build --release -p usagi-win --features mock`: 가짜 사용량만 보내는 화면 확인용 빌드 (CLI·네트워크·로그 읽기 없음, 자동 실행·알림 등록·업데이트·설치 위치로 옮기기는 건드리지 않음, 포터블 data 폴더가 있어야 실행. 옆의 `usagi-settings.exe` 사용)
 
 `USAGI_UPDATE_REPO=owner/name`을 지정하고 빌드하면 그 저장소에서 업데이트 수신 (릴리스 빌드는 자동 지정).
 

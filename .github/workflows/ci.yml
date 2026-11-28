@@ -2,7 +2,7 @@
 #
 # - 실제 릴리스 빌드와 묶기는 release.yml(Build & Release)이 해요. 버전을 올린 커밋을 main에 올렸을 때만
 #   빌드하고, 그 밖의 main 푸시는 여기서 가볍게 확인만 해요.
-# - 릴리스 최적화(LTO) 없이 cargo check로 컴파일만 확인해서 빨라요.
+# - 릴리스 최적화(LTO) 없이 cargo check로 컴파일만 확인해서 빨라요. Windows만 링크까지 해서 실행 파일의 DLL 검색 보호를 확인해요.
 # - Windows·macOS는 실제 GitHub 릴리스로 업데이트를 받아 검증하고, OS 프록시를 거쳐서도 받아지는지 확인해요.
 # - Linux 줄은 앱이 아직 없어서 공통 로직과 서명 도구만 (게시 단계가 Linux에서 서명 도구를 빌드하므로 미리 확인).
 # - Linux 줄은 업데이트 공개 키가 고정 값과 같은지, 설치 스크립트에 넣은 키도 같은지 확인해요 (scripts/check-update-key.sh).
@@ -122,4 +122,15 @@ jobs:
         run: |
           args=(-p "$APP")
           if [[ "$APP" == usagi-win || "$APP" == usagi-mac ]]; then args+=(-p usagi-settings); fi
-          cargo check "${args[@]}" --locked
+          # Windows는 링크까지 해서 아래 단계가 실행 파일의 DLL 검색 설정을 확인
+          if [[ "$RUNNER_OS" == Windows ]]; then cargo build "${args[@]}" --locked; else cargo check "${args[@]}" --locked; fi
+
+      # 가져다 쓰는 DLL 목록 출력, System32에서만 찾는지(DependentLoadFlags 0x800)와 정적 C 런타임인지 확인
+      - name: DLL 검색 보호 확인 (dumpbin)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/check-windows-pe.ps1 target/debug/usagi.exe target/debug/usagi-settings.exe
+
+      - name: Windows 앱 테스트
+        if: runner.os == 'Windows'
+        run: cargo test -p usagi-win --locked

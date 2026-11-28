@@ -382,6 +382,19 @@ impl App {
                         self.ctl.set_error(error);
                     }
                 }
+                Effect::InstallCopy => {
+                    if cfg!(feature = "mock") {
+                        self.ctl.set_error(usagi_core::tr!("테스트 빌드: 설치 위치로 옮기지 않음", "Test build: not moved to the install folder"));
+                    } else {
+                        match crate::install::copy_and_restart() {
+                            Ok(_) => {
+                                self.quit();
+                                return;
+                            }
+                            Err(error) => self.ctl.set_error(error),
+                        }
+                    }
+                }
                 Effect::CloseSettings => {
                     self.settings = None;
                     queue.extend(self.ctl.settings_closed());
@@ -501,6 +514,7 @@ impl App {
             urgent_supported: crate::toast::urgent_supported(),
             urgent_allowed: crate::toast::urgent_allowed(),
             monitors,
+            install_dir: crate::install::available().map(|dir| dir.to_string_lossy().into_owned()),
         }
     }
 
@@ -808,8 +822,18 @@ fn shell_open(path: &str) {
 
 // ------------------------------------------------------------------ 시작
 
-/// `from_autostart`: 로그인할 때 자동 실행으로 시작됨 (이미 떠 있으면 설정 창을 열지 않고 끝냄)
-pub fn run(from_autostart: bool) {
+/// 어떻게 시작됐는지
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    Normal,
+    /// 로그인할 때 자동 실행 (이미 떠 있으면 설정 창을 열지 않고 끝냄)
+    Autostart,
+    /// 설치 위치로 옮긴 사본의 첫 실행 (설정 창을 열어 이어서 설정)
+    Installed,
+}
+
+pub fn run(start: Start) {
+    let from_autostart = start == Start::Autostart;
     // 테스트 빌드는 exe 옆 data 폴더(포터블)에서만 실행: 실제 %APPDATA%\usAgI 설정·계정을 절대 읽거나 쓰지 않게
     if cfg!(feature = "mock") && !config::is_portable() {
         unsafe {
@@ -869,8 +893,10 @@ pub fn run(from_autostart: bool) {
     #[cfg(not(feature = "mock"))]
     {
         crate::toast::refresh_icon();
-        // 설치형일 때만 시작 메뉴 바로 가기 (포터블은 흔적을 남기지 않음)
-        if !config::is_portable() {
+        // 가리키는 exe가 없어진 바로 가기는 지우고, 설치형이 고정 위치에서 실행될 때만 시작 메뉴 바로 가기
+        // (포터블은 흔적을 남기지 않음, 내려받기·임시 폴더의 exe는 등록하지 않음)
+        crate::toast::remove_stale_shortcut();
+        if !config::is_portable() && usagi_core::location::current().is_none() {
             if let Ok(exe) = std::env::current_exe() {
                 let _ = crate::toast::ensure_shortcut(&exe);
             }
@@ -913,7 +939,7 @@ pub fn run(from_autostart: bool) {
             crate::autostart::refresh();
             let fx = app.ctl.startup();
             app.run(fx);
-            if !from_autostart && usagi_core::accounts::load(app.ctl.state()).is_empty() {
+            if start == Start::Installed || (!from_autostart && usagi_core::accounts::load(app.ctl.state()).is_empty()) {
                 app.open_settings();
             }
         }
