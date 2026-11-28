@@ -5,15 +5,17 @@
 # - 릴리스 최적화(LTO) 없이 cargo check로 컴파일만 확인해서 빨라요.
 # - Windows·macOS는 실제 GitHub 릴리스로 업데이트를 받아 검증하고, OS 프록시를 거쳐서도 받아지는지 확인해요.
 # - Linux 줄은 앱이 아직 없어서 공통 로직과 서명 도구만 (게시 단계가 Linux에서 서명 도구를 빌드하므로 미리 확인).
+# - Linux 줄은 업데이트 공개 키가 고정 값과 같은지, 설치 스크립트에 넣은 키도 같은지 확인해요 (scripts/check-update-key.sh).
+#   그래서 설치 스크립트만 바뀌어도 돌아요.
 # - 같은 브랜치·PR에 새로 올리면 이전 실행은 취소해요. 문서만 바뀌면 돌지 않아요.
 name: CI
 
 on:
   push:
     branches: [main]
-    paths-ignore: ["**.md", "scripts/install-mac.sh", "scripts/release.ps1"]
+    paths-ignore: ["**.md", "scripts/release.ps1"]
   pull_request:
-    paths-ignore: ["**.md", "scripts/install-mac.sh", "scripts/release.ps1"]
+    paths-ignore: ["**.md", "scripts/release.ps1"]
   workflow_dispatch:
 
 permissions:
@@ -51,6 +53,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: 업데이트 공개 키 고정 확인
+        if: runner.os == 'Linux'
+        run: bash scripts/check-update-key.sh
+
+      # 릴리스 본문의 검증 정보를 만들고 읽는 스크립트 (게시·수동 재서명이 사용)
+      - name: 릴리스 검증 정보 스크립트 확인
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: ./scripts/test-release-verification.ps1
 
       # 러너에 설치된 rustup을 그대로 씀 (서드파티 액션을 거치지 않음)
       - name: Rust 준비

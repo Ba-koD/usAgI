@@ -2,7 +2,7 @@
 #
 #   main에 올리면   Cargo.toml·Cargo.lock이 바뀐 푸시만 실행 (버전을 올리면 항상 바뀜).
 #                   빌드는 바로 시작하고, 버전(Cargo.toml)이 아직 게시되지 않았고 CHANGELOG에 그 버전 섹션이
-#                   있으면 묶기 → 게시. 태그(v<버전>)는 게시할 때 여기서 만들어요.
+#                   있으면 묶기 → 서명(승인 필요) → 게시. 태그(v<버전>)는 게시할 때 여기서 만들어요.
 #                   의존성만 바뀐 푸시는 빌드만 해서 의존성 캐시를 미리 새로 만들어 둬요 (게시 안 함).
 #   수동 실행       빌드만 (산출물은 실행 페이지에서 받기). main에서 "publish"를 켜면 게시까지.
 #
@@ -14,6 +14,9 @@
 #     지난번과 같으면 큰 캐시를 다시 올리지 않아요. 버전만 올린 릴리스는 저장 시간을 아껴요.
 #   - 동시 빌드: 본체·설정 창·테스트·서명 도구를 각자 다른 러너에서 준비 단계를 기다리지 않고 바로 시작해요.
 #     가장 오래 걸리는 설정 창 빌드가 끝나는 대로 묶기와 게시가 이어져요. Mac은 ARM·Intel도 따로 빌드한 뒤 합쳐요.
+#   - 서명: 비밀 키를 쓰는 작은 작업 하나로 따로 떼어 release-signing 환경에 묶었어요. 비밀 키는 그 환경에만 있고,
+#     환경은 main에서만 쓰이며 승인자가 승인해야 시작해요 (저장소 설정: docs/DEVELOPMENT.md "저장소 설정").
+#     main에 버전을 올린 푸시만으로는 서명되지 않아요. 공개 키가 비었거나 비밀값이 없으면 건너뛰지 않고 실패해요.
 #   - 게시: 모든 파일을 초안 릴리스에 올린 뒤 한 번에 공개해요. 앱의 자동 업데이트가
 #     파일이 덜 올라간 릴리스를 보는 일이 없어요.
 name: Build & Release
@@ -62,6 +65,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # 앱에 들어갈 공개 키가 고정 값과 다르면(또는 비었으면) 빌드하지 않음
+      - name: 업데이트 공개 키 확인
+        run: bash scripts/check-update-key.sh
 
       - name: 게시할지 확인
         id: ver
@@ -563,9 +570,78 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # 서명: 비밀 키를 쓰는 유일한 작업. 비밀 키(UPDATE_SIGNING_KEY)는 저장소가 아니라 release-signing 환경에 두고,
+  # 그 환경은 main에서만 쓰이고 승인자가 승인해야 시작해요. 승인 전에는 이 작업이 비밀값을 읽지 못해요.
+  # 승인 화면에서 실행의 커밋과 버전이 직접 올린 것인지 확인 (빌드가 모두 끝난 뒤 승인을 기다림).
+  # 비밀값이 보이는 곳을 줄이려고 공식 액션(체크아웃·산출물 받기·올리기)과 이 실행에서 만든 서명 도구만 실행하고,
+  # 결과는 .minisig 파일만 넘겨요. 릴리스를 만들고 고치는 권한(contents: write)은 이 작업에 없어요.
+  sign:
+    name: 서명 (승인 필요)
+    needs: [prepare, test, signer, win-package, mac-package]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-signing
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      HAS_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY != '' }}
+    steps:
+      # 서명 도구는 빌드할 때의 저장소 경로에서 공개 키(packaging/usagi-update.pub)를 읽으므로 같은 자리에 체크아웃
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: out
+          merge-multiple: true
+
+      # 같은 실행에서 이 커밋으로 미리 빌드한 서명 도구 (이 작업에서 Rust를 설치·컴파일하지 않음)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signer
+          path: signer-bin
+
+      # 설치된 앱은 서명이 없거나 맞지 않는 업데이트를 받지 않음. 서명을 건너뛰고 게시하지 않도록 모두 실패로 처리
+      - name: 서명 준비 확인 (공개 키·비밀값·파일)
+        run: |
+          bash scripts/check-update-key.sh
+          if [[ "$HAS_SIGNING_KEY" != "true" ]]; then
+            echo "::error::UPDATE_SIGNING_KEY 비밀값 없음 (release-signing 환경에 등록). 서명 없는 릴리스는 게시하지 않음"
+            exit 1
+          fi
+          for f in usagi.exe usAgI-mac.zip; do
+            [[ -s "out/$f" ]] || { echo "::error::$f 없음"; exit 1; }
+          done
+
+      # 비밀 키는 이 단계에만 전달하고 끝나면 지움. 서명 도구가 비밀 키와 저장소 공개 키가 짝인지도 확인
+      - name: 서명 (.minisig)
+        env:
+          USAGI_SIGN_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          USAGI_SIGN_PASSWORD: ${{ secrets.UPDATE_SIGNING_PASSWORD }}
+        run: |
+          chmod +x signer-bin/usagi-sign
+          key="$RUNNER_TEMP/update-signing.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077; printf '%s\n' "$USAGI_SIGN_KEY" > "$key")
+          signer-bin/usagi-sign sign --version "$VERSION" --key "$key" \
+            out/usagi.exe out/usAgI-mac.zip
+          # 수동 확인용 기록 (승인한 실행이 서명한 파일)
+          sha256sum out/usagi.exe out/usAgI-mac.zip
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signatures
+          path: |
+            out/usagi.exe.minisig
+            out/usAgI-mac.zip.minisig
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: 게시
-    needs: [prepare, test, signer, win-package, mac-package]
+    needs: [prepare, sign]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -577,7 +653,6 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
       HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
-      HAS_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -589,7 +664,11 @@ jobs:
           path: out
           merge-multiple: true
 
-      # 같은 실행에서 이 커밋으로 미리 빌드한 서명 도구 (게시 단계에서 Rust를 설치·컴파일하지 않음)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signatures
+          path: out
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: signer
@@ -598,59 +677,33 @@ jobs:
       - name: 게시 파일 확인
         working-directory: out
         run: |
-          for f in usagi.exe usagi.exe.sha256 usAgI-mac.zip usAgI-mac.zip.sha256 notes.md; do
+          for f in usagi.exe usagi.exe.sha256 usagi.exe.minisig usAgI-mac.zip usAgI-mac.zip.sha256 usAgI-mac.zip.minisig notes.md; do
             [[ -s "$f" ]] || { echo "::error::$f 없음"; exit 1; }
           done
 
-      # 업데이트 서명: 앱에 들어 있는 공개 키(packaging/usagi-update.pub)와 짝인 비밀 키로 파일마다 .minisig 생성.
-      # 설치된 앱은 서명이 없거나 맞지 않는 업데이트를 받지 않으므로, 공개 키가 있는데 비밀값이 없으면 게시하지 않고 실패.
-      # 비밀 키는 이 단계에만 전달 (다른 단계·서드파티 액션에는 보이지 않음)
-      - name: 서명 (.minisig)
-        id: sign
-        env:
-          USAGI_SIGN_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-          USAGI_SIGN_PASSWORD: ${{ secrets.UPDATE_SIGNING_PASSWORD }}
+      # 서명 작업이 넘긴 서명을 앱과 같은 검증(공개 키·버전·파일 이름)으로 한 번 더 확인한 뒤에만 게시
+      - name: 서명 확인
         run: |
-          if ! grep -qvE '^(untrusted comment:.*|#.*|[[:space:]]*)$' packaging/usagi-update.pub; then
-            echo "서명 공개 키 없음: 서명 건너뜀"
-            exit 0
-          fi
-          if [[ "$HAS_SIGNING_KEY" != "true" ]]; then
-            echo "::error::packaging/usagi-update.pub에 공개 키가 있는데 UPDATE_SIGNING_KEY 비밀값이 없음 (서명 없는 릴리스는 앱이 받지 않음)"
-            exit 1
-          fi
           chmod +x signer-bin/usagi-sign
-          key="$RUNNER_TEMP/update-signing.key"
-          trap 'rm -f "$key"' EXIT
-          (umask 077; printf '%s\n' "$USAGI_SIGN_KEY" > "$key")
-          signer-bin/usagi-sign sign --version "$VERSION" --key "$key" \
-            out/usagi.exe out/usAgI-mac.zip
-          echo "signed=true" >> "$GITHUB_OUTPUT"
+          signer-bin/usagi-sign verify --version "$VERSION" out/usagi.exe out/usAgI-mac.zip
 
       - name: 릴리스 본문에 파일 검증 정보 추가
         shell: pwsh
-        env:
-          SIGNED: ${{ steps.sign.outputs.signed }}
         run: |
           . ./scripts/release-verification.ps1
           $names = @('usagi.exe', 'usAgI-mac.zip')
-          $block = New-ReleaseVerificationBlock -Directory out -Names $names -Signed:($env:SIGNED -eq 'true')
+          $block = New-ReleaseVerificationBlock -Directory out -Names $names -Signed
           $body = Get-Content -LiteralPath out/notes.md -Raw -Encoding utf8
           Set-Content -LiteralPath out/notes.md -Value (Set-ReleaseVerificationBlock $body $block) -Encoding utf8NoBOM
 
       - name: 릴리스 만들기 (초안에 모두 올린 뒤 공개, 태그는 이 커밋에)
         working-directory: out
-        env:
-          SIGNED: ${{ steps.sign.outputs.signed }}
         run: |
           files=(usagi.exe usAgI-mac.zip)
           # 0.3.0은 첨부를 읽는 구버전도 자동으로 설치할 수 있게 게시.
           base_version="${VERSION%%-*}"
           if [[ "$(printf '%s\n' "$base_version" 0.3.0 | sort -V | tail -n1)" == 0.3.0 ]]; then
-            files+=(usagi.exe.sha256 usAgI-mac.zip.sha256)
-            if [[ "$SIGNED" == "true" ]]; then
-              files+=(usagi.exe.minisig usAgI-mac.zip.minisig)
-            fi
+            files+=(usagi.exe.sha256 usAgI-mac.zip.sha256 usagi.exe.minisig usAgI-mac.zip.minisig)
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             # 초안이 남아 있던 경우: 파일과 노트만 바꿔 올림
@@ -664,6 +717,7 @@ jobs:
           gh release edit "$TAG" --draft=false
           echo "릴리스: $(gh release view "$TAG" --json url -q .url)"
 
+      # Homebrew는 minisign 서명을 쓰지 않고 탭 저장소의 체크섬을 믿음 (docs/DEVELOPMENT.md "업데이트 서명이 막는 것")
       - name: Homebrew 탭 갱신 (HOMEBREW_TAP_TOKEN 비밀값이 있을 때만, 미리보기 버전은 제외)
         if: env.HAS_TAP_TOKEN == 'true' && needs.prepare.outputs.prerelease != 'true'
         env:
