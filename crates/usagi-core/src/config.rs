@@ -235,15 +235,18 @@ pub fn ensure_file() -> std::io::Result<PathBuf> {
 }
 
 pub fn load() -> Config {
+    match ensure_file().and_then(std::fs::read_to_string) {
+        Ok(text) => parse(&text),
+        Err(e) => Config {
+            error: Some(crate::tr!(format!("설정 파일 읽기 실패: {e}"), format!("Failed to read the config file: {e}"))),
+            ..Config::default()
+        },
+    }
+}
+
+fn parse(text: &str) -> Config {
     let mut cfg = Config::default();
-    let text = match ensure_file().and_then(std::fs::read_to_string) {
-        Ok(t) => t,
-        Err(e) => {
-            cfg.error = Some(crate::tr!(format!("설정 파일 읽기 실패: {e}"), format!("Failed to read the config file: {e}")));
-            return cfg;
-        }
-    };
-    let file: FileConfig = match toml::from_str(&text) {
+    let file: FileConfig = match toml::from_str(text) {
         Ok(f) => f,
         Err(e) => {
             cfg.error = Some(crate::tr!(
@@ -253,10 +256,12 @@ pub fn load() -> Config {
             return cfg;
         }
     };
-    cfg.tired_percent = file.alerts.tired_percent.unwrap_or(80.0).clamp(1.0, 99.0);
+    // TOML은 nan·inf를 숫자로 받아들이고, clamp는 NaN을 그대로 둠
+    let finite = |v: Option<f64>| v.filter(|v| v.is_finite());
+    cfg.tired_percent = finite(file.alerts.tired_percent).unwrap_or(80.0).clamp(1.0, 99.0);
     cfg.notify = file.alerts.notify.unwrap_or(true);
     cfg.claude_dirs = file.data.claude_dirs.unwrap_or_default().into_iter().filter(|d| !d.trim().is_empty()).collect();
-    cfg.poll_seconds = file.data.poll_seconds.unwrap_or(3.0).clamp(1.0, 60.0);
+    cfg.poll_seconds = finite(file.data.poll_seconds).unwrap_or(3.0).clamp(1.0, 60.0);
     if let Some(p) = file.data.providers {
         cfg.providers = p.into_iter().map(|s| s.to_lowercase()).collect();
     }
@@ -357,7 +362,7 @@ impl State {
     }
 
     pub fn pref_f64(&self, key: &str) -> Option<f64> {
-        self.0.get("prefs").and_then(|p| p.get(key)).and_then(|v| v.as_f64())
+        self.0.get("prefs").and_then(|p| p.get(key)).and_then(|v| v.as_f64()).filter(|v| v.is_finite())
     }
 
     pub fn pref_str(&self, key: &str, default: &str) -> String {
@@ -475,6 +480,16 @@ mod tests {
         assert_eq!(mac_portable_dir(&executable_dir), Some(Portable::at(source.clone())));
         assert_eq!(std::fs::read(source.join("state.json")).unwrap(), b"state");
         assert_eq!(std::fs::read(destination.join("unrelated")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn non_finite_numbers_in_the_config_fall_back_to_defaults() {
+        let cfg = parse("[alerts]\ntired_percent = nan\n[data]\npoll_seconds = nan\n");
+        assert!(cfg.error.is_none());
+        assert_eq!(cfg.poll_seconds, 3.0);
+        assert_eq!(cfg.tired_percent, 80.0);
+        assert_eq!(parse("[data]\npoll_seconds = inf\n").poll_seconds, 3.0);
+        assert_eq!(parse("[data]\npoll_seconds = 0.2\n").poll_seconds, 1.0);
     }
 
     #[test]

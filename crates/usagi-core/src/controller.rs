@@ -348,7 +348,7 @@ impl Controller {
         .into_iter()
         .flatten()
         .min_by(f64::total_cmp)
-        .map(|at| std::time::Duration::from_secs_f64((at - now).max(0.0)))
+        .map(|at| time::duration_secs(at - now))
     }
 
     pub fn settings_opened(&mut self) {

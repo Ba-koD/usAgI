@@ -204,7 +204,8 @@ pub fn parse_reset(text: &str, event_ts: f64) -> Option<f64> {
     if let Some(pos) = low.find("limit reached|") {
         let digits: String = low[pos + 14..].chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 9 {
-            return digits.parse::<f64>().ok();
+            // 숫자가 아주 길면 무한이 됨
+            return digits.parse::<f64>().ok().and_then(time::timestamp);
         }
     }
     let start = low.find("reset")?;

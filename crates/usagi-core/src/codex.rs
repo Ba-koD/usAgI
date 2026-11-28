@@ -116,8 +116,8 @@ pub fn parse_line(line: &[u8]) -> Option<CodexSnapshot> {
     let limits = raw.payload?.rate_limits?;
     let mut windows = Vec::with_capacity(2);
     for w in [limits.primary, limits.secondary].into_iter().flatten() {
-        if let (Some(p), Some(m)) = (w.used_percent, w.window_minutes) {
-            windows.push(CodexWindow { minutes: m, used_percent: p, resets_at: w.resets_at });
+        if let (Some(p), Some(m)) = (w.used_percent.filter(|p| p.is_finite()), w.window_minutes) {
+            windows.push(CodexWindow { minutes: m, used_percent: p, resets_at: w.resets_at.and_then(time::timestamp) });
         }
     }
     if windows.is_empty() {
@@ -549,8 +549,8 @@ pub fn parse_app_server(r: &serde_json::Value, now: f64) -> Result<CodexSnapshot
     let mut windows = Vec::new();
     for key in ["primary", "secondary"] {
         if let Some(w) = limits.get(key).filter(|w| !w.is_null()) {
-            if let (Some(p), Some(m)) = (w.get("usedPercent").and_then(|x| x.as_f64()), w.get("windowDurationMins").and_then(|x| x.as_u64())) {
-                windows.push(CodexWindow { minutes: m as u32, used_percent: p, resets_at: w.get("resetsAt").and_then(|x| x.as_f64()) });
+            if let (Some(p), Some(m)) = (w.get("usedPercent").and_then(|x| x.as_f64()).filter(|p| p.is_finite()), w.get("windowDurationMins").and_then(|x| x.as_u64())) {
+                windows.push(CodexWindow { minutes: m as u32, used_percent: p, resets_at: w.get("resetsAt").and_then(|x| x.as_f64()).and_then(time::timestamp) });
             }
         }
     }
@@ -571,6 +571,7 @@ pub fn parse_app_server(r: &serde_json::Value, now: f64) -> Result<CodexSnapshot
             balance: c
                 .get("balance")
                 .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+                .filter(|balance: &f64| balance.is_finite())
                 .unwrap_or(0.0),
         }),
         refills: r.get("rateLimitResetCredits").filter(|c| !c.is_null()).map(|c| {
@@ -578,7 +579,7 @@ pub fn parse_app_server(r: &serde_json::Value, now: f64) -> Result<CodexSnapshot
             let usable = list.iter().filter(|x| x.get("status").and_then(|s| s.as_str()).is_none_or(|s| s == "available"));
             Refills {
                 available: c.get("availableCount").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or_else(|| usable.clone().count() as u32),
-                expires_at: usable.filter_map(|x| x.get("expiresAt").and_then(|v| v.as_f64())).min_by(|a, b| a.total_cmp(b)),
+                expires_at: usable.filter_map(|x| x.get("expiresAt").and_then(|v| v.as_f64()).and_then(time::timestamp)).min_by(|a, b| a.total_cmp(b)),
             }
         }),
     })
@@ -611,5 +612,18 @@ mod app_server_tests {
         assert_eq!(s.plan.as_deref(), Some("pro"));
         assert!(!s.reached);
         assert_eq!(s.ts, 5.0);
+    }
+
+    #[test]
+    fn absurd_numbers_from_codex_are_rejected_or_clamped() {
+        let r = serde_json::json!({"rateLimits":{"primary":{"usedPercent":7,"windowDurationMins":300,"resetsAt":1e300},
+            "credits":{"hasCredits":true,"unlimited":false,"balance":"inf"}},
+            "rateLimitResetCredits":{"availableCount":1,"credits":[{"status":"available","expiresAt":1e300}]}});
+        let s = parse_app_server(&r, 5.0).unwrap();
+        assert_eq!(s.windows[0].resets_at, Some(time::MAX_TIMESTAMP));
+        assert_eq!(s.credits.unwrap().balance, 0.0);
+        assert_eq!(s.refills.unwrap().expires_at, Some(time::MAX_TIMESTAMP));
+        let line = br#"{"timestamp":"2026-11-15T10:12:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":1.0,"window_minutes":300,"resets_at":1e300}}}}"#;
+        assert_eq!(parse_line(line).unwrap().windows[0].resets_at, Some(time::MAX_TIMESTAMP));
     }
 }

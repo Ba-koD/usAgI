@@ -96,7 +96,8 @@ pub fn parse(text: &str, now: f64) -> Option<BridgeFile> {
         let Some(rest) = line.strip_prefix("Current ") else { continue };
         let Some(colon) = rest.find(':') else { continue };
         let (head, tail) = (rest[..colon].trim(), &rest[colon + 1..]);
-        let Some(pct) = tail.trim_start().split('%').next().and_then(|p| p.trim().parse::<f64>().ok()) else { continue };
+        // f64 파싱은 "NaN"·"inf"·"1e999"도 받아들임
+        let Some(pct) = tail.trim_start().split('%').next().and_then(|p| p.trim().parse::<f64>().ok()).filter(|p| p.is_finite()) else { continue };
         // parse_reset가 직접 "reset"을 찾음. 소문자로 바꾼 글자의 위치로 원문을 자르면 글자 중간에서 패닉
         let resets_at = parse_reset(tail, now);
         let w = BridgeWindow { used_percentage: pct, resets_at };
@@ -181,6 +182,11 @@ Extra usage: $3.20 of $50.00 used
         let window = file.five_hour.unwrap();
         assert_eq!(window.used_percentage, 30.0);
         assert!(window.resets_at.is_some_and(|at| at > 1_795_000_000.0));
+    }
+
+    #[test]
+    fn non_finite_percentages_are_skipped() {
+        assert!(parse("Current session: NaN% used\nCurrent week: inf% used\nCurrent week (Fable): 1e999% used", 0.0).is_none());
     }
 
     #[test]

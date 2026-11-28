@@ -43,10 +43,11 @@ pub struct ProbeOutcome {
 
 fn window(v: Option<&serde_json::Value>) -> Option<BridgeWindow> {
     let v = v?;
-    let util = v.get("utilization")?.as_f64()?;
+    // 아주 큰 값은 100을 곱하면 무한이 됨
+    let used_percentage = Some(v.get("utilization")?.as_f64()? * 100.0).filter(|p| p.is_finite())?;
     Some(BridgeWindow {
-        used_percentage: util * 100.0,
-        resets_at: v.get("resetsAt").or_else(|| v.get("resets_at")).and_then(|r| r.as_f64()),
+        used_percentage,
+        resets_at: v.get("resetsAt").or_else(|| v.get("resets_at")).and_then(|r| r.as_f64()).and_then(time::timestamp),
     })
 }
 
@@ -65,7 +66,7 @@ pub fn parse_output(out: &str, now: f64) -> Result<ProbeOutcome, String> {
                 let status = info.and_then(|i| i.get("status")).and_then(|s| s.as_str()).unwrap_or("").to_string();
                 // 거절됐는데 창 정보가 없으면 5시간 한도 도달로 봄
                 if status == "rejected" && five.is_none() {
-                    let reset = info.and_then(|i| i.get("resetsAt")).and_then(|r| r.as_f64());
+                    let reset = info.and_then(|i| i.get("resetsAt")).and_then(|r| r.as_f64()).and_then(time::timestamp);
                     five = Some(BridgeWindow { used_percentage: 100.0, resets_at: reset });
                 }
                 if five.is_some() || seven.is_some() {
@@ -152,5 +153,13 @@ mod tests {
         let rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":500}}"#;
         let o = parse_output(rejected, 0.0).unwrap();
         assert_eq!(o.file.five_hour.unwrap().used_percentage, 100.0);
+    }
+
+    #[test]
+    fn rejects_overflowing_usage_and_clamps_reset_times() {
+        let out = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":1e308,"resetsAt":1795302000},"seven_day":{"utilization":0.5,"resetsAt":1e300}}}}"#;
+        let f = parse_output(out, 0.0).unwrap().file;
+        assert_eq!(f.five_hour, None, "1e308 × 100은 무한");
+        assert_eq!(f.seven_day.unwrap().resets_at, Some(time::MAX_TIMESTAMP));
     }
 }

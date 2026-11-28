@@ -227,7 +227,7 @@ fn refills(value: &Value) -> Option<Refills> {
         .filter(|credit| credit["status"].as_str() == Some("available"))
         .filter_map(|credit| {
             let at = &credit["expires_at"];
-            at.as_f64().or_else(|| crate::time::parse_iso(at.as_str()?))
+            at.as_f64().or_else(|| crate::time::parse_iso(at.as_str()?)).and_then(crate::time::timestamp)
         })
         .min_by(f64::total_cmp);
     Some(Refills {
@@ -250,11 +250,11 @@ fn snapshot(value: &Value, session: &Session, now: f64) -> Option<CodexSnapshot>
             let window = &rate[key];
             let seconds = window["limit_window_seconds"].as_u64()?;
             let minutes = u32::try_from(seconds / 60).ok()?;
-            let used_percent = window["used_percent"].as_f64()?;
+            let used_percent = window["used_percent"].as_f64().filter(|p| p.is_finite())?;
             if minutes == 0 || used_percent < 0.0 {
                 return None;
             }
-            let resets_at = window["reset_at"].as_f64().filter(|at| *at > 0.0);
+            let resets_at = window["reset_at"].as_f64().and_then(crate::time::timestamp).filter(|at| *at > 0.0);
             Some(CodexWindow {
                 minutes,
                 used_percent,

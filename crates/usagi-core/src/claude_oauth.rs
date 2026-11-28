@@ -170,7 +170,8 @@ fn window(value: &Value, key: &str) -> Option<BridgeWindow> {
         .as_str()
         .and_then(crate::time::parse_iso)
         .or_else(|| reset.as_f64())
-        .filter(|reset| reset.is_finite() && *reset > 0.0);
+        .and_then(crate::time::timestamp)
+        .filter(|reset| *reset > 0.0);
     Some(BridgeWindow {
         used_percentage,
         resets_at,

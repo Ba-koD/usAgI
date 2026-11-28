@@ -1031,7 +1031,8 @@ impl Engine {
                             let _ = poke.send(if moved { Cmd::Refresh } else { Cmd::Poke });
                         }
                         let next = pending_checks.values().copied().fold(regular_at, f64::min);
-                        let wait = Duration::from_secs_f64((next - time::now()).clamp(1.0, LOGIN_CHECK.as_secs_f64()));
+                        // clamp는 NaN을 그대로 두므로 max·min (NaN이면 다른 쪽 값)
+                        let wait = time::duration_secs((next - time::now()).max(1.0).min(LOGIN_CHECK.as_secs_f64()));
                         match login_rx.recv_timeout(wait) {
                             Ok(()) => {
                                 regular_at = 0.0;
@@ -1233,7 +1234,7 @@ impl Engine {
                                 let _ = completed.send(ProbeCommand::Finished(key, Err(UsageError::Failed(error.to_string())), live_at, interval));
                             }
                         }
-                        wait = Duration::from_secs_f64((next_retry - time::now()).clamp(0.0, 30.0));
+                        wait = time::duration_secs((next_retry - time::now()).max(0.0).min(30.0));
                     }
                 })
                 .expect("spawn probe thread");
@@ -1304,7 +1305,7 @@ impl Engine {
                         on_snapshot(snap);
                     }
                     force = false;
-                    let wait = Duration::from_secs_f64(c.poll_seconds)
+                    let wait = time::duration_secs(c.poll_seconds)
                         .min(reconcile_at.saturating_duration_since(Instant::now()));
                     match rx.recv_timeout(wait) {
                         Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
