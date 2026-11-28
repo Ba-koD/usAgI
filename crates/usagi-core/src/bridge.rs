@@ -290,9 +290,78 @@ pub fn run_statusline(input: &str, account_id: &str) -> String {
     line
 }
 
+/// `statusline` 명령의 계정 (`--account <id>`, 없으면 첫 Claude 계정)
+pub fn statusline_account(args: &[String]) -> String {
+    args.iter()
+        .position(|a| a == "--account")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "claude-1".into())
+}
+
+/// `usagi statusline --account <id>` 명령 전체: stdin JSON으로 사용량을 기록하고 상태 표시줄 글자를 stdout에 씀.
+/// 원래 쓰던 상태 표시줄(계정의 `chain`)이 있으면 `run_chain(명령, 입력)`의 출력을 대신 보여 줌.
+/// 그 명령을 실행할 셸은 플랫폼마다 달라서 앱이 정함 (macOS는 [`run_chain_sh`]).
+pub fn statusline_main(args: &[String], run_chain: impl FnOnce(&str, &str) -> Option<String>) {
+    use std::io::{Read, Write};
+    let account = statusline_account(args);
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let line = run_statusline(&input, &account);
+    let chain = crate::accounts::load(&crate::config::State::load())
+        .into_iter()
+        .find(|a| a.usage_key() == account)
+        .and_then(|a| a.chain);
+    let out = statusline_reply(line, chain.as_deref(), &input, run_chain);
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(out.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// 원래 상태 표시줄이 출력하면 그 글자, 없거나 실패하면 usAgI 글자
+fn statusline_reply(line: String, chain: Option<&str>, input: &str, run_chain: impl FnOnce(&str, &str) -> Option<String>) -> String {
+    chain.and_then(|cmd| run_chain(cmd, input)).unwrap_or(line)
+}
+
+/// 원래 상태 표시줄을 `/bin/sh -c`로 실행 (macOS·Linux)
+#[cfg(unix)]
+pub fn run_chain_sh(cmd: &str, input: &str) -> Option<String> {
+    let mut command = std::process::Command::new("/bin/sh");
+    command.arg("-c").arg(cmd);
+    crate::login::run_statusline_chain(command, input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn statusline_account_reads_the_flag() {
+        assert_eq!(statusline_account(&args(&["usagi", "statusline", "--account", "claude-3"])), "claude-3");
+        assert_eq!(statusline_account(&args(&["usagi", "statusline"])), "claude-1");
+        assert_eq!(statusline_account(&args(&["usagi", "statusline", "--account"])), "claude-1", "값이 빠지면 기본 계정");
+    }
+
+    #[test]
+    fn statusline_reply_prefers_the_original_status_line() {
+        let line = || "usAgI".to_string();
+        let echo = |cmd: &str, input: &str| Some(format!("{cmd}:{input}"));
+        assert_eq!(statusline_reply(line(), Some("orig"), "{}", echo), "orig:{}");
+        assert_eq!(statusline_reply(line(), None, "{}", |_: &str, _: &str| -> Option<String> { panic!("체인 없으면 실행 안 함") }), "usAgI");
+        assert_eq!(statusline_reply(line(), Some("broken"), "{}", |_: &str, _: &str| None), "usAgI", "실패하면 usAgI 글자");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_chain_sh_passes_stdin_and_rejects_failures() {
+        assert_eq!(run_chain_sh("cat", "hello").as_deref(), Some("hello"));
+        assert_eq!(run_chain_sh("printf original", "").as_deref(), Some("original"));
+        assert_eq!(run_chain_sh("exit 3", ""), None);
+    }
 
     #[test]
     fn parses_documented_fields() {
